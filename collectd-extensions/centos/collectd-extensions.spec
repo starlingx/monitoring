@@ -41,6 +41,7 @@ BuildRequires: systemd-devel
 
 Requires: systemd
 Requires: collectd
+Requires: collectd-python
 Requires: fm-api
 Requires: python-httplib2
 Requires: python-influxdb
