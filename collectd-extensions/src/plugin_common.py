@@ -10,6 +10,7 @@
 ############################################################################
 
 import collectd
+import itertools as it
 import json
 import uuid
 import httplib2
@@ -19,11 +20,81 @@ from oslo_concurrency import processutils
 from fm_api import constants as fm_constants
 import tsconfig.tsconfig as tsc
 
+from kubernetes import client
+from kubernetes import config
+from kubernetes.client import Configuration
+import urllib3
+
+
 # http request constants
 PLUGIN_TIMEOUT = 10
 PLUGIN_HTTP_HEADERS = {'Accept': 'application/json', 'Connection': 'close'}
 
 MIN_AUDITS_B4_FIRST_QUERY = 2
+
+# Kubernetes client constants
+KUBELET_CONF = '/etc/kubernetes/kubelet.conf'
+SSL_TLS_SUPPRESS = True
+
+# Standard units conversion parameters (mebi, kibi)
+# Reference: https://en.wikipedia.org/wiki/Binary_prefix
+Mi = 1048576
+Ki = 1024
+
+# Standard units conversion
+ONE_MILLION = 1000000
+ONE_THOUSAND = 1000
+ONE_HUNDRED = 100
+
+# cgroup definitions
+CGROUP_ROOT = '/sys/fs/cgroup'
+K8S_ROOT = 'k8s-infra'
+KUBEPODS = 'kubepods'
+
+# High level grouping categories
+GROUP_OVERALL = 'overall'
+GROUP_FIRST = 'first'
+GROUP_PODS = 'pods'
+
+# Overall cpuacct groupings 
+GROUP_TOTAL = 'cgroup-total'
+GROUP_PLATFORM = 'platform'
+GROUP_BASE = 'base'
+GROUP_K8S_SYSTEM = 'kube-system'
+GROUP_K8S_ADDON = 'kube-addon'
+
+# Groups included in platform - this excludes apps
+PLATFORM_GROUPS = [GROUP_BASE, GROUP_K8S_SYSTEM, GROUP_K8S_ADDON]
+OVERALL_GROUPS = [GROUP_PLATFORM]
+OVERALL_GROUPS.extend(PLATFORM_GROUPS)
+
+# First level cgroups -- these are the groups we know about
+CGROUP_SYSTEM = 'system.slice'
+CGROUP_USER = 'user.slice'
+CGROUP_MACHINE = 'machine.slice'
+CGROUP_DOCKER = 'docker'
+CGROUP_K8S = K8S_ROOT
+
+# Groupings by first level cgroup
+BASE_GROUPS = [CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER]
+BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
+
+# Groupings of pods by kubernetes namespace
+K8S_NAMESPACE_SYSTEM = ['kube-system']
+K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
+
+# Pod parent cgroup name based on annotation.
+# e.g., used by: kube-controller-manager, kube-scheduler, kube-apiserver
+POD_ANNOTATION_KEY = 'kubernetes.io/config.hash'
+
+# Worker reserved file and keyname
+RESERVED_CONF = '/etc/platform/worker_reserved.conf'
+RESERVED_MEM_KEY = 'WORKER_BASE_RESERVED'
+RESERVED_CPULIST_KEY = 'PLATFORM_CPU_LIST'
+
+# plugin return values
+PLUGIN_PASS = 0
+PLUGIN_FAIL = 1
 
 
 class PluginObject(object):
@@ -284,6 +355,59 @@ class PluginObject(object):
         return True
 
 
+class K8sClient(object):
+
+    def __init__(self):
+
+        self._host = socket.gethostname()
+        self._kube_client_core = None
+
+    def _load_kube_config(self):
+
+        config.load_kube_config(KUBELET_CONF)
+
+        # WORKAROUND: Turn off SSL/TLS verification
+        if SSL_TLS_SUPPRESS:
+            # Suppress the "InsecureRequestWarning: Unverified HTTPS request"
+            # seen with each kubelet client API call.
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            c = Configuration()
+            c.verify_ssl = False
+            Configuration.set_default(c)
+
+    def _get_k8sclient_core(self):
+        if not self._kube_client_core:
+            self._load_kube_config()
+            self._kube_client_core = client.CoreV1Api()
+        return self._kube_client_core
+
+    def kube_get_local_pods(self):
+        field_selector = 'spec.nodeName=' + self._host
+        try:
+            api_response = self._get_k8sclient_core().\
+                list_pod_for_all_namespaces(
+                    watch=False,
+                    field_selector=field_selector)
+            return api_response.items
+        except Exception as err:
+            collectd.error("kube_get_local_pods: %s" % (err))
+            raise
+
+
+class POD_object:
+    def __init__(self, uid, name, namespace, qos_class):
+        self.uid = uid
+        self.name = name
+        self.namespace = namespace
+        self.qos_class = qos_class
+
+    def __str__(self):
+        return str(self.__class__) + ": " + str(self.__dict__)
+
+    def __repr__(self):
+        return str(self.__class__) + ": " + str(self.__dict__)
+
+
 def is_uuid_like(val):
     """Returns validation of a value as a UUID
 
@@ -309,3 +433,84 @@ def get_severity_str(severity):
         return "minor"
     else:
         return "unknown"
+
+
+def convert2boolean(v):
+    """Convert an object to boolean result"""
+
+    if type(v) == bool:
+        return v
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    if isinstance(v, str):
+        return v.lower() in ("yes", "true", "t", "1",)
+    else:
+        return False
+
+
+def log_dictionary(plugin='', name='', d={}):
+    """Log a line of output for each key-value pair for dictionary d.
+
+    i.e., d[key] = value
+    """
+
+    for key in sorted(d.keys()):
+        collectd.info('%s: %s: %s = %s'
+                      % (plugin, name, key, d[key]))
+
+
+def log_dictionary_nodes(plugin='', name='', d={}):
+    """Log a line of output for each key-value pair for nested dictionary d.
+
+    i.e., For each node, for each key-value pair: d[node][key] = value
+    """
+
+    for node in sorted(d.keys()):
+        for key, val in sorted(d[node].items()):
+            collectd.info('%s: %s: %s %s = %s'
+                          % (plugin, name, node, key, val))
+
+
+def walklevel(some_dir, level=1):
+    """Recursively walk directories to a specified level.
+
+    Provides the same functionality as os.walk(), just limits the walk to a
+    specified level of recursion.
+    """
+
+    some_dir = some_dir.rstrip(os.path.sep)
+    assert os.path.isdir(some_dir)
+    num_sep = some_dir.count(os.path.sep)
+    for root, dirs, files in os.walk(some_dir):
+        yield root, dirs, files
+        num_sep_this = root.count(os.path.sep)
+        if num_sep + level <= num_sep_this:
+            del dirs[:]
+
+
+def range_to_list(csv_range=None):
+    """Convert a string of comma separated ranges into integer list.
+
+    e.g., '1-3,8-9,15' is converted to [1,2,3,8,9,15]
+    """
+
+    if not csv_range:
+        return []
+    ranges = [(lambda L: range(L[0], L[-1] + 1))(map(int, r.split('-')))
+              for r in csv_range.split(',')]
+    return [y for x in ranges for y in x]
+
+
+def format_range_set(items):
+    """Generate pretty-printed value of ranges, such as 3-6,12-17."""
+
+    ranges = []
+    for k, iterable in it.groupby(enumerate(sorted(items)),
+                                  lambda x: x[1] - x[0]):
+        rng = list(iterable)
+        if len(rng) == 1:
+            s = str(rng[0][1])
+        else:
+            s = "%s-%s" % (rng[0][1], rng[-1][1])
+        ranges.append(s)
+    return ','.join(ranges)
