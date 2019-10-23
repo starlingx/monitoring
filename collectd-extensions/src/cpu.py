@@ -7,256 +7,504 @@
 #
 # This file is the collectd 'Platform CPU Usage' Monitor.
 #
-# The Platform CPU Usage is calculated as an averaged percentage of
-# platform core usable since the previous sample.
+# The Platform CPU Usage is calculated as an averaged occupancy percentage
+# of platform logical cpus since the previous sample.
 #
-#  Init Function:
-#    - if 'worker_reserved.conf exists then query/store PLATFORM_CPU_LIST
+# Example commands to read samples from the database:
+# SELECT * FROM cpu_value WHERE type='percent' AND type_instance='used'
+# SELECT * FROM cpu_value WHERE type='percent' AND type_instance='occupancy'
 #
 ############################################################################
-import os
-import time
 import collectd
-
-debug = False
-
-PASS = 0
-FAIL = 1
-
-PATH = '/proc/cpuinfo'
-WORKER_RESERVED_CONF = '/etc/platform/worker_reserved.conf'
+import copy
+import os
+import plugin_common as pc
+import re
+import socket
+import time
 
 PLUGIN = 'platform cpu usage plugin'
+PLUGIN_DEBUG = 'DEBUG platform cpu'
+
+TIMESTAMP = 'timestamp'
+PLATFORM_CPU_PERCENT = 'platform-occupancy'
+CGROUP_PLATFORM_CPU_PERCENT = 'cgroup-platform-occupancy'
+SCHEDSTAT_SUPPORTED_VERSION = 15
+
+# Linux per-cpu info
+CPUINFO = '/proc/cpuinfo'
+SCHEDSTAT = '/proc/schedstat'
+
+# cpuacct cgroup controller
+CPUACCT = pc.CGROUP_ROOT + '/cpuacct'
+CPUACCT_USAGE = 'cpuacct.usage'
+
+# Common regex pattern match groups
+re_uid = re.compile(r'^pod(\S+)')
+re_processor = re.compile(r'^[Pp]rocessor\s+:\s+(\d+)')
+re_schedstat = re.compile(r'^cpu(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+')
+re_schedstat_version = re.compile(r'^version\s+(\d+)')
+re_keyquoteval = re.compile(r'^\s*(\S+)\s*[=:]\s*\"(\S+)\"\s*')
 
 
-# CPU Control class
-class CPU:
-    hostname = ""            # hostname for sample notification message
-    usage = float(0.0)       # float value of cpu usage
+# Plugin specific control class and object.
+class CPU_object:
 
-    processors = int(0)      # number of processors for all cpus case
-    cpu_list = []            # list of CPUs to calculate combined usage for
-    cpu_time = []            # schedstat time for each CPU
-    cpu_time_last = []       # last schedstat time for each CPU
-    time_last = float(0.0)   # float of the time the last sample was taken
+    def __init__(self):
+        self.debug = True
+        self.verbose = True
+        self._cache = {}
+        self._k8s_client = pc.K8sClient()
+        self.k8s_pods = set()
+        self.hostname = ''
 
-    def log_error(self, err_str):
-        """Print an error log with plugin name prefixing the log"""
+        self.schedstat_version = 0
+        self.schedstat_supported = True
+        self.number_platform_cpus = 0
 
-        collectd.error("%s %s" % (PLUGIN, err_str))
+        # Platform CPU monitor
+        now = time.time()  # epoch time in floating seconds
+        self._t0 = {}      # cputime state information at start of sample interval
+        self._t0[TIMESTAMP] = now
+        self._t0_cpuacct = {}
 
+        self._data = {}    # derived measurements at end of sample interval
+        self._data[PLATFORM_CPU_PERCENT] = 0.0
+        self.elapsed_ms = 0.0
 
 # Instantiate the class
-c = CPU()
+obj = CPU_object()
 
 
-# The collectd configuration interface
-# collectd needs this defined ; but not used/needed.
+def read_schedstat():
+    """Read current hiresolution times per cpu from /proc/schedstats.
+
+    Return dictionary of cputimes in nanoseconds per cpu.
+    """
+
+    cputime = {}
+
+    # Obtain cumulative cputime (nanoseconds) from 7th field of
+    # /proc/schedstat. This is the time running tasks on this cpu.
+    try:
+        with open(SCHEDSTAT, 'r') as f:
+            for line in f:
+                match = re_schedstat.search(line)
+                if match:
+                    k = int(match.group(1))
+                    v = int(match.group(2))
+                    cputime[k] = v
+    except Exception as err:
+        collectd.error('%s Cannot read schedstat, error=%s' % (PLUGIN, err))
+
+    return cputime
+
+
+def get_logical_cpus():
+    """Get the list of logical cpus from /proc/cpuinfo."""
+
+    cpus = set([])
+    try:
+        with open(CPUINFO, 'r') as infile:
+            for line in infile:
+                match = re_processor.search(line)
+                if match:
+                    cpus.add(int(match.group(1)))
+    except Exception as err:
+        collectd.error('%s Cannot parse file, error=%s' % (PLUGIN, err))
+    return list(cpus)
+
+
+def get_platform_cpulist():
+    """Get the platform configured cpu list from worker_reserved.conf."""
+
+    cpulist = []
+
+    # Match key=value, the value is quoted cpulist without spaces.
+    # E.g., PLATFORM_CPU_LIST="0-3"
+    m = {}
+    if os.path.exists(pc.RESERVED_CONF):
+        try:
+            with open(pc.RESERVED_CONF, 'r') as f:
+                for line in f:
+                    match = re_keyquoteval.search(line)
+                    if match:
+                        k = match.group(1)
+                        v = match.group(2)
+                        m[k] = v
+        except Exception as err:
+            collectd.error('%s Cannot parse file, error=%s' % (PLUGIN, err))
+
+    if pc.RESERVED_CPULIST_KEY in m:
+        cpus = m[pc.RESERVED_CPULIST_KEY]
+        cpulist = pc.range_to_list(csv_range=cpus)
+    else:
+        collectd.warning('%s %s not found in file: %s'
+                         % (PLUGIN,
+                            pc.RESERVED_CPULIST_KEY, pc.RESERVED_CONF))
+
+    return cpulist
+
+
+def get_cgroup_cpuacct(path):
+    """Get cgroup cpuacct usage for a specific cgroup path.
+
+    This represents the aggregate usage for child cgroups.
+
+    Returns cumulative usage in nanoseconds.
+    """
+
+    acct = 0
+
+    fstat = '/'.join([path, CPUACCT_USAGE])
+    try:
+        with open(fstat, 'r') as f:
+            line = f.readline().rstrip()
+            acct = int(line)
+    except IOError:
+        # Silently ignore IO errors. It is likely the cgroup disappeared.
+        pass
+
+    return acct
+
+
+def get_cpuacct():
+    """Get cpuacct usage based on cgroup hierarchy."""
+
+    cpuacct = {}
+    cpuacct[pc.GROUP_OVERALL] = {}
+    cpuacct[pc.GROUP_FIRST] = {}
+    cpuacct[pc.GROUP_PODS] = {}
+
+    # Overall cpuacct usage
+    acct = get_cgroup_cpuacct(CPUACCT)
+    cpuacct[pc.GROUP_OVERALL][pc.GROUP_TOTAL] = acct
+
+    # Walk the first level cgroups and get cpuacct usage
+    # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
+    dir_list = os.walk(CPUACCT).next()[1]
+    for name in dir_list:
+        cg_path = '/'.join([CPUACCT, name])
+        acct = get_cgroup_cpuacct(cg_path)
+        cpuacct[pc.GROUP_FIRST][name] = acct
+
+    # Walk the kubepods hierarchy to the pod level and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS])
+    for root, dirs, files in pc.walklevel(path, level=1):
+        for name in dirs:
+            if name.startswith('pod') and CPUACCT_USAGE in files:
+                match = re_uid.search(name)
+                if match:
+                    uid = match.group(1)
+                    cg_path = os.path.join(root, name)
+                    acct = get_cgroup_cpuacct(cg_path)
+                    cpuacct[pc.GROUP_PODS][uid] = acct
+    return cpuacct
+
+
+def update_cpu_data(init=False):
+    """Gather cputime info and Update platform cpu occupancy metrics.
+
+    This gathers current per-cpu cputime information from schedstats
+    and per-cgroup cputime information from cgroup cpuacct.
+
+    This calculates the average cpu occupancy of the platform cores
+    since this routine was last run.
+    """
+
+    # Get epoch time in floating seconds
+    now = time.time()
+
+    # Calculate elapsed time delta since last run
+    obj.elapsed_ms = float(pc.ONE_THOUSAND) * (now - obj._t0[TIMESTAMP])
+
+    # Prevent calling this routine too frequently (<= 1 sec)
+    if not init and obj.elapsed_ms <= 1000.0:
+        return
+
+    t1 = {}
+    t1[TIMESTAMP] = now
+    if obj.schedstat_supported:
+        # Get current per-cpu cumulative cputime usage from /proc/schedstat.
+        cputimes = read_schedstat()
+        for cpu in obj.cpu_list:
+            t1[cpu] = cputimes[cpu]
+    else:
+        return
+
+    # Get current cpuacct usages based on cgroup hierarchy
+    t1_cpuacct = get_cpuacct()
+
+    # Refresh the k8s pod information if we have discovered new cgroups
+    cg_pods = set(t1_cpuacct[pc.GROUP_PODS].keys())
+    if not cg_pods.issubset(obj.k8s_pods):
+        if obj.debug:
+            collectd.info('%s Refresh k8s pod information.' % (PLUGIN_DEBUG))
+        obj.k8s_pods = set()
+        pods = obj._k8s_client.kube_get_local_pods()
+        for i in pods:
+            # NOTE: parent pod cgroup name contains annotation config.hash as
+            # part of its name, otherwise it contains the pod uid.
+            uid = i.metadata.uid
+            if ((i.metadata.annotations) and
+                    (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
+                hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
+                                                      None)
+                if hash_uid:
+                    if obj.debug:
+                        collectd.info('%s POD_ANNOTATION_KEY: '
+                                      'hash=%s, uid=%s, '
+                                      'name=%s, namespace=%s, qos_class=%s'
+                                      % (PLUGIN_DEBUG,
+                                         hash_uid,
+                                         i.metadata.uid,
+                                         i.metadata.name,
+                                         i.metadata.namespace,
+                                         i.status.qos_class))
+                    uid = hash_uid
+
+            obj.k8s_pods.add(uid)
+            if uid not in obj._cache:
+                obj._cache[uid] = pc.POD_object(i.metadata.uid,
+                                                i.metadata.name,
+                                                i.metadata.namespace,
+                                                i.status.qos_class)
+    # Remove stale _cache entries
+    remove_uids = set(obj._cache.keys()) - obj.k8s_pods
+    for uid in remove_uids:
+        del obj._cache[uid]
+
+    # Save initial state information
+    if init:
+        obj._t0 = copy.deepcopy(t1)
+        obj._t0_cpuacct = copy.deepcopy(t1_cpuacct)
+        return
+
+    # Aggregate cputime delta for platform logical cpus using integer math
+    cputime_ms = 0.0
+    for cpu in obj.cpu_list:
+        cputime_ms += float(t1[cpu] - obj._t0[cpu])
+    cputime_ms /= float(pc.ONE_MILLION)
+
+    # Calculate average occupancy of platform logical cpus
+    occupancy = 0.0
+    if obj.number_platform_cpus > 0 and obj.elapsed_ms > 0:
+        occupancy = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+            / float(obj.elapsed_ms) / obj.number_platform_cpus
+    else:
+        occupancy = 0.0
+    obj._data[PLATFORM_CPU_PERCENT] = occupancy
+    if obj.debug:
+        collectd.info('%s %s elapsed = %.1f ms, cputime = %.1f ms, '
+                      'n_cpus = %d, occupancy = %.2f %%'
+                      % (PLUGIN_DEBUG,
+                         PLATFORM_CPU_PERCENT,
+                         obj.elapsed_ms,
+                         cputime_ms,
+                         obj.number_platform_cpus,
+                         occupancy))
+
+    # Calculate cpuacct delta for cgroup hierarchy, dropping transient cgroups
+    cpuacct = {}
+    for i in t1_cpuacct.keys():
+        cpuacct[i] = {}
+        for k, v in t1_cpuacct[i].items():
+            if k in obj._t0_cpuacct[i]:
+                cpuacct[i][k] = v - obj._t0_cpuacct[i][k]
+            else:
+                cpuacct[i][k] = v
+
+    # Summarize cpuacct usage for various groupings
+    for g in pc.OVERALL_GROUPS:
+        cpuacct[pc.GROUP_OVERALL][g] = 0.0
+
+    # Aggregate cpuacct usage by K8S pod
+    for uid in cpuacct[pc.GROUP_PODS]:
+        acct = cpuacct[pc.GROUP_PODS][uid]
+        if uid in obj._cache:
+            pod = obj._cache[uid]
+        else:
+            collectd.warning('%s uid %s not found' % (PLUGIN, uid))
+            continue
+
+        # K8S platform system usage, i.e., essential: kube-system
+        if pod.namespace in pc.K8S_NAMESPACE_SYSTEM:
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += acct
+
+        # K8S platform addons usage, i.e., non-essential: monitor, openstack
+        if pod.namespace in pc.K8S_NAMESPACE_ADDON:
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_ADDON] += acct
+
+    # Calculate base cpuacct usage (i.e., base tasks, exclude K8S and VMs)
+    # e.g., docker, system.slice, user.slice
+    for name in cpuacct[pc.GROUP_FIRST]:
+        if name in pc.BASE_GROUPS:
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_BASE] += \
+                cpuacct[pc.GROUP_FIRST][name]
+        elif name not in pc.BASE_GROUPS_EXCLUDE:
+            collectd.warning('%s could not find cgroup: %s' % (PLUGIN, name))
+
+    # Calculate platform cpuacct usage (this excludes apps)
+    for g in pc.PLATFORM_GROUPS:
+        cpuacct[pc.GROUP_OVERALL][pc.GROUP_PLATFORM] += \
+            cpuacct[pc.GROUP_OVERALL][g]
+
+    # Calculate cgroup based occupancy for overall groupings
+    for g in pc.OVERALL_GROUPS:
+        cputime_ms = \
+            float(cpuacct[pc.GROUP_OVERALL][g]) / float(pc.ONE_MILLION)
+        occupancy = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+            / float(obj.elapsed_ms) / obj.number_platform_cpus
+        obj._data[g] = occupancy
+        if obj.debug:
+            collectd.info('%s %s elapsed = %.1f ms, cputime = %.1f ms, '
+                          'n_cpus = %d, occupancy = %.2f %%'
+                          % (PLUGIN_DEBUG,
+                             g,
+                             obj.elapsed_ms,
+                             cputime_ms,
+                             obj.number_platform_cpus,
+                             occupancy))
+
+    # Update t0 state for the next sample collection
+    obj._t0 = copy.deepcopy(t1)
+    obj._t0_cpuacct = copy.deepcopy(t1_cpuacct)
+
+
 def config_func(config):
-    collectd.info('%s config function' % PLUGIN)
+    """Configure the cpu usage plugin."""
+
+    for node in config.children:
+        key = node.key.lower()
+        val = node.values[0]
+        if key == 'debug':
+            obj.debug = pc.convert2boolean(val)
+        elif key == 'verbose':
+            obj.verbose = pc.convert2boolean(val)
+
+    collectd.info('%s debug=%s, verbose=%s'
+                  % (PLUGIN, obj.debug, obj.verbose))
+
+    return pc.PLUGIN_PASS
 
 
 # Get the platform cpu list and number of cpus reported by /proc/cpuinfo
 def init_func():
-    # get current hostname
-    c.hostname = os.uname()[1]
+    """Init the plugin."""
 
-    collectd.info('%s init function for %s' % (PLUGIN, c.hostname))
+    obj.hostname = socket.gethostname()
+    collectd.info('%s init function for %s' % (PLUGIN, obj.hostname))
 
-    raw_list = ""
-    if os.path.exists(WORKER_RESERVED_CONF):
-        with open(WORKER_RESERVED_CONF, 'r') as infile:
-            for line in infile:
-                if 'PLATFORM_CPU_LIST' in line:
-                    val = line.split("=")
-                    raw_list = val[1].strip('\n')[1:-1].strip('"')
-                    break
-    if raw_list:
+    # Determine the full list of logical cpus for this host
+    obj.logical_cpus = get_logical_cpus()
 
-        # Convert the cpu list fetched from the compute
-        # reserved file into an integer list.
-        # Handle mix of number list #,# and number range #-#
-        split_list = raw_list.split(',')
-        if debug:
-            collectd.info('%s split list: %s' % (PLUGIN, split_list))
-        for cpu in split_list:
-            if cpu.find('-') == -1:
-                # add individual cpu # with assumed ',' delimiter
-                c.cpu_list.append(int(cpu))
-            else:
-                # add all in range #-#
-                cpu_range = cpu.split('-')
-                if len(cpu_range) == 2:
-                    first = int(cpu_range[0])
-                    last = int(cpu_range[1]) + 1
-                    # add each
-                    for i in list(range(first, last)):
-                        c.cpu_list.append(i)
+    # Determine the subset of logical platform cpus that we want to monitor
+    obj.cpu_list = get_platform_cpulist()
+    if obj.debug:
+        collectd.info('%s configured platform cpu list: %r'
+                      % (PLUGIN_DEBUG, obj.cpu_list))
 
-        # with the full CPU list in hand we can now just read their samples
-        if debug:
-            collectd.info('%s full cpu list: %s' %
-                          (PLUGIN, c.cpu_list))
+    # Ensure that the platform cpus are a subset of actual logical cpus
+    if not (all(x in obj.logical_cpus for x in obj.cpu_list)):
+        collectd.error('%s cpulist %r is not a subset of host logical cpus %r'
+                       % (PLUGIN, obj.cpu_list, obj.logical_cpus))
+        return pc.PLUGIN_FAIL
 
+    # Monitor all logical cpus if no platform cpus have been specified
+    if not obj.cpu_list:
+        obj.cpu_list = obj.logical_cpus
+    obj.number_platform_cpus = len(obj.cpu_list)
+
+    collectd.info('%s found %d cpus total; monitoring %d cpus, cpu list: %s'
+                  % (PLUGIN,
+                     len(obj.logical_cpus),
+                     obj.number_platform_cpus,
+                     pc.format_range_set(obj.cpu_list)))
+
+    # Check schedstat version
+    version = 0
     try:
-        f = open('/proc/cpuinfo')
-    except EnvironmentError as e:
-        collectd.error(str(e), UserWarning)
-    else:
+        with open(SCHEDSTAT, 'r') as f:
+            line = f.readline()
+            match = re_schedstat_version.search(line)
+            if match:
+                version = int(match.group(1))
+    except Exception as err:
+        collectd.error('%s Cannot read schedstat, error=%s' % (PLUGIN, err))
+        return pc.PLUGIN_FAIL
+    if version != SCHEDSTAT_SUPPORTED_VERSION:
+        obj.schedstat_supported = False
+        collectd.error('%s unsupported schedstat version [%d]'
+                       % (PLUGIN, version))
+        return pc.PLUGIN_FAIL
 
-        if len(c.cpu_list) == 0:
-            _want_all_cpus = True
-        else:
-            _want_all_cpus = False
+    # Gather initial cputime state information.
+    update_cpu_data(init=True)
 
-        c.processors = 0
-        for line in f:
-            name_value = [s.strip() for s in line.split(':', 1)]
-            if len(name_value) != 2:
-                continue
+    collectd.info('%s initialization complete' % PLUGIN)
 
-            name, value = name_value
-            if 'rocessor' in name:
-                if _want_all_cpus is True:
-                    c.cpu_list.append(int(c.processors))
-                c.processors += 1
-
-        collectd.info('%s has found %d cpus total' %
-                      (PLUGIN, c.processors))
-        collectd.info('%s monitoring %d cpus %s' %
-                      (PLUGIN, len(c.cpu_list), c.cpu_list))
-        f.close()
+    return pc.PLUGIN_PASS
 
 
 # Calculate the CPU usage sample
 def read_func():
-    try:
-        f = open('/proc/schedstat')
-    except EnvironmentError as e:
-        c.log_error('file open failed ; ' + str(e))
-        return FAIL
-    else:
-        # schedstat time for each CPU
-        c.cpu_time = []
 
-        # Loop over each line ...
-        #  get the output version ; only 15 is supported
-        #  get the cpu time from each line staring with 'cpux ....'
-        for line in f:
+    # epoch time in floating seconds
+    now0 = time.time()
 
-            # break each line into name/value pairs
-            line_split = [s.strip() for s in line.split(' ', 1)]
-            name, value = line_split
+    if not obj.schedstat_supported:
+        return pc.PLUGIN_FAIL
 
-            # get the output version.
-            if 'ersion' in name:
-                try:
-                    c.version = int(value)
-                except ValueError as e:
-                    c.log_error('got invalid schedstat version ; ' + str(e))
-
-                    # TODO: Consider exiting here and raising alarm.
-                    # Calling this type of exit will stop the plugin.
-                    # sys._exit()
-                    return FAIL
-
-            # only version 15 is supported
-            if c.version == 15:
-                if 'cpu' in name:
-                    # get the cpu number for each line
-                    if int(name.replace('cpu', '')) in c.cpu_list:
-                        _in_list = True
-                    else:
-                        _in_list = False
-
-                    # get cpu time for each cpu that is valid
-                    if len(c.cpu_list) == 0 or _in_list is True:
-                        _schedstat = value
-                        value_split = value.split(' ')
-                        c.cpu_time.append(float(value_split[6]))
-                        if debug:
-                            collectd.info('%s %s schedstat is %s [%s]' %
-                                          (PLUGIN, name, value_split[6],
-                                           _schedstat))
-            else:
-                collectd.error('%s unsupported schedstat version [%d]' %
-                               (PLUGIN, c.version))
-                return 0
-
-        f.close()
-
-    # Now that we have the cpu time recorded for each cpu
-    _time_delta = float(0)
-    _cpu_count = int(0)
-    if len(c.cpu_time_last) == 0:
-        c.time_last = time.time()
-        if c.cpu_list:
-            # This is a compute node.
-            # Do not include vswitch or pinned cpus in calculation.
-            for cpu in c.cpu_list:
-                c.cpu_time_last.append(float(c.cpu_time[_cpu_count]))
-                _cpu_count += 1
-        if debug:
-            collectd.info('%s cpu time ; first pass ; %s' %
-                          (PLUGIN, c.cpu_time))
-        return PASS
-    else:
-        _time_this = time.time()
-        _time_delta = _time_this - c.time_last
-        c.total_avg_cpu = 0
-        cpu_occupancy = []
-        if debug:
-            collectd.info('%s cpu time ; this pass ; %s -> %s' %
-                          (PLUGIN, c.cpu_time_last, c.cpu_time))
-
-    if c.cpu_list:
-        # This is a compute node.
-        # Do not include vswitch or pinned cpus in calculation.
-        for cpu in c.cpu_list:
-            if cpu >= c.processors:
-                c.log_error(' got out of range cpu number')
-            else:
-                _delta = (c.cpu_time[_cpu_count] - c.cpu_time_last[_cpu_count])
-                _delta = _delta / 1000000 / _time_delta
-                cpu_occupancy.append(float((100 * (_delta)) / 1000))
-                c.total_avg_cpu += cpu_occupancy[_cpu_count]
-                if debug:
-                    collectd.info('%s cpu %d - count:%d [%s]' %
-                                  (PLUGIN, cpu, _cpu_count, cpu_occupancy))
-                _cpu_count += 1
-
-    else:
+    if not obj.cpu_list:
         collectd.info('%s no cpus to monitor' % PLUGIN)
-        return 0
+        return pc.PLUGIN_PASS
 
-    c.usage = c.total_avg_cpu / _cpu_count
-    if debug:
-        collectd.info('%s reports %.2f %% usage (averaged)' %
-                      (PLUGIN, c.usage))
+    # Gather current cputime state information, and calculate occupancy since
+    # this routine was last run.
+    update_cpu_data()
 
-    # Prepare for next audit ; mode now to last
-    # c.cpu_time_last = []
-    c.cpu_time_last = c.cpu_time
-    c.time_last = _time_this
+    # Prevent dispatching measurements at plugin startup
+    if obj.elapsed_ms <= 1000.0:
+        return pc.PLUGIN_PASS
 
-    # if os.path.exists('/var/run/fit/cpu_data'):
-    #     with open('/var/run/fit/cpu_data', 'r') as infile:
-    #         for line in infile:
-    #             c.usage = float(line)
-    #             collectd.info("%s using FIT data:%.2f" %
-    #                           (PLUGIN, c.usage))
-    #             break
+    if obj.verbose:
+        collectd.info('%s Usage: %.1f%% (avg per cpu); '
+                      'cpus: %d, Platform: %.1f%% '
+                      '(Base: %.1f, k8s-system: %.1f, k8s-addon: %.1f)'
+                      % (PLUGIN, obj._data[PLATFORM_CPU_PERCENT],
+                         obj.number_platform_cpus,
+                         obj._data[pc.GROUP_PLATFORM],
+                         obj._data[pc.GROUP_BASE],
+                         obj._data[pc.GROUP_K8S_SYSTEM],
+                         obj._data[pc.GROUP_K8S_ADDON]))
 
-    # Dispatch usage value to collectd
-    val = collectd.Values(host=c.hostname)
+    # Dispatch overall platform cpu usage percent value
+    val = collectd.Values(host=obj.hostname)
     val.plugin = 'cpu'
     val.type = 'percent'
     val.type_instance = 'used'
-    val.dispatch(values=[c.usage])
+    val.dispatch(values=[obj._data[PLATFORM_CPU_PERCENT]])
 
-    return 0
+    # Dispatch grouped platform cpu usage values
+    val = collectd.Values(host=obj.hostname)
+    val.plugin = 'cpu'
+    val.type = 'percent'
+    val.type_instance = 'occupancy'
+    for g in pc.OVERALL_GROUPS:
+        val.plugin_instance = g
+        val.dispatch(values=[obj._data[g]])
+
+    # Calculate overhead cost of gathering metrics
+    if obj.debug:
+        now = time.time()
+        elapsed_ms = float(pc.ONE_THOUSAND) * (now - now0)
+        collectd.info('%s overhead sampling cost = %.3f ms'
+                      % (PLUGIN_DEBUG, elapsed_ms))
+
+    return pc.PLUGIN_PASS
 
 
+# Register the config, init and read functions
 collectd.register_config(config_func)
 collectd.register_init(init_func)
 collectd.register_read(read_func)
