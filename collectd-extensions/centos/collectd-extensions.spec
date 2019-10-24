@@ -14,7 +14,6 @@ Source2: collectd.conf.pmon
 
 # collectd python plugin files - notifiers
 Source3: fm_notifier.py
-Source4: mtce_notifier.py
 Source5: plugin_common.py
 
 # collectd python plugin files - resource plugins
@@ -76,7 +75,6 @@ install -m 600 %{SOURCE2} %{buildroot}%{local_config_extensions_dir}
 
 # collectd python plugin files - notifiers
 install -m 700 %{SOURCE3} %{buildroot}%{local_python_extensions_dir}
-install -m 700 %{SOURCE4} %{buildroot}%{local_python_extensions_dir}
 install -m 700 %{SOURCE5} %{buildroot}%{local_python_extensions_dir}
 
 # collectd python plugin files - resource plugins

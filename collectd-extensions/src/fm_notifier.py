@@ -9,18 +9,19 @@
 #
 # This file is the collectd 'FM Alarm' Notifier.
 #
-# This notifier manages raising and clearing alarms based on collectd
-# notifications ; i.e. automatic collectd calls to this handler/notifier.
+# This notifier debounces and then manages raising and clearing alarms
+# and sending degrade assert and clear messages to maintenance based on
+# Collectd resource usage severity notifications.
 #
 # Collectd process startup automatically calls this module's init_func which
 # declares and initializes a plugObject class for plugin type in preparation
-# for periodic ongoing monitoring where collectd calls notify_func for each
-# plugin and instance of that plugin.
+# for periodic ongoing monitoring where Collectd calls notify_func for each
+# plugin and instance of that plugin every audit interval.
 #
 # All other class or common member functions implemented herein exist in
 # support of that aformentioned initialization and periodic monitoring.
 #
-# Collects provides information about each event as an object passed to the
+# Collectd provides information about each event as an object passed to the
 # notification handler ; the notification object.
 #
 #    object.host              - the hostname.
@@ -38,22 +39,22 @@
 # This notifier uses the notification object to manage plugin/instance alarms.
 #
 # To avoid stuck alarms or missing alarms the plugin thresholds should be
-# configured with Persist = true and persistOK = true. Thes controls tell
-# collectd to always send notifications regardless of state change ; which
-# would be the case with these cobtrols set to false.
+# configured with Persist = true and persistOK = true. These controls tell
+# Collectd to send notifications every audit interval regardless of state
+# change.
 #
-# Persist   = false ; only send notifications on 'okay' to 'not okay' change.
-# PersistOK = false ; only send notifications on 'not okay' to 'okay' change.
+# Persist   = False ; only send notifications on 'okay' to 'not okay' change.
+# PersistOK = False ; only send notifications on 'not okay' to 'okay' change.
 #
-# With these both set to true in the threshold spec for the plugin then
-# collectd will call this notifier for each audit plugin/instance audit.
+# With these both set to True in the threshold spec for the plugin then
+# Collectd will call this notifier for each audit plugin/instance audit.
 #
 # Collectd supports only 2 threshold severities ; warning and failure.
 # The 'failure' maps to 'critical' while 'warning' maps to 'major' in FM.
 #
 # To avoid unnecessary load on FM, this notifier maintains current alarm
 # state and only makes an FM call on alarm state changes. Current alarm state
-# is queried by the init function called by collectd on process startup.
+# is queried by the init function called by Collectd on process startup.
 #
 # Current alarm state is maintained by two severity lists for each plugin,
 # a warnings list and a failures list.
@@ -84,7 +85,7 @@
 # UT imports
 import os
 import re
-import uuid
+import socket
 import collectd
 from threading import RLock as Lock
 from fm_api import constants as fm_constants
@@ -110,11 +111,16 @@ DEBUG_AUDIT = 2
 # write a 'value' log on a the resource sample change of more than this amount
 LOG_STEP = 10
 
-# Number of back to back database update misses
-MAX_NO_UPDATE_B4_ALARM = 5
+# Same state message throttle count.
+# Only send the degrade message every 'this' number
+# while the state of assert or clear remains the same.
+ONE_EVERY = 20
 
 # This plugin name
 PLUGIN = 'alarm notifier'
+
+# This plugin's degrade function
+PLUGIN_DEGRADE = 'degrade notifier'
 
 # Path to the plugin's drop dir
 PLUGIN_PATH = '/etc/collectd.d/'
@@ -127,6 +133,12 @@ READING_TYPE__PERCENT_USAGE = '% usage'
 # Default invalid threshold value
 INVALID_THRESHOLD = float(-1)
 
+# 3 minute alarm assertion debounce
+# 1 minute alarm clear debounce
+#    assuming 30 second interval
+DEBOUNCE_FROM_CLEAR_THLD = 7  # (((3 * 60) / 30) + 1)
+DEBOUNCE_FROM_ASSERT_THLD = 3
+
 # collectd severity definitions ;
 # Note: can't seem to pull then in symbolically with a header
 NOTIF_FAILURE = 1
@@ -136,6 +148,11 @@ NOTIF_OKAY = 4
 PASS = 0
 FAIL = 1
 
+# Maintenance Degrade Service definitions
+
+# default mtce port.
+# ... with configuration override
+MTCE_CMD_RX_PORT = 2101
 
 # Some plugin_instances are mangled by collectd.
 # The filesystem plugin is especially bad for this.
@@ -210,6 +227,325 @@ PLUGIN_NAME_LIST = [PLUGIN__CPU,
                     PLUGIN__VSWITCH_IFACE,
                     PLUGIN__EXAMPLE]
 
+# Used to find plugin name based on alarm id
+# for managing degrade for startup alarms.
+ALARM_ID__TO__PLUGIN_DICT = {ALARM_ID__CPU: PLUGIN__CPU,
+                             ALARM_ID__MEM: PLUGIN__MEM,
+                             ALARM_ID__DF: PLUGIN__DF,
+                             ALARM_ID__VSWITCH_CPU: PLUGIN__VSWITCH_CPU,
+                             ALARM_ID__VSWITCH_MEM: PLUGIN__VSWITCH_MEM,
+                             ALARM_ID__VSWITCH_PORT: PLUGIN__VSWITCH_PORT,
+                             ALARM_ID__VSWITCH_IFACE: PLUGIN__VSWITCH_IFACE}
+
+
+#########################################
+# The collectd Maintenance Degrade Object
+#########################################
+class DegradeObject:
+
+    def __init__(self, port):
+        """DegradeObject Class constructor"""
+
+        # maintenance port for degrade messages
+        self.port = port
+
+        # controller floating address
+        self.addr = None
+
+        # specifies the protocol family to use when messaging maintenance.
+        # if system is IPV6, then that is learned and this 'protocol' is
+        # updated with AF_INET6
+        self.protocol = socket.AF_INET
+
+        self.resource = ""
+
+        # List of plugin names that require degrade for specified severity.
+        self.degrade_list__failure = [PLUGIN__DF,
+                                      PLUGIN__MEM,
+                                      PLUGIN__CPU,
+                                      PLUGIN__INTERFACE]
+        self.degrade_list__warning = [PLUGIN__INTERFACE]
+
+        # The running list of resources that require degrade.
+        # a degrade clear message is sent whenever this list is empty.
+        # a degrade assert message is sent whenever this list is not empty.
+        self.degrade_list = []
+
+        # throttle down sending of duplicate degrade assert/clear messages
+        self.last_state = "undef"
+        self.msg_throttle = 0
+
+    ##########################################################################
+    #
+    # Name    : _get_active_controller_ip
+    #
+    # Purpose : Lookup the active controller's ip address.
+    #
+    # Updates : self.addr with the active controller's address or
+    #           None if lookup fails.
+    #
+    # Returns : Nothing
+    #
+    ##########################################################################
+    def _get_active_controller_ip(self):
+        """Get the active controller host IP"""
+
+        try:
+            self.addr = socket.getaddrinfo('controller', None)[0][4][0]
+            collectd.info("%s controller ip: %s" %
+                          (PLUGIN_DEGRADE, self.addr))
+        except Exception as ex:
+            self.addr = None
+            collectd.error("%s failed to get controller ip ; %s" %
+                           (PLUGIN_DEGRADE, str(ex)))
+
+    ##########################################################################
+    #
+    # Name       : mtce_degrade_notifier
+    #
+    # Purpose    : Message mtcAgent with its requested degrade state of
+    #              the host.
+    #
+    # Description: If the degrade list is empty then a clear state is sent to
+    #              maintenance.
+    #
+    #              If degrade list is NOT empty then an assert state is sent
+    #              to maintenance.
+    #
+    # For logging and to ease debug the code below will create a list of
+    # degraded resource instances to be included in the message to maintenance
+    # for mtcAgent to optionally log it.
+    #
+    # Updates    : Preserves this state as last state
+    #
+    # Returns    : Nothing
+    #
+    ##########################################################################
+    def mtce_degrade_notifier(self, nObject):
+        """Message mtcAgent with collectd degrade state of the host"""
+
+        resources = ""
+        if self.degrade_list:
+            # loop over the list,
+            # limit the degraded resource list being sent to mtce to 5
+            for r in self.degrade_list[0:1:5]:
+                resources += r + ','
+            resources = resources[:-1]
+            state = "assert"
+        else:
+            state = "clear"
+
+        # Degrade message throttling ....
+        #
+        # Avoid sending the same last state message for up to ONE_EVERY count.
+        # Degrade state is refreshed every 10 minutes with audit at 30 seconds.
+        # Just reduce load on mtcAgent.
+        if self.last_state == state and self.msg_throttle < ONE_EVERY:
+            self.msg_throttle += 1
+            return 0
+        else:
+            # Clear the message throttle counter
+            self.msg_throttle = 0
+
+        # if the degrade state has changed then log it and proceed
+        if self.last_state != state:
+            if self.last_state != "undef":
+                collectd.info("%s degrade %s %s" %
+                              (PLUGIN_DEGRADE,
+                               state,
+                               self.degrade_list))
+
+        # Save state for next time
+        self.last_state = state
+
+        # Send the degrade state ; assert or clear message to mtcAgent.
+        # If we get a send failure then log it and set the addr to None
+        # so it forces us to refresh the controller address on the next
+        # notification
+        try:
+            mtce_socket = socket.socket(self.protocol, socket.SOCK_DGRAM)
+            if mtce_socket:
+                if self.addr is None:
+                    self._get_active_controller_ip()
+                    if self.addr is None:
+                        collectd.error("%s cannot send degrade notification ; "
+                                       "controller address lookup failed" %
+                                       PLUGIN_DEGRADE)
+                        return 0
+
+                # Create the Maintenance message.
+                message = "{\"service\":\"collectd_notifier\","
+                message += "\"hostname\":\"" + nObject.host + "\","
+                message += "\"degrade\":\"" + state + "\","
+                message += "\"resource\":\"" + resources + "\"}"
+                collectd.info("%s: %s" % (PLUGIN_DEGRADE, message))
+
+                mtce_socket.settimeout(1.0)
+                mtce_socket.sendto(message, (self.addr, self.port))
+                mtce_socket.close()
+            else:
+                collectd.error("%s %s failed to open socket (%s)" %
+                               (PLUGIN_DEGRADE, self.resource, self.addr))
+        except socket.error as e:
+            if e.args[0] == socket.EAI_ADDRFAMILY:
+                # Handle IPV4 to IPV6 switchover:
+                self.protocol = socket.AF_INET6
+                collectd.info("%s %s ipv6 addressing (%s)" %
+                              (PLUGIN_DEGRADE, self.resource, self.addr))
+            else:
+                collectd.error("%s %s socket error (%s) ; %s" %
+                               (PLUGIN_DEGRADE,
+                                self.resource,
+                                self.addr,
+                                str(e)))
+                # try self correction
+                self.addr = None
+                self.protocol = socket.AF_INET
+
+    ##########################################################################
+    #
+    # Name    : _df_instance_to_path
+    #
+    # Purpose : Convert filesystem instance to path
+    #
+    # Returns : Created path
+    #
+    ##########################################################################
+    def _df_instance_to_path(self, df_inst):
+        """Convert a df instance name to a mountpoint"""
+
+        # df_root is not a dynamic file system. Ignore that one.
+        if df_inst == 'df_root':
+            return '/'
+        else:
+            # For all others replace all '-' with '/'
+            return('/' + df_inst[3:].replace('-', '/'))
+
+    ##########################################################################
+    #
+    # Name    : remove_degrade_for_missing_filesystems
+    #
+    # Purpose : Removes degraded filesystems that are no longer mounted.
+    #
+    # Updates : might update self.degrade_list
+    #
+    # Returns : Nothing
+    #
+    ##########################################################################
+    def remove_degrade_for_missing_filesystems(self):
+        """Remove file systems that are no longer mounted"""
+
+        for df_inst in self.degrade_list:
+
+            # Only file system plugins are looked at.
+            # File system plugin instance names are prefixed with 'df_'
+            # as the first 3 chars in the instance name.
+            if df_inst[0:3] == 'df_':
+                path = self._df_instance_to_path(df_inst)
+
+                # check the mount point.
+                # if the mount point no longer exists then remove
+                # this instance from the degrade list.
+                if os.path.ismount(path) is False:
+                    collectd.info("%s clearing degrade for missing %s ; %s" %
+                                  (PLUGIN_DEGRADE, path, self.degrade_list))
+                    self.degrade_list.remove(df_inst)
+
+    ##########################################################################
+    #
+    # Name       : manage_degrade_list
+    #
+    # Purpose    : Track the resources that require this host to be degraded.
+    #
+    # Description: Manages the 'degrade_list' based on collectd notifications.
+    #
+    # Updates    : self.degrade list with resource names that have severity
+    #              levels that require the host to be degraded.
+    #
+    # Returns    : Nothing
+    #
+    ###########################################################################
+    def manage_degrade_list(self, nObject):
+        """Collectd Mtce Notifier Handler Function"""
+
+        remove = False
+        add = False
+
+        # Create the resource name from the notifier object.
+        # format: <plugin name>_<plugin_instance_name>
+        resource = nObject.plugin
+        if nObject.plugin_instance:
+            resource += "_" + nObject.plugin_instance
+
+        # This block looks at the current notification severity
+        # and manages the degrade_list.
+        # If the specified plugin name exists in each of the warnings
+        # or failure lists and there is a current severity match then
+        # add that resource instance to the degrade list.
+        # Conversely, if this notification is OKAY then make sure this
+        # resource instance is not in the degrade list (remove it if it is)
+        if nObject.severity is NOTIF_OKAY:
+            if self.degrade_list and resource in self.degrade_list:
+                remove = True
+
+        elif nObject.severity is NOTIF_FAILURE:
+            if self.degrade_list__failure:
+                if nObject.plugin in self.degrade_list__failure:
+                    if resource not in self.degrade_list:
+                        # handle dynamic filesystems going missing over a swact
+                        # or unmount and being reported as a transient error by
+                        # the df plugin. Don't add it to the failed list if the
+                        # mountpoint is gone.
+                        add = True
+                        if nObject.plugin == PLUGIN__DF:
+                            path = self._df_instance_to_path(resource)
+                            add = os.path.ismount(path)
+
+            else:
+                # If severity is failure and no failures cause degrade
+                # then make sure this plugin is not in the degrade list,
+                # Should never occur.
+                if resource in self.degrade_list:
+                    remove = True
+
+        elif nObject.severity is NOTIF_WARNING:
+            if self.degrade_list__warning:
+                if nObject.plugin in self.degrade_list__warning:
+                    if resource not in self.degrade_list:
+                        # handle dynamic filesystems going missing over a swact
+                        # or unmount and being reported as a transient error by
+                        # the df plugin. Don't add it to the failed list if the
+                        # mountpoint is gone.
+                        add = True
+                        if nObject.plugin == PLUGIN__DF:
+                            path = self._df_instance_to_path(resource)
+                            add = os.path.ismount(path)
+
+                elif resource in self.degrade_list:
+                    remove = True
+            else:
+                # If severity is warning and no warnings cause degrade
+                # then make sure this plugin is not in the degrade list.
+                if resource in self.degrade_list:
+                    remove = True
+        else:
+            collectd.info("%s unsupported severity %d" %
+                          (PLUGIN_DEGRADE, nObject.severity))
+
+        if remove is True:
+            self.degrade_list.remove(resource)
+            collectd.info("%s %s removed from degrade list" %
+                          (PLUGIN_DEGRADE, resource))
+        elif add is True:
+            self.degrade_list.append(resource)
+            collectd.info("%s %s added to degrade list" %
+                          (PLUGIN_DEGRADE, resource))
+
+
+# Instantiate the maintenance degrade object
+# This object persists from notification to notification
+mtcDegradeObj = DegradeObject(MTCE_CMD_RX_PORT)
+
 
 # PluginObject Class
 class PluginObject:
@@ -268,6 +604,10 @@ class PluginObject:
         # The entity id should only be in one lists for any given raised alarm.
         self.warnings = []
         self.failures = []
+
+        # alarm debounce control
+        self.warnings_debounce_counter = 0
+        self.failures_debounce_counter = 0
 
         # total notification count
         self.count = 0
@@ -332,7 +672,7 @@ class PluginObject:
 
     ##########################################################################
     #
-    # Name    : _manage_change
+    # Name    : manage_change
     #
     # Purpose : Manage sample value change.
     #
@@ -344,7 +684,7 @@ class PluginObject:
     #
     ##########################################################################
 
-    def _manage_change(self, nObject):
+    def manage_change(self, nObject):
         """Log resource instance value on step state change"""
 
         # filter out messages to ignore ; notifications that have no value
@@ -430,6 +770,7 @@ class PluginObject:
         #
         # Note: only usage type so far
         if logit:
+
             resource = self.resource_name
 
             # setup resource name for filesystem instance usage log
@@ -469,48 +810,157 @@ class PluginObject:
                                    self.reading_type,
                                    resource))
 
+            # update last logged value
+            self.last_value = round(self.value, 2)
+
     ##########################################################################
     #
-    # Name       : _update_alarm
+    # Name       : debounce
     #
-    # Purpose    : Compare current severity to instance severity lists to
-    #              facilitate early 'do nothing' exit from a notification.
+    # Purpose    : Debounce alarm and degrade action handling based on
+    #              severity notifications from plugins.
     #
-    # Description: Avoid clearing an already cleared alarm.
-    #              Refresh asserted alarm data for usage reading type alarms
+    # Description: Clear to assert has a 3 minute debounce
+    #              All other state changes have 1 minute debounce.
+
+    #              A true return indicates that debounce is complete and the
+    #              current alarm severity needs to be acted upon.
     #
-    # Returns    : True if the alarm needs refresh, otherwise false.
+    #              A false return means that there is no severity change or
+    #              that debouning a severity change is in progress and the
+    #              caller should not take action on the current notification.
+    #
+    # Returns    : True if the alarm needs state change.
+    #              False during debounce of if no alarm state change needed.
     #
     ##########################################################################
-    def _update_alarm(self, entity_id, severity, this_value, last_value):
+
+    def debounce(self, base_obj, entity_id, severity, this_value):
         """Check for need to update alarm data"""
 
-        if entity_id in self.warnings:
+        rc = False
+        logit = False
+
+        # Only % Usage readings are debounced and alarmed
+        if base_obj.reading_type != READING_TYPE__PERCENT_USAGE:
+            return False
+
+        if entity_id in base_obj.warnings:
             self._llog(entity_id + " is already in warnings list")
             current_severity_str = "warning"
-        elif entity_id in self.failures:
+        elif entity_id in base_obj.failures:
             self._llog(entity_id + " is already in failures list")
             current_severity_str = "failure"
         else:
             self._llog(entity_id + " is already OK")
             current_severity_str = "okay"
 
-        # Compare to current state to previous state.
-        # If they are the same then return done.
+        # No severity change case
+        # Always clear debounce counters with no severity level change
         if severity == current_severity_str:
-            if severity == "okay":
-                return False
-            if self.reading_type != READING_TYPE__PERCENT_USAGE:
-                return False
-            elif round(last_value, 2) == round(this_value, 2):
-                return False
-        return True
+            self.warnings_debounce_counter = 0
+            self.failures_debounce_counter = 0
+
+        # From Okay -> Warning Case - PASS
+        elif current_severity_str == "okay" and severity == "warning":
+            logit = True
+            self.warnings_debounce_counter += 1
+            if self.warnings_debounce_counter >= DEBOUNCE_FROM_CLEAR_THLD:
+                rc = True
+
+            # Special Case: failures debounce counter should clear in this case
+            # so that ; max-x failures and then a warning followed by more
+            # failures should not allow the failure alarm assertion.
+            # Need back to back DEBOUNCE_FROM_CLEAR_THLD failures to
+            # constitute a failure alarm.
+            self.failures_debounce_counter = 0
+
+        # From Okay -> Failure
+        elif current_severity_str == "okay" and severity == "failure":
+            logit = True
+            self.failures_debounce_counter += 1
+            if self.failures_debounce_counter >= DEBOUNCE_FROM_CLEAR_THLD:
+                rc = True
+
+            # Special Case: warning debounce counter should track failure
+            # so that ; say 2 failures and then a warning would constitute
+            # a valid okay to warning alarm assertion.
+            self.warnings_debounce_counter += 1
+
+        # From Failure -> Okay Case
+        elif current_severity_str == "failure" and severity == "okay":
+            logit = True
+            self.failures_debounce_counter += 1
+            if self.failures_debounce_counter >= DEBOUNCE_FROM_ASSERT_THLD:
+                rc = True
+
+            # Special Case: Recovery from failure can be to okay or warning
+            # so that ; say at failure and we get 2 okay's and a warning
+            # we should allow that as a valid debounce from failure to warning.
+            self.warnings_debounce_counter += 1
+
+        # From Failure -> Warning Case
+        elif current_severity_str == "failure" and severity == "warning":
+            logit = True
+            self.failures_debounce_counter += 1
+            if self.failures_debounce_counter >= DEBOUNCE_FROM_ASSERT_THLD:
+                rc = True
+
+        # From Warning -> Okay Case
+        elif current_severity_str == "warning" and severity == "okay":
+            logit = True
+            self.warnings_debounce_counter += 1
+            if self.warnings_debounce_counter >= DEBOUNCE_FROM_ASSERT_THLD:
+                rc = True
+
+            # Special Case: Any previously thresholded failure count
+            # should be cleared. Say we are at this warning level but
+            # started debouncing a failure severity. Then before the
+            # failure debounce completed we got an okay (this clause).
+            # Then on the next audit get another failure event.
+            # Without clearing the failure count on this okay we would
+            # mistakenly qualify for a failure debounce by continuing
+            # to count up the failures debounce count.
+            self.failures_debounce_counter = 0
+
+        # From Warning -> Failure Case
+        elif current_severity_str == "warning" and severity == "failure":
+            logit = True
+            self.failures_debounce_counter += 1
+            if self.failures_debounce_counter >= DEBOUNCE_FROM_ASSERT_THLD:
+                rc = True
+
+            # Special Case: While in warning severity and debouncing to okay
+            # we get a failure reading then we need to clear the warning
+            # debounce count. Otherwise the next okay would qualify the clear
+            # which it should not because we got a failure while the warning
+            # to okay debounce.
+            self.warnings_debounce_counter = 0
+
+        if logit is True:
+            collectd.info("%s %s %s debounce '%s -> %s' (%2.2f) (%d:%d) %s" % (
+                          PLUGIN,
+                          base_obj.resource_name,
+                          self.instance,
+                          current_severity_str,
+                          severity,
+                          this_value,
+                          self.warnings_debounce_counter,
+                          self.failures_debounce_counter,
+                          rc))
+
+        if rc is True:
+            # clear both debounce counters on every state change
+            self.warnings_debounce_counter = 0
+            self.failures_debounce_counter = 0
+
+        return rc
 
     ########################################################################
     #
-    # Name    : _manage_alarm
+    # Name    : manage_alarm_lists
     #
-    # Putpose : Alarm Severity Tracking
+    # Purpose : Alarm Severity Tracking
     #
     # This class member function accepts a severity level and entity id.
     # It manages the content of the current alarm object's 'failures' and
@@ -550,7 +1000,7 @@ class PluginObject:
     #
     #########################################################################
 
-    def _manage_alarm(self, entity_id, severity):
+    def manage_alarm_lists(self, entity_id, severity):
         """Manage the alarm severity lists and report state change"""
 
         collectd.debug("%s manage alarm %s %s %s" %
@@ -728,13 +1178,13 @@ class PluginObject:
 
     ##########################################################################
     #
-    # Name    : _create_instance_object
+    # Name    : create_instance_object
     #
     # Purpose : Create a new instance object and tack it on the supplied base
     #           object's instance object dictionary.
     #
     ##########################################################################
-    def _create_instance_object(self, instance):
+    def create_instance_object(self, instance):
 
         try:
             # create a new plugin object
@@ -767,7 +1217,7 @@ class PluginObject:
 
     ##########################################################################
     #
-    # Name    : _create_instance_objects
+    # Name    : create_instance_objects
     #
     # Purpose : Create a list of instance objects for 'self' type plugin and
     #           add those objects to the parent's instance_objects dictionary.
@@ -776,7 +1226,7 @@ class PluginObject:
     #           All other instance creations/allocations are done on-demand.
     #
     ##########################################################################
-    def _create_instance_objects(self):
+    def create_instance_objects(self):
         """Create, initialize and add an instance object to this/self plugin"""
 
         # Create the File System subordinate instance objects.
@@ -882,7 +1332,7 @@ def clear_alarm(alarm_id, eid):
         return False
 
 
-def _get_base_object(alarm_id):
+def get_base_object(alarm_id):
     """Get the alarm object for the specified alarm id"""
     for plugin in PLUGIN_NAME_LIST:
         if PLUGINS[plugin].id == alarm_id:
@@ -890,10 +1340,10 @@ def _get_base_object(alarm_id):
     return None
 
 
-def _get_object(alarm_id, eid):
+def get_object(alarm_id, eid):
     """Get the plugin object for the specified alarm id and eid"""
 
-    base_obj = _get_base_object(alarm_id)
+    base_obj = get_base_object(alarm_id)
     if len(base_obj.instance_objects):
         try:
             return(base_obj.instance_objects[eid])
@@ -1143,7 +1593,7 @@ def _clear_alarm_for_missing_filesystems():
     # At this point we don't care about severity, we just need to
     # determine if an any-severity' alarmed filesystem no longer exists
     # so we can cleanup by clearing its alarm.
-    # Note: the 2 lists shpould always contain unique data between them
+    # Note: the 2 lists should always contain unique data between them
     alarm_list = df_base_obj.warnings + df_base_obj.failures
     if len(alarm_list):
         for eid in alarm_list:
@@ -1162,7 +1612,7 @@ def _clear_alarm_for_missing_filesystems():
                     if clear_alarm(df_base_obj.id, obj.entity_id) is True:
                         collectd.info("%s cleared alarm for missing %s" %
                                       (PLUGIN, path))
-                        df_base_obj._manage_alarm(obj.entity_id, "okay")
+                        df_base_obj.manage_alarm_lists(obj.entity_id, "okay")
                 else:
                     collectd.debug("%s maintaining alarm for %s" %
                                    (PLUGIN, path))
@@ -1173,6 +1623,10 @@ def _clear_alarm_for_missing_filesystems():
 # Query FM for existing alarms and run with that starting state.
 def init_func():
     """Collectd FM Notifier Initialization Function"""
+
+    mtcDegradeObj.port = MTCE_CMD_RX_PORT
+    collectd.error("%s mtce port %d" %
+                   (PLUGIN, mtcDegradeObj.port))
 
     PluginObject.lock = Lock()
 
@@ -1211,7 +1665,7 @@ def init_func():
     # The FileSystem (DF) plugin has multiple instances
     # One instance per file system mount point being monitored.
     # Create one DF instance object per mount point
-    obj._create_instance_objects()
+    obj.create_instance_objects()
 
     # ntp query is for controllers only
     if want_vswitch is False:
@@ -1323,9 +1777,10 @@ def notifier_func(nObject):
                         if PluginObject.host not in eid:
                             continue
 
-                        base_obj = _get_base_object(alarm_id)
-                        if base_obj is None:
-                            # might be a plugin instance - clear it
+                        base_obj = get_base_object(alarm_id)
+                        inst_obj = get_object(alarm_id, eid)
+                        if base_obj != inst_obj:
+                            # is a plugin instance - clear it
                             want_alarm_clear = True
 
                         collectd.info('%s found %s %s alarm [%s]' %
@@ -1359,7 +1814,25 @@ def notifier_func(nObject):
 
                         # Load the alarm severity by plugin/instance lookup.
                         if base_obj is not None:
-                            base_obj._manage_alarm(eid, sev)
+                            base_obj.manage_alarm_lists(eid, sev)
+
+                            # handle degrade for alarmed resources
+                            # over process startup.
+                            # Note: 'ap' stands for alarmed_plugin
+                            ap = ALARM_ID__TO__PLUGIN_DICT[alarm_id]
+                            add = False
+                            if alarm.severity == "critical" and\
+                                    ap in mtcDegradeObj.degrade_list__failure:
+                                add = True
+                            elif alarm.severity == "major" and\
+                                    ap in mtcDegradeObj.degrade_list__warning:
+                                add = True
+                            if add is True:
+                                mtcDegradeObj.degrade_list.append(ap)
+                                collectd.info("%s '%s' plugin added to "
+                                              "degrade list due to found "
+                                              "startup alarm %s" %
+                                              (PLUGIN_DEGRADE, ap, alarm_id))
 
         PluginObject.fm_connectivity = True
         collectd.info("%s initialization complete" % PLUGIN)
@@ -1443,7 +1916,7 @@ def notifier_func(nObject):
                 need_instance_object_create = True
 
             if need_instance_object_create is True:
-                base_obj._create_instance_object(nObject.plugin_instance)
+                base_obj.create_instance_object(nObject.plugin_instance)
                 inst_obj = base_obj._get_instance_object(eid)
                 if inst_obj:
                     collectd.debug("%s %s:%s inst object created" %
@@ -1479,7 +1952,6 @@ def notifier_func(nObject):
     # If want_state_audit is True then run the audit.
     # Primarily used for debug
     # default state is False
-    # TODO: comment out for production code.
     if want_state_audit:
         obj.audit_threshold += 1
         if obj.audit_threshold == DEBUG_AUDIT:
@@ -1487,7 +1959,7 @@ def notifier_func(nObject):
             obj._state_audit("audit")
 
     # manage reading value change ; store last and log if gt obj.step
-    action = obj._manage_change(nObject)
+    action = obj.manage_change(nObject)
     if action == "done":
         return 0
 
@@ -1499,15 +1971,25 @@ def notifier_func(nObject):
     # always be there.
     if obj.instance == '/':
         _clear_alarm_for_missing_filesystems()
+        if len(mtcDegradeObj.degrade_list):
+            mtcDegradeObj.remove_degrade_for_missing_filesystems()
 
     # exit early if there is no alarm update to be made
-    if base_obj._update_alarm(obj.entity_id,
-                              severity_str,
-                              obj.value,
-                              obj.last_value) is False:
+    if obj.debounce(base_obj,
+                    obj.entity_id,
+                    severity_str,
+                    obj.value) is False:
+        # Call the degrade notifier at steady state,
+        #  degrade or clear, so that the required collectd
+        #  degrade state is periodically refreshed.
+        # However, rather than do this refresh on every notification,
+        #  just do it for the root filesystem instance case.
+        if obj.instance == '/':
+            mtcDegradeObj.mtce_degrade_notifier(nObject)
         return 0
 
-    obj.last_value = round(obj.value, 2)
+    mtcDegradeObj.manage_degrade_list(nObject)
+    mtcDegradeObj.mtce_degrade_notifier(nObject)
 
     if _alarm_state == fm_constants.FM_ALARM_STATE_CLEAR:
         if clear_alarm(obj.id, obj.entity_id) is False:
@@ -1565,7 +2047,7 @@ def notifier_func(nObject):
             return 0
 
     # update the lists now that
-    base_obj._manage_alarm(obj.entity_id, severity_str)
+    base_obj.manage_alarm_lists(obj.entity_id, severity_str)
 
     collectd.info("%s %s alarm %s:%s %s:%s value:%2.2f" % (
                   PLUGIN,

@@ -64,7 +64,7 @@ class CPU_object:
 
         # Platform CPU monitor
         now = time.time()  # epoch time in floating seconds
-        self._t0 = {}      # cputime state information at start of sample interval
+        self._t0 = {}      # cputime state info at start of sample interval
         self._t0[TIMESTAMP] = now
         self._t0_cpuacct = {}
 
@@ -477,6 +477,16 @@ def read_func():
                          obj._data[pc.GROUP_BASE],
                          obj._data[pc.GROUP_K8S_SYSTEM],
                          obj._data[pc.GROUP_K8S_ADDON]))
+
+    # Fault insertion code to assis in regression UT
+    #
+    # if os.path.exists('/var/run/fit/cpu_data'):
+    #     with open('/var/run/fit/cpu_data', 'r') as infile:
+    #         for line in infile:
+    #             obj._data[PLATFORM_CPU_PERCENT] = float(line)
+    #             collectd.info("%s using FIT data:%.2f" %
+    #                           (PLUGIN, obj._data[PLATFORM_CPU_PERCENT] ))
+    #             break
 
     # Dispatch overall platform cpu usage percent value
     val = collectd.Values(host=obj.hostname)
