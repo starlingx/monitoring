@@ -112,34 +112,37 @@ def get_platform_reserved_memory():
     via sysinv query.
 
     Returns total platform reserved MiB.
+    Returns 0.0 if worker_reserved.conf does not exist.
     """
 
     reserved_MiB = 0.0
 
+    # Match key=("value1" "value2" ...), a bash array of quoted strings.
     m = {}
-    try:
-        with open(pc.RESERVED_CONF, 'r') as infile:
-            for line in infile:
-                # skip lines we don't care about
-                match = re_blank.search(line)
-                if match:
-                    continue
-                match = re_comment.search(line)
-                if match:
-                    continue
-                match = re_nonword.search(line)
-                if match:
-                    continue
+    if os.path.exists(pc.RESERVED_CONF):
+        try:
+            with open(pc.RESERVED_CONF, 'r') as infile:
+                for line in infile:
+                    # skip lines we don't care about
+                    match = re_blank.search(line)
+                    if match:
+                        continue
+                    match = re_comment.search(line)
+                    if match:
+                        continue
+                    match = re_nonword.search(line)
+                    if match:
+                        continue
 
-                # match key value array pairs
-                match = re_keyval_arr.search(line)
-                if match:
-                    k = match.group(1)
-                    v = match.group(2)
-                    m[k] = v
-    except IOError as err:
-        collectd.error('%s: Cannot parse file, error=%s' % (PLUGIN, err))
-        return 0.0
+                    # match key value array pairs
+                    match = re_keyval_arr.search(line)
+                    if match:
+                        k = match.group(1)
+                        v = match.group(2)
+                        m[k] = v
+        except Exception as err:
+            collectd.error('%s: Cannot parse file, error=%s' % (PLUGIN, err))
+            return 0.0
 
     # Parse and aggregate reserved memory from pattern like this:
     # WORKER_BASE_MEMORY=("node0:1500MB:1" "node1:1500MB:1")
@@ -156,7 +159,6 @@ def get_platform_reserved_memory():
         collectd.warning('%s: %s not found in file: %s'
                          % (PLUGIN,
                             pc.RESERVED_MEM_KEY, pc.RESERVED_CONF))
-        return 0.0
 
     return reserved_MiB
 
@@ -270,17 +272,21 @@ def get_platform_memory():
         m = get_cgroup_memory(cg_path)
         memory[pc.GROUP_FIRST][name] = m.get('rss_MiB', 0.0)
 
-    # Walk the kubepods hierarchy to the pod level and get memory usage
+    # Walk the kubepods hierarchy to the pod level and get memory usage.
+    # We can safely ignore reading this if the path does not exist.
+    # The path wont exist on non-K8S nodes. The path is created as part of
+    # kubernetes configuration.
     path = '/'.join([MEMCONT, pc.K8S_ROOT, pc.KUBEPODS])
-    for root, dirs, files in pc.walklevel(path, level=1):
-        for name in dirs:
-            if name.startswith('pod') and MEMORY_STAT in files:
-                match = re_uid.search(name)
-                if match:
-                    uid = match.group(1)
-                    cg_path = os.path.join(root, name)
-                    m = get_cgroup_memory(cg_path)
-                    memory[pc.GROUP_PODS][uid] = m.get('rss_MiB', 0.0)
+    if os.path.isdir(path):
+        for root, dirs, files in pc.walklevel(path, level=1):
+            for name in dirs:
+                if name.startswith('pod') and MEMORY_STAT in files:
+                    match = re_uid.search(name)
+                    if match:
+                        uid = match.group(1)
+                        cg_path = os.path.join(root, name)
+                        m = get_cgroup_memory(cg_path)
+                        memory[pc.GROUP_PODS][uid] = m.get('rss_MiB', 0.0)
     return memory
 
 

@@ -116,7 +116,14 @@ def get_logical_cpus():
 
 
 def get_platform_cpulist():
-    """Get the platform configured cpu list from worker_reserved.conf."""
+    """Get the platform configured cpu list from worker_reserved.conf.
+
+    This value is provided by puppet resource file which is populated
+    via sysinv query.
+
+    Returns list of platform cpus.
+    Returns empty list if worker_reserved.conf does not exist.
+    """
 
     cpulist = []
 
@@ -134,6 +141,9 @@ def get_platform_cpulist():
                         m[k] = v
         except Exception as err:
             collectd.error('%s Cannot parse file, error=%s' % (PLUGIN, err))
+            return cpulist
+    else:
+        return cpulist
 
     if pc.RESERVED_CPULIST_KEY in m:
         cpus = m[pc.RESERVED_CPULIST_KEY]
@@ -188,17 +198,21 @@ def get_cpuacct():
         acct = get_cgroup_cpuacct(cg_path)
         cpuacct[pc.GROUP_FIRST][name] = acct
 
-    # Walk the kubepods hierarchy to the pod level and get cpuacct usage
+    # Walk the kubepods hierarchy to the pod level and get cpuacct usage.
+    # We can safely ignore reading this if the path does not exist.
+    # The path wont exist on non-K8S nodes. The path is created as part of
+    # kubernetes configuration.
     path = '/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS])
-    for root, dirs, files in pc.walklevel(path, level=1):
-        for name in dirs:
-            if name.startswith('pod') and CPUACCT_USAGE in files:
-                match = re_uid.search(name)
-                if match:
-                    uid = match.group(1)
-                    cg_path = os.path.join(root, name)
-                    acct = get_cgroup_cpuacct(cg_path)
-                    cpuacct[pc.GROUP_PODS][uid] = acct
+    if os.path.isdir(path):
+        for root, dirs, files in pc.walklevel(path, level=1):
+            for name in dirs:
+                if name.startswith('pod') and CPUACCT_USAGE in files:
+                    match = re_uid.search(name)
+                    if match:
+                        uid = match.group(1)
+                        cg_path = os.path.join(root, name)
+                        acct = get_cgroup_cpuacct(cg_path)
+                        cpuacct[pc.GROUP_PODS][uid] = acct
     return cpuacct
 
 
@@ -283,6 +297,10 @@ def update_cpu_data(init=False):
     # Aggregate cputime delta for platform logical cpus using integer math
     cputime_ms = 0.0
     for cpu in obj.cpu_list:
+        # Paranoia check, we should never hit this.
+        if cpu not in obj._t0:
+            collectd.error('%s cputime initialization error' % (PLUGIN))
+            break
         cputime_ms += float(t1[cpu] - obj._t0[cpu])
     cputime_ms /= float(pc.ONE_MILLION)
 
