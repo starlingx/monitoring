@@ -488,7 +488,7 @@ def read_func():
     if obj.verbose:
         collectd.info('%s Usage: %.1f%% (avg per cpu); '
                       'cpus: %d, Platform: %.1f%% '
-                      '(Base: %.1f, k8s-system: %.1f, k8s-addon: %.1f)'
+                      '(Base: %.1f, k8s-system: %.1f), k8s-addon: %.1f'
                       % (PLUGIN, obj._data[PLATFORM_CPU_PERCENT],
                          obj.number_platform_cpus,
                          obj._data[pc.GROUP_PLATFORM],

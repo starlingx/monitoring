@@ -64,8 +64,8 @@ GROUP_K8S_SYSTEM = 'kube-system'
 GROUP_K8S_ADDON = 'kube-addon'
 
 # Groups included in platform - this excludes apps
-PLATFORM_GROUPS = [GROUP_BASE, GROUP_K8S_SYSTEM, GROUP_K8S_ADDON]
-OVERALL_GROUPS = [GROUP_PLATFORM]
+PLATFORM_GROUPS = [GROUP_BASE, GROUP_K8S_SYSTEM]
+OVERALL_GROUPS = [GROUP_PLATFORM, GROUP_K8S_ADDON]
 OVERALL_GROUPS.extend(PLATFORM_GROUPS)
 
 # First level cgroups -- these are the groups we know about

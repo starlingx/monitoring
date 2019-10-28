@@ -21,4 +21,4 @@ COPY_LIST="$PKG_BASE/src/LICENSE \
   $PKG_BASE/src/ptp.conf \
   $PKG_BASE/src/example.py \
   $PKG_BASE/src/example.conf"
-TIS_PATCH_VER=14
+TIS_PATCH_VER=15

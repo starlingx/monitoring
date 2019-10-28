@@ -584,7 +584,7 @@ def read_func():
     if obj.verbose:
         collectd.info('%s: Usage: %.1f%%; '
                       'Reserved: %.1f MiB, Platform: %.1f MiB '
-                      '(Base: %.1f, k8s-system: %.1f, k8s-addon: %.1f)'
+                      '(Base: %.1f, k8s-system: %.1f), k8s-addon: %.1f'
                       % (PLUGIN, obj.platform_memory_percent,
                          obj.reserved_MiB,
                          memory[pc.GROUP_OVERALL][pc.GROUP_PLATFORM],
