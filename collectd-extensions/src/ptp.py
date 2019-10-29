@@ -857,40 +857,23 @@ def read_func():
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
     if my_identity == gm_identity or port_locked is False:
+        if ctrl.nolock_alarm_object.raised is False:
+            if raise_alarm(ALARM_CAUSE__NO_LOCK, None, 0) is True:
+                ctrl.nolock_alarm_object.raised = True
 
-        if obj.controller is False:
+        # produce a throttled log while this host is not locked to the GM
+        if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info("%s %s not locked to remote Grand Master "
+                          "(%s)" % (PLUGIN, obj.hostname, gm_identity))
+        obj.log_throttle_count += 1
 
-            # Compute and storage nodes should not be the Grand Master
-            if ctrl.nolock_alarm_object.raised is False:
-                if raise_alarm(ALARM_CAUSE__NO_LOCK, None, 0) is True:
-                    ctrl.nolock_alarm_object.raised = True
+        # No samples if we are not locked to a Grand Master
+        return 0
 
-            # produce a throttled log while this host is not locked to the GM
-            if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s %s not locked to remote Grand Master "
-                              "(%s)" % (PLUGIN, obj.hostname, gm_identity))
-            obj.log_throttle_count += 1
-
-            # No samples for storage and compute nodes that are not
-            # locked to a Grand Master
-            return 0
-
-        else:
-            # Controllers can be a Grand Master ; throttle the log
-            if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s %s is Grand Master:%s" %
-                              (PLUGIN, obj.hostname, gm_identity))
-            obj.log_throttle_count += 1
-
-            # The Grand Master will always be 0 so there is no point
-            # creating a sample for it.
-            return 0
-
-    # Handle clearing nolock alarm for computes and storage nodes
-    elif obj.controller is False:
-        if ctrl.nolock_alarm_object.raised is True:
-            if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
-                ctrl.nolock_alarm_object.raised = False
+    # Handle clearing nolock alarm
+    elif ctrl.nolock_alarm_object.raised is True:
+        if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
+            ctrl.nolock_alarm_object.raised = False
 
     # Keep this FIT test code but make it commented out for security
     # if os.path.exists('/var/run/fit/ptp_data'):
