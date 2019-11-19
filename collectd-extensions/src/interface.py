@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019 Wind River Systems, Inc.
+# Copyright (c) 2019-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -7,11 +7,12 @@
 #
 # This is the Host Interface Monitor plugin for collectd.
 #
-# Only mgmt, cluster-host and oam interfaces are supported with the following
-# mapping specified in /etc/platform/platform.conf
+# mgmt, cluster-host, oam and data-network interfaces are supported with the following
+# mapping specified in /etc/lmon/lmon.conf
 #
 #   oam - oam_interface            | controller | mandatory
-# mgmnt - management_interface     | all hosts  | mandatory
+#  mgmt - management_interface     | all hosts  | mandatory
+#  data - data_network_interface   | compute    | mandatory
 # clstr - cluster_host_interface   | any host   | optional
 #
 # This plugin queries the maintenance Link Monitor daemon 'lmon'
@@ -22,28 +23,55 @@
 # of the monitored links, state and the time of the last event or when
 # initial status was learned. An example of the Link Monitor response is
 #
-#  {
-#      "status" : "pass"
-#      "link_info": [
-#      { "network":"mgmt",
-#        "type":"vlan",
-#        "links": [
-#              { "name":"enp0s8.1", "state":"Up", "time":"5674323454567" },
-#              { "name":"enp0s8.2", "state":"Up", "time":"5674323454567" }]
-#      },
-#      { "network":"clstr",
-#        "type":"bond",
-#        "bond":"bond0",
-#        "links": [
-#              { "name":"enp0s9f1", "state":"Down", "time":"5674323454567" },
-#              { "name":"enp0s9f0", "state":"Up"  , "time":"5674323454567" }]
-#      },
-#      { "network":"oam",
-#        "type":"single",
-#        "links": [
-#              { "name":"enp0s3", "state":"Up", "time":"5674323454567" }]
-#      }]
-#  }
+# {
+#     "status": "pass",
+#     "link_info": [{
+#         "network": "mgmt",
+#         "type": "ethernet",
+#         "links": [{
+#             "name": "lo",
+#             "state": "Up",
+#             "time": "1577688993681475"
+#         }]
+#     }, {
+#         "network": "cluster-host",
+#         "type": "ethernet",
+#         "links": [{
+#             "name": "lo",
+#             "state": "Up",
+#             "time": "1577688993681516"
+#         }]
+#     }, {
+#         "network": "oam",
+#         "type": "ethernet",
+#         "links": [{
+#             "name": "ens6",
+#             "state": "Up",
+#             "time": "1577688993681564"
+#         }]
+#     }, {
+#         "network": "data-network",
+#         "type": "bond",
+#         "bond": "bond0",
+#         "links": [{
+#             "name": "ens10",
+#             "state": "Up",
+#             "time": "1577688993681636"
+#         }, {
+#             "name": "ens9",
+#             "state": "Up",
+#             "time": "1577688993681641"
+#         }]
+#     }, {
+#         "network": "data-network",
+#         "type": "vlan",
+#         "links": [{
+#             "name": "ens7",
+#             "state": "Up",
+#             "time": "1577689255103060"
+#         }]
+#     }]
+# }
 #
 # On failure
 #
@@ -53,6 +81,38 @@
 #
 # This plugin then uses this information to manage interface alarm
 # assertion and clear with appropriate severity.
+#
+# The data-network is named by the string "data-network" and a single
+# number (as a way to distinguish it from other data-networks). For
+# example, data-network1, data-network2.
+#
+# Some alarm examples of data-network are
+# +----------+----------------------------------+--------------------+----------+----------------+
+# | Alarm ID | Reason Text                      | Entity ID          | Severity | Time Stamp     |
+# +----------+----------------------------------+--------------------+----------+----------------+
+# | 100.113  | 'DATA-NETWORK1' interface failed | host=controller-0. | critical | 2019-12-30T07: |
+# |          |                                  | interface=data-    |          | 04:58          |
+# |          |                                  | network1           |          |                |
+# |          |                                  |                    |          |                |
+# | 100.112  | 'DATA-NETWORK1' port failed      | host=controller-0. | major    | 2019-12-30T07: |
+# |          |                                  | port=ens7          |          | 34:58          |
+# |          |                                  |                    |          |                |
+# +----------+----------------------------------+--------------------+----------+----------------+
+#
+# +----------+----------------------------------+--------------------+----------+----------------+
+# | Alarm ID | Reason Text                      | Entity ID          | Severity | Time Stamp     |
+# +----------+----------------------------------+--------------------+----------+----------------+
+# | 100.113  | 'DATA-NETWORK2' interface failed | host=controller-0. | critical | 2019-12-30T06: |
+# |          |                                  | interface=data-    |          | 38:56          |
+# |          |                                  | network2           |          |                |
+# |          |                                  |                    |          |                |
+# | 100.112  | 'DATA-NETWORK2' port failed      | host=controller-0. | major    | 2019-12-30T06: |
+# |          |                                  | port=ens10         |          | 38:56          |
+# |          |                                  |                    |          |                |
+# | 100.112  | 'DATA-NETWORK2' port failed      | host=controller-0. | major    | 2019-12-30T06: |
+# |          |                                  | port=ens9          |          | 37:48          |
+# |          |                                  |                    |          |                |
+# +----------+----------------------------------+--------------------+----------+----------------+
 #
 # Severity: Interface and Port levels
 #
@@ -110,18 +170,29 @@ PLUGIN_MGMT_IFACE_ALARMID = '100.109'   # Management Network Interface
 PLUGIN_CLSTR_PORT_ALARMID = '100.110'   # Cluster-host Network Port
 PLUGIN_CLSTR_IFACE_ALARMID = '100.111'  # Cluster-host Nwk Interface
 
+PLUGIN_DATA_PORT_ALARMID = "100.112"    # Data-network Network Port
+PLUGIN_DATA_IFACE_ALARMID = "100.113"   # Data-network Network Interface
+
 # List of all alarm identifiers.
 ALARM_ID_LIST = [PLUGIN_OAM_PORT_ALARMID,
                  PLUGIN_OAM_IFACE_ALARMID,
                  PLUGIN_MGMT_PORT_ALARMID,
                  PLUGIN_MGMT_IFACE_ALARMID,
                  PLUGIN_CLSTR_PORT_ALARMID,
-                 PLUGIN_CLSTR_IFACE_ALARMID]
+                 PLUGIN_CLSTR_IFACE_ALARMID,
+                 PLUGIN_DATA_PORT_ALARMID,
+                 PLUGIN_DATA_IFACE_ALARMID]
 
 # Monitored Network Name Strings
 NETWORK_MGMT = 'mgmt'
 NETWORK_CLSTR = 'cluster-host'
 NETWORK_OAM = 'oam'
+NETWORK_DATA = 'data-network'
+
+NETWORK_TYPE_LIST = [NETWORK_MGMT,
+                     NETWORK_CLSTR,
+                     NETWORK_OAM,
+                     NETWORK_DATA]
 
 # Port / Interface State strings
 LINK_UP = 'Up'
@@ -252,6 +323,9 @@ class NetworkObject:
         elif name == NETWORK_CLSTR:
             alarm_id = PLUGIN_CLSTR_PORT_ALARMID
             self.alarm_id = PLUGIN_CLSTR_IFACE_ALARMID
+        elif name.startswith(NETWORK_DATA):
+            alarm_id = PLUGIN_DATA_PORT_ALARMID
+            self.alarm_id = PLUGIN_DATA_IFACE_ALARMID
         else:
             self.alarm_id = ""
             collectd.error("%s unexpected network (%s)" % (PLUGIN, name))
@@ -398,9 +472,7 @@ obj = pc.PluginObject(PLUGIN, PLUGIN_HTTP_URL_PREFIX)
 
 
 # Network Object List - Primary Network/Link Control Object
-NETWORKS = [NetworkObject(NETWORK_MGMT),
-            NetworkObject(NETWORK_OAM),
-            NetworkObject(NETWORK_CLSTR)]
+NETWORKS = []
 
 
 ##########################################################################
@@ -560,7 +632,9 @@ def clear_alarms(alarm_id_list):
                         alarm_id == PLUGIN_MGMT_PORT_ALARMID or \
                         alarm_id == PLUGIN_MGMT_IFACE_ALARMID or \
                         alarm_id == PLUGIN_CLSTR_PORT_ALARMID or \
-                        alarm_id == PLUGIN_CLSTR_IFACE_ALARMID:
+                        alarm_id == PLUGIN_CLSTR_IFACE_ALARMID or \
+                        alarm_id == PLUGIN_DATA_PORT_ALARMID or \
+                        alarm_id == PLUGIN_DATA_IFACE_ALARMID:
 
                     try:
                         if api.clear_fault(alarm_id, eid) is False:
@@ -829,8 +903,14 @@ def read_func():
         for network_link_info in link_info:
             collectd.debug("%s parse link info:%s" %
                            (PLUGIN, network_link_info))
+            network_name = network_link_info['network']
+            if NETWORK_TYPE_LIST.count(network_name) == 0:
+                continue
+            if not is_exist_network(network_link_info):
+                add_network_item(network_link_info)
+
             for network in NETWORKS:
-                if network.name == network_link_info['network']:
+                if is_same_network(network, network_link_info):
                     links = network_link_info['links']
                     nname = network.name
                     if len(links) > 0:
@@ -973,6 +1053,60 @@ def read_func():
     obj.audits += 1
 
     return 0
+
+
+def add_network_item(network_link_info):
+    """add a new network object"""
+
+    network_name = network_link_info['network']
+
+    if network_name == NETWORK_DATA:
+        data_network_index = 0
+        for item in NETWORKS:
+            if item.name.startswith(NETWORK_DATA):
+                data_network_index += 1
+        network_name = network_name + str(data_network_index)
+    network = NetworkObject(network_name)
+
+    links = network_link_info['links']
+    if len(links) > 0:
+        link_one = links[0]
+        network.link_one.name = link_one['name']
+    if len(links) > 1:
+        link_two = links[1]
+        network.link_two.name = link_two['name']
+
+    NETWORKS.append(network)
+
+
+def is_exist_network(network_link_info):
+    """check if this network already exists"""
+
+    for network in NETWORKS:
+        if is_same_network(network, network_link_info):
+            return True
+    return False
+
+
+def is_same_network(network, network_link_info):
+    """check if these networks are the same"""
+
+    network_name = network_link_info['network']
+    links = network_link_info['links']
+
+    if network.name.startswith(network_name):
+        if len(links) > 1:
+            link_one = links[0]
+            link_two = links[1]
+            if network.link_one.name == link_one['name'] and \
+                    network.link_two.name == link_two['name']:
+                return True
+        if len(links) > 0:
+            link_one = links[0]
+            if network.link_one.name == link_one['name']:
+                return True
+
+    return False
 
 
 # register the config, init and read functions
