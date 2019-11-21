@@ -738,7 +738,6 @@ def read_func():
                     # a new ntp server is selected, old alarm may not be
                     # valid
                     _clear_base_alarm()
-                    obj.alarm_raised = False
                 if obj.peer_selected is False:
                     if obj.selected_server:
                         # done update the selected server if more selections

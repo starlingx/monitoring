@@ -23,4 +23,4 @@ COPY_LIST="$PKG_BASE/src/LICENSE \
   $PKG_BASE/src/ovs_interface.conf \
   $PKG_BASE/src/example.py \
   $PKG_BASE/src/example.conf"
-TIS_PATCH_VER=16
+TIS_PATCH_VER=17
