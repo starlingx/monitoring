@@ -22,15 +22,20 @@
 # A server is considered unreachable if the Tally Code is a ' ' (space)
 # A server with a '*' Tally Code is the 'selected' server.
 #
-# Here is an example of the ntpq command output
+# Here is an example of the ntpq command output. The IP address is displayed on
+# its own line to support displaying long IPV6 addresses.
 #
-#      remote           refid      st t when poll reach   delay  offset  jitter
+#      remote           refid     st t when poll reach   delay   offset  jitter
 # =============================================================================
-# +192.168.204.104 206.108.0.133    2 u  203 1024  377    0.226  -3.443   1.137
-# +97.107.129.217  200.98.196.212   2 u  904 1024  377   21.677   5.577   0.624
-#  192.95.27.155   24.150.203.150   2 u  226 1024  377   15.867   0.381   1.124
-# -97.107.129.217  200.98.196.212   2 u  904 1024  377   21.677   5.577   0.624
-# *182.95.27.155   24.150.203.150   2 u  226 1024  377   15.867   0.381   1.124
+# +192.168.204.3
+#                  149.56.27.12    3 u  315  512  376    0.160  -28.910   3.993
+# +154.11.146.39
+#                  172.21.138.4    2 u  197  512  377   54.249  -20.327   7.677
+# +129.250.35.251
+#                  249.224.99.213  2 u  429  512  377   16.921  -35.557   5.930
+# *206.108.0.132
+#                  .PTP0.          1 u  442  512  377    8.057  -36.061   6.171
+#
 #
 # The local controller node is not to be considered a reachable server and is
 # never alarmed if it is not reachable.
@@ -66,7 +71,7 @@ import socket
 api = fm_api.FaultAPIsV2()
 
 PLUGIN = 'NTP query plugin'
-PLUGIN_INTERVAL = 600          # audit interval in secs
+PLUGIN_INTERVAL = 300          # audit interval in secs
 PLUGIN_CONF = '/etc/ntp.conf'
 PLUGIN_EXEC = '/usr/sbin/ntpq'
 PLUGIN_EXEC_OPTIONS = '-pn'
@@ -201,7 +206,7 @@ def _raise_alarm(ip=None):
             # That way it will be retried at a later time.
             collectd.error("%s 'set_fault' failed ; %s:%s ; %s" %
                            (PLUGIN, PLUGIN_ALARMID, eid, alarm_uuid))
-            return 0
+            return True
         else:
             collectd.info("%s raised alarm %s:%s" %
                           (PLUGIN,
@@ -219,7 +224,7 @@ def _raise_alarm(ip=None):
                         eid,
                         fm_severity,
                         ex))
-    return 0
+    return True
 
 
 ###############################################################################
@@ -695,8 +700,10 @@ def read_func():
     # Ignore the first 2 lines ; just header data.
     for i in range(2, len(obj.ntpq)):
 
-        # ignore empty or lines that are not long enough
-        if len(obj.ntpq[i]) < 10:
+        # Ignore empty or lines that are not long enough. IPV4 IP Address is at
+        # least 7 characters long, IPV6 2. Adding 1 character for the
+        # availability flag.
+        if len(obj.ntpq[i]) < 3:
             continue
 
         # log the ntpq output ; minus the 2 lines of header
