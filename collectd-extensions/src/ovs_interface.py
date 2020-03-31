@@ -41,10 +41,10 @@
 #  0       or 0% percent used        - all interfaces for that port are Down
 #
 # For example:
-#     x will be 0 when all interfaces of that port are Down.
-#     x will be 50 when one interface of the bond which contains two interfaces is down.
-#     x will be 66.7 when two of the bond which contains three interfaces are down.
-#     x will be 100 when all interfaces of that port are up.
+#     x is 0 when all interfaces of that port are Down.
+#     x is 50 when one interface of a two interface bond is down.
+#     x is 66.7 when two of a three interface bond is down.
+#     x is 100 when all interfaces of that port are up.
 #
 ############################################################################
 
@@ -56,6 +56,7 @@ import plugin_common as pc
 from oslo_concurrency import processutils
 from fm_api import constants as fm_constants
 from fm_api import fm_api
+import tsconfig.tsconfig as tsc
 
 # Fault manager API Object
 api = fm_api.FaultAPIsV2()
@@ -219,7 +220,7 @@ class InterfaceObject:
             return True
 
     def manage_interface_alarm(self, current_state):
-        """raise or clear interface alarm based on previous state and current state"""
+        """raise or clear interface alarm based on previous/current state"""
 
         if current_state != self.state:
             if current_state == LINK_UP:
@@ -858,7 +859,9 @@ def init_func():
         if obj.init_ready() is False:
             return 0
 
-    obj.hostname = obj.gethostname()
+    # Only runs on worker nodes
+    if 'worker' not in tsc.subfunctions:
+        return 0
 
     # Check whether this host is openstack worker node or not
     # OVS and OVSDPDK will only run on openstack worker node
@@ -873,15 +876,22 @@ def init_func():
             if count == 1 and pid:
                 # /var/run/openvswitch/ovs-vswitchd.43.ctl
                 global OVS_VSWITCHD_SOCKET
-                OVS_VSWITCHD_SOCKET = "".join([OVS_VSWITCHD_PATH, ".", pid, ".ctl"])
+                OVS_VSWITCHD_SOCKET = \
+                    "".join([OVS_VSWITCHD_PATH, ".", pid, ".ctl"])
                 obj.init_done = True
+                obj.hostname = obj.gethostname()
                 collectd.info("%s initialization complete" % PLUGIN)
-            else:
+                obj.error_logged = False
+
+            elif obj.error_logged is False:
                 collectd.info("%s failed to retrieve pid for ovs-vswitchd in "
-                              "file /var/run/openvswitch/ovs-vswitchd.pid" % PLUGIN)
-    else:
-        collectd.info("%s failed to initial because pid file "
-                      "for ovs-vswitchd doesn't exist" % PLUGIN)
+                              "file /var/run/openvswitch/ovs-vswitchd.pid" %
+                              PLUGIN)
+                obj.error_logged = True
+
+    elif obj.error_logged is False:
+        collectd.info("%s waiting for ovs-vswitchd to be running" % PLUGIN)
+        obj.error_logged = True
 
     return 0
 

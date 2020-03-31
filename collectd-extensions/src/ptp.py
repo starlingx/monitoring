@@ -813,7 +813,7 @@ def read_func():
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC,
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', PLUGIN_CONF_FILE,
                                     '-u', '-b', '0', 'GET PORT_DATA_SET'])
 
     port_locked = False
@@ -829,7 +829,7 @@ def read_func():
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC,
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', PLUGIN_CONF_FILE,
                                     '-u', '-b', '0', 'GET TIME_STATUS_NP'])
 
     got_master_offset = False
