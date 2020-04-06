@@ -51,7 +51,7 @@ Requires: tsconfig
 Requires: /bin/systemctl
 
 %description
-Titanium Cloud collectd extensions
+StarlingX collectd extensions
 
 %define debug_package %{nil}
 %define local_unit_dir %{_sysconfdir}/systemd/system
