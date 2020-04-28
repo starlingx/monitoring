@@ -10,3 +10,6 @@ monitor-tools
 
 # vm-topology
 vm-topology
+
+# kube-cpusets
+kube-cpusets

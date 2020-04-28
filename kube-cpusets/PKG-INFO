@@ -1,0 +1,12 @@
+Metadata-Version: 1.1
+Name: kube-cpusets
+Version: 1.0
+Summary: Display kubernetes containers cpusets per numa-node
+Home-page:
+Author: Windriver
+Author-email: info@windriver.com
+License: Apache-2.0
+
+Description: Display kubernetes containers cpusets per numa-node
+
+Platform: UNKNOWN
