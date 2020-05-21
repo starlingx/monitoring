@@ -226,6 +226,7 @@ class LinkObject:
         self.severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
         self.alarm_id = alarm_id
         self.state_change = True
+        self.port_alarm = False
 
         collectd.debug("%s LinkObject constructor: %s" %
                        (PLUGIN, alarm_id))
@@ -928,9 +929,11 @@ def read_func():
                             collectd.debug("%s %s IS Up [%s]" %
                                            (PLUGIN, network.link_one.name,
                                             network.link_one.state))
-                            if network.link_one.state != LINK_UP:
+                            if (network.link_one.state != LINK_UP
+                                    or network.link_one.port_alarm):
                                 network.link_one.state_change = True
-                                network.link_one.clear_port_alarm(nname)
+                                if network.link_one.clear_port_alarm(nname):
+                                    network.link_one.port_alarm = False
                             network.link_one.state = LINK_UP
                         else:
                             collectd.debug("%s %s IS Down [%s]" %
@@ -938,7 +941,8 @@ def read_func():
                                             network.link_one.state))
                             if network.link_one.state == LINK_UP:
                                 network.link_one.state_change = True
-                                network.link_one.raise_port_alarm(nname)
+                                if network.link_one.raise_port_alarm(nname):
+                                    network.link_one.port_alarm = True
                             network.link_one.state = LINK_DOWN
 
                     if len(links) > 1:
@@ -956,9 +960,11 @@ def read_func():
                             collectd.debug("%s %s IS Up [%s]" %
                                            (PLUGIN, network.link_two.name,
                                             network.link_two.state))
-                            if network.link_two.state != LINK_UP:
+                            if (network.link_two.state != LINK_UP or
+                                    network.link_two.port_alarm):
                                 network.link_two.state_change = True
-                                network.link_two.clear_port_alarm(nname)
+                                if network.link_two.clear_port_alarm(nname):
+                                    network.link_two.port_alarm = False
                                 network.link_two.state = LINK_UP
                         else:
                             collectd.debug("%s %s IS Down [%s]" %
@@ -966,7 +972,8 @@ def read_func():
                                             network.link_two.state))
                             if network.link_two.state == LINK_UP:
                                 network.link_two.state_change = True
-                                network.link_two.raise_port_alarm(nname)
+                                if network.link_two.raise_port_alarm(nname):
+                                    network.link_two.port_alarm = True
                             network.link_two.state = LINK_DOWN
 
                     # manage interface alarms

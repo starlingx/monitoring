@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019 Wind River Systems, Inc.
+# Copyright (c) 2019-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -50,8 +50,8 @@ PLUGIN = 'ptp plugin'
 # Service name
 PTP = 'Precision Time Protocol (PTP)'
 
-# Interface Monitoring Interval in seconds
-PLUGIN_AUDIT_INTERVAL = 300
+# PTP Interface Monitoring Interval in seconds
+PLUGIN_AUDIT_INTERVAL = 30
 
 # Sample Data 'type' and 'instance' database field values.
 PLUGIN_TYPE = 'time_offset'

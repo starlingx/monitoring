@@ -18,7 +18,7 @@ Requires: influxdb
 Requires: /bin/systemctl
 
 %description
-Titanium Cloud influxdb extensions
+StarlingX influxdb extensions
 
 %define debug_package %{nil}
 %define local_unit_dir %{_sysconfdir}/systemd/system
