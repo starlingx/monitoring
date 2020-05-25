@@ -12,7 +12,6 @@
 # - Platform Memory and breakdown (base, kube-system, kube-addon).
 # - Overall 4K memory usage (anon, avail, total, and cgroup-rss).
 # - Per-numa node 4K memory usage (anon, avail, total).
-# - Per-numa node hugepages usage.
 #
 # Example commands to read samples from the influx database:
 # SELECT * FROM memory_value WHERE type='percent' AND type_instance='used'
@@ -29,7 +28,6 @@ import time
 PLUGIN = 'platform memory usage'
 PLUGIN_NORM = '4K memory usage'
 PLUGIN_NUMA = '4K numa memory usage'
-PLUGIN_HUGE = 'hugepage memory usage'
 PLUGIN_DEBUG = 'DEBUG memory'
 
 # Memory cgroup controller
@@ -190,9 +188,6 @@ def get_cgroup_memory(path):
     # Calculate RSS usage in MiB
     memory['rss_MiB'] = float(m.get('total_rss', 0)) / float(pc.Mi)
 
-    # Calculate RSS Hugepages usage in MiB
-    memory['rss_huge_MiB'] = float(m.get('total_rss_huge', 0)) / float(pc.Mi)
-
     return memory
 
 
@@ -345,21 +340,10 @@ def calc_normal_memory_nodes():
         else:
             anon_percent = 0.0
 
-        hp_used = meminfo['HugePages_Total'] - meminfo['HugePages_Free']
-        hp_total = meminfo['HugePages_Total']
-        if hp_total > 0:
-            hp_percent = float(pc.ONE_HUNDRED) \
-                * float(hp_used) / float(hp_total)
-        else:
-            hp_percent = 0.0
-
         normal_nodes[node]['anon_MiB'] = anon_MiB
         normal_nodes[node]['avail_MiB'] = avail_MiB
         normal_nodes[node]['total_MiB'] = total_MiB
         normal_nodes[node]['anon_percent'] = anon_percent
-        normal_nodes[node]['hp_used'] = hp_used
-        normal_nodes[node]['hp_total'] = hp_total
-        normal_nodes[node]['hp_percent'] = hp_percent
 
     return normal_nodes
 
@@ -554,11 +538,6 @@ def read_func():
         val.plugin_instance = node
         val.dispatch(values=[obj.normal_nodes[node]['anon_percent']])
 
-        # Only dispatch hugepage sample if Huge Page Memory is allocated
-        if obj.normal_nodes[node]['hp_total'] > 0:
-            val.plugin_instance = node + '_hugepages'
-            val.dispatch(values=[obj.normal_nodes[node]['hp_percent']])
-
     # Display debug memory logs
     if obj.debug:
         # First-level cgroup memory summary
@@ -609,13 +588,6 @@ def read_func():
                              obj.normal_nodes[node]['anon_MiB'],
                              obj.normal_nodes[node]['avail_MiB'],
                              obj.normal_nodes[node]['total_MiB']))
-            if obj.normal_nodes[node]['hp_total'] > 0:
-                collectd.info('%s: %s, Used: %.2f%%, '
-                              'Used: %d hugepages, Total: %d hugepages'
-                              % (PLUGIN_HUGE, node,
-                                 obj.normal_nodes[node]['hp_percent'],
-                                 obj.normal_nodes[node]['hp_used'],
-                                 obj.normal_nodes[node]['hp_total']))
 
     # Calculate overhead cost of gathering metrics
     if obj.debug:
