@@ -13,15 +13,15 @@ Source0:        %{pypi_name}-%{version}.tar.gz
 
 BuildArch:      noarch
 
-BuildRequires: python
-BuildRequires: python-setuptools
-BuildRequires: python2-pip
-BuildRequires: python2-wheel
-BuildRequires: python-keyring
+BuildRequires: python3
+BuildRequires: python3-setuptools
+BuildRequires: python3-pip
+BuildRequires: python3-wheel
+BuildRequires: python3-keyring
 BuildRequires: libvirt
 
-Requires: python
-Requires: python-keyring
+Requires: python3
+Requires: python3-keyring
 Requires: /usr/bin/env
 Requires: libvirt
 
@@ -36,11 +36,11 @@ rm -rf %{pypi_name}.egg-info
 rm -f requirements.txt
 
 %build
-%{__python2} setup.py build
-%py2_build_wheel
+%{__python3} setup.py build
+%py3_build_wheel
 
 %install
-%{__python2} setup.py install --skip-build --root %{buildroot}
+%{__python3} setup.py install --skip-build --root %{buildroot}
 mkdir -p $RPM_BUILD_ROOT/wheels
 install -m 644 dist/*.whl $RPM_BUILD_ROOT/wheels/
 
@@ -48,8 +48,8 @@ install -m 644 dist/*.whl $RPM_BUILD_ROOT/wheels/
 %defattr(-,root,root,-)
 %license LICENSE
 %{_bindir}/vm-topology
-%{python2_sitelib}/vm_topology
-%{python2_sitelib}/*.egg-info
+%{python3_sitelib}/vm_topology
+%{python3_sitelib}/*.egg-info
 
 %package wheels
 Summary: %{name} wheels
