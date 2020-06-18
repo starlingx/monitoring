@@ -66,6 +66,9 @@ import collectd
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 import tsconfig.tsconfig as tsc
+
+import plugin_common as pc
+
 import socket
 
 api = fm_api.FaultAPIsV2()
@@ -79,12 +82,8 @@ PLUGIN_ALARMID = "100.114"
 
 
 # define a class here that will persist over read calls
-class NtpqObject:
+class NtpqObject(pc.PluginObject):
 
-    # static variables set in init
-    hostname = ''                   # the name of this host
-    base_eid = ''                   # the eid for the major alarm
-    init_complete = False         # set to true once config is complete
     alarm_raised = False            # True when the major alarm is asserted
 
     server_list_conf = []           # list of servers in the /etc/ntp.conf file
@@ -106,7 +105,7 @@ class NtpqObject:
 
 
 # This plugin's class object - persists over read calls
-obj = NtpqObject()
+obj = NtpqObject(PLUGIN, '')
 
 
 ###############################################################################
@@ -278,7 +277,7 @@ def _clear_base_alarm():
 ###############################################################################
 
 def _remove_ip_from_unreachable_list(ip):
-    """Remove an IP address from the unreachable list and clear its NTP alarms"""
+    """Remove IP address from the unreachable list and clear its NTP alarms"""
 
     # remove from unreachable list if its there
     if ip and ip in obj.unreachable_servers:
@@ -553,12 +552,11 @@ def init_func():
         return 0
 
     # do nothing till config is complete.
-    # init_func will be called again by read_func once config is complete.
-    if os.path.exists(tsc.VOLATILE_CONTROLLER_CONFIG_COMPLETE) is False:
+    if obj.config_complete() is False:
         return 0
 
     # get current hostname
-    obj.hostname = os.uname()[1]
+    obj.hostname = obj.gethostname()
     if not obj.hostname:
         collectd.error("%s failed to get hostname" % PLUGIN)
         return 1
@@ -617,8 +615,7 @@ def init_func():
     else:
         collectd.info("%s no major startup alarms found" % PLUGIN)
 
-    obj.init_complete = True
-
+    obj.init_completed()
     return 0
 
 
@@ -650,9 +647,7 @@ def read_func():
         return 0
 
     if obj.init_complete is False:
-        if os.path.exists(tsc.VOLATILE_CONTROLLER_CONFIG_COMPLETE) is True:
-            collectd.info("%s re-running init" % PLUGIN)
-            init_func()
+        init_func()
         return 0
 
     # get a list if provisioned ntp servers

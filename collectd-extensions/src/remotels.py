@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019 Wind River Systems, Inc.
+# Copyright (c) 2019-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -146,15 +146,14 @@ def init_func():
     if tsc.nodetype != 'controller':
         return 0
 
-    if obj.init_done is False:
-        if obj.init_ready() is False:
-            return False
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
+        return 0
 
     obj.hostname = obj.gethostname()
     obj.base_eid = 'host=' + obj.hostname
-    obj.init_done = True
-    collectd.info("%s initialization complete" % PLUGIN)
 
+    obj.init_completed()
     return True
 
 
@@ -166,7 +165,7 @@ def read_func():
     if tsc.nodetype != 'controller':
         return 0
 
-    if obj.init_done is False:
+    if obj.init_complete is False:
         init_func()
         return 0
 

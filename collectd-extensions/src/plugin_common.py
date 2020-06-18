@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019 Wind River Systems, Inc.
+# Copyright (c) 2019-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -15,6 +15,7 @@ import json
 import uuid
 import httplib2
 import socket
+import time
 import os
 from oslo_concurrency import processutils
 from fm_api import constants as fm_constants
@@ -56,7 +57,7 @@ GROUP_OVERALL = 'overall'
 GROUP_FIRST = 'first'
 GROUP_PODS = 'pods'
 
-# Overall cpuacct groupings 
+# Overall cpuacct groupings
 GROUP_TOTAL = 'cgroup-total'
 GROUP_PLATFORM = 'platform'
 GROUP_BASE = 'base'
@@ -99,7 +100,7 @@ PLUGIN_FAIL = 1
 
 class PluginObject(object):
 
-    def __init__(self, plugin, url):
+    def __init__(self, plugin, url=""):
 
         # static variables set in init_func
         self.plugin = plugin             # the name of this plugin
@@ -110,9 +111,9 @@ class PluginObject(object):
 
         # dynamic gate variables
         self.virtual = False             # set to True if host is virtual
-        self.config_complete = False     # set to True once config is complete
+        self._config_complete = False    # set to True once config is complete
         self.config_done = False         # set true if config_func completed ok
-        self.init_done = False           # set true if init_func completed ok
+        self.init_complete = False       # set true if init_func completed ok
         self.fm_connectivity = False     # set true when fm connectivity ok
 
         self.alarm_type = fm_constants.FM_ALARM_TYPE_7     # OPERATIONAL
@@ -141,6 +142,7 @@ class PluginObject(object):
         self.error_logged = False        # used to prevent log flooding
         self.log_throttle_count = 0      # used to count throttle logs
         self.INIT_LOG_THROTTLE = 10      # the init log throttle threshold
+        self.CONFIG_LOG_THROTTLE = 50    # the config log throttle threshold
         self.http_retry_count = 0        # track http error cases
         self.HTTP_RETRY_THROTTLE = 6     # http retry threshold
         self.phase = 0                   # tracks current phase; init, sampling
@@ -150,28 +152,57 @@ class PluginObject(object):
 
     ###########################################################################
     #
-    # Name       : init_ready
+    # Name       : init_completed
     #
-    # Description: Test for init ready condition
+    # Description: Declare init completed
     #
     # Parameters : plugin name
     #
-    # Returns    : False if initial config complete is not done
-    #              True if initial config complete is done
+    ###########################################################################
+
+    def init_completed(self):
+        """Declare plugin init complete"""
+
+        collectd.info("%s initialization completed" % self.plugin)
+        self.init_complete = True
+
+    ###########################################################################
+    #
+    # Name       : config_complete
+    #
+    # Description: Test for config complete condition
+    #
+    # Parameters : plugin name
+    #
+    # Returns    : False if config is not complete
+    #              True if config is complete
     #
     ###########################################################################
 
-    def init_ready(self):
-        """Test for system init ready state"""
+    def config_complete(self):
+        """Test for config complete state"""
 
-        if os.path.exists(tsc.INITIAL_CONFIG_COMPLETE_FLAG) is False:
-            self.log_throttle_count += 1
-            if self.log_throttle_count > self.INIT_LOG_THROTTLE:
-                collectd.info("%s initialization needs retry" % self.plugin)
+        if self._config_complete is False:
+            if tsc.nodetype == 'worker' or 'worker' in tsc.subfunctions:
+                flag_file = tsc.VOLATILE_WORKER_CONFIG_COMPLETE
+            elif tsc.nodetype == 'storage':
+                flag_file = tsc.VOLATILE_STORAGE_CONFIG_COMPLETE
+            else:
+                flag_file = tsc.VOLATILE_CONTROLLER_CONFIG_COMPLETE
+
+            if os.path.exists(flag_file) is False:
+                self._config_complete = False
+                self.log_throttle_count += 1
+                if self.log_throttle_count > self.CONFIG_LOG_THROTTLE:
+                    collectd.info("%s configuration check needs retry" %
+                                  self.plugin)
+                    self.log_throttle_count = 0
+                time.sleep(1)
+                return False
+            else:
+                self._config_complete = True
                 self.log_throttle_count = 0
-            return False
-        else:
-            self.log_throttle_count = 0
+                collectd.info("%s configuration completed" % self.plugin)
 
         return True
 

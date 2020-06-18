@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2019 Wind River Systems, Inc.
+# Copyright (c) 2018-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -48,15 +48,15 @@ re_keyquoteval = re.compile(r'^\s*(\S+)\s*[=:]\s*\"(\S+)\"\s*')
 
 
 # Plugin specific control class and object.
-class CPU_object:
+class CPU_object(pc.PluginObject):
 
     def __init__(self):
+        super(CPU_object, self).__init__(PLUGIN, '')
         self.debug = True
         self.verbose = True
         self._cache = {}
         self._k8s_client = pc.K8sClient()
         self.k8s_pods = set()
-        self.hostname = ''
 
         self.schedstat_version = 0
         self.schedstat_supported = True
@@ -71,6 +71,7 @@ class CPU_object:
         self._data = {}    # derived measurements at end of sample interval
         self._data[PLATFORM_CPU_PERCENT] = 0.0
         self.elapsed_ms = 0.0
+
 
 # Instantiate the class
 obj = CPU_object()
@@ -410,8 +411,11 @@ def config_func(config):
 def init_func():
     """Init the plugin."""
 
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
+        return False
+
     obj.hostname = socket.gethostname()
-    collectd.info('%s init function for %s' % (PLUGIN, obj.hostname))
 
     # Determine the full list of logical cpus for this host
     obj.logical_cpus = get_logical_cpus()
@@ -459,13 +463,16 @@ def init_func():
     # Gather initial cputime state information.
     update_cpu_data(init=True)
 
-    collectd.info('%s initialization complete' % PLUGIN)
-
+    obj.init_completed()
     return pc.PLUGIN_PASS
 
 
 # Calculate the CPU usage sample
 def read_func():
+
+    if obj.init_complete is False:
+        init_func()
+        return 0
 
     # epoch time in floating seconds
     now0 = time.time()
