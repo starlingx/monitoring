@@ -327,7 +327,7 @@ def update_cpu_data(init=False):
     for i in t1_cpuacct.keys():
         cpuacct[i] = {}
         for k, v in t1_cpuacct[i].items():
-            if k in obj._t0_cpuacct[i]:
+            if i in obj._t0_cpuacct and k in obj._t0_cpuacct[i]:
                 cpuacct[i][k] = v - obj._t0_cpuacct[i][k]
             else:
                 cpuacct[i][k] = v
