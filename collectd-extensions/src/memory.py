@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2019 Wind River Systems, Inc.
+# Copyright (c) 2018-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -53,15 +53,15 @@ re_base_mem = re.compile('\"node\d+:(\d+)MB:\d+\"')
 
 
 # Plugin specific control class and object.
-class MEM_object:
+class MEM_object(pc.PluginObject):
 
     def __init__(self):
+        super(MEM_object, self).__init__(PLUGIN, '')
         self.debug = False
         self.verbose = False
         self._cache = {}
         self._k8s_client = pc.K8sClient()
         self.k8s_pods = set()
-        self.hostname = ''
         self.reserved_MiB = 0.0
         self.reserve_all = False
         self.strict_memory_accounting = False
@@ -369,6 +369,10 @@ def config_func(config):
 def init_func():
     """Init the plugin."""
 
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
+        return 0
+
     obj.hostname = socket.gethostname()
     collectd.info('%s: init function for %s' % (PLUGIN, obj.hostname))
 
@@ -382,14 +386,17 @@ def init_func():
     collectd.info('%s: reserve_all: %s, reserved_MiB: %d'
                   % (PLUGIN, obj.reserve_all, obj.reserved_MiB))
 
-    collectd.info('%s: initialization complete' % PLUGIN)
-
+    obj.init_completed()
     return pc.PLUGIN_PASS
 
 
 # The memory plugin read function - called every audit interval
 def read_func():
     """collectd memory monitor plugin read function"""
+
+    if obj.init_complete is False:
+        init_func()
+        return 0
 
     # Get epoch time in floating seconds
     now0 = time.time()

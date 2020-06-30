@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2019 Wind River Systems, Inc.
+# Copyright (c) 2018-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -236,6 +236,9 @@ ALARM_ID__TO__PLUGIN_DICT = {ALARM_ID__CPU: PLUGIN__CPU,
                              ALARM_ID__VSWITCH_MEM: PLUGIN__VSWITCH_MEM,
                              ALARM_ID__VSWITCH_PORT: PLUGIN__VSWITCH_PORT,
                              ALARM_ID__VSWITCH_IFACE: PLUGIN__VSWITCH_IFACE}
+
+# Common plugin object
+pluginObject = pc.PluginObject(PLUGIN, '')
 
 
 #########################################
@@ -547,8 +550,8 @@ class DegradeObject:
 mtcDegradeObj = DegradeObject(MTCE_CMD_RX_PORT)
 
 
-# PluginObject Class
-class PluginObject:
+# fmAlarmObject Class
+class fmAlarmObject:
 
     dbObj = None                           # shared database connection obj
     host = None                            # saved hostname
@@ -561,7 +564,7 @@ class PluginObject:
     fm_connectivity = False
 
     def __init__(self, id, plugin):
-        """PluginObject Class constructor"""
+        """fmAlarmObject Class constructor"""
 
         # plugin specific static class members.
         self.id = id               # alarm id ; 100.1??
@@ -1121,7 +1124,7 @@ class PluginObject:
 
         try:
             collectd.debug("%s %s Get   Lock ..." % (PLUGIN, self.plugin))
-            with PluginObject.lock:
+            with fmAlarmObject.lock:
                 obj = self.instance_objects[eid]
                 return obj
         except:
@@ -1147,7 +1150,7 @@ class PluginObject:
         """
         try:
             collectd.debug("%s %s Add   Lock ..." % (PLUGIN, self.plugin))
-            with PluginObject.lock:
+            with fmAlarmObject.lock:
                 self.instance_objects[eid] = obj
         except:
             collectd.error("%s failed to add instance to %s object list" %
@@ -1188,7 +1191,7 @@ class PluginObject:
 
         try:
             # create a new plugin object
-            inst_obj = PluginObject(self.id, self.plugin)
+            inst_obj = fmAlarmObject(self.id, self.plugin)
             self._copy_instance_object(inst_obj)
 
             # initialize the object with instance specific data
@@ -1259,7 +1262,7 @@ class PluginObject:
             # loop over the mount points
             for mp in mountpoints:
                 # create a new plugin object
-                inst_obj = PluginObject(ALARM_ID__DF, PLUGIN__DF)
+                inst_obj = fmAlarmObject(ALARM_ID__DF, PLUGIN__DF)
 
                 # initialize the object with instance specific data
                 inst_obj.resource_name = self.resource_name
@@ -1282,24 +1285,21 @@ class PluginObject:
                               (PLUGIN, inst_obj.instance))
 
 
-PluginObject.host = os.uname()[1]
-
-
 # ADD_NEW_PLUGIN: add plugin to this table
 # This instantiates the plugin objects
 PLUGINS = {
-    PLUGIN__CPU: PluginObject(ALARM_ID__CPU, PLUGIN__CPU),
-    PLUGIN__MEM: PluginObject(ALARM_ID__MEM, PLUGIN__MEM),
-    PLUGIN__DF: PluginObject(ALARM_ID__DF, PLUGIN__DF),
-    PLUGIN__VSWITCH_CPU: PluginObject(ALARM_ID__VSWITCH_CPU,
-                                      PLUGIN__VSWITCH_CPU),
-    PLUGIN__VSWITCH_MEM: PluginObject(ALARM_ID__VSWITCH_MEM,
-                                      PLUGIN__VSWITCH_MEM),
-    PLUGIN__VSWITCH_PORT: PluginObject(ALARM_ID__VSWITCH_PORT,
-                                       PLUGIN__VSWITCH_PORT),
-    PLUGIN__VSWITCH_IFACE: PluginObject(ALARM_ID__VSWITCH_IFACE,
-                                        PLUGIN__VSWITCH_IFACE),
-    PLUGIN__EXAMPLE: PluginObject(ALARM_ID__EXAMPLE, PLUGIN__EXAMPLE)}
+    PLUGIN__CPU: fmAlarmObject(ALARM_ID__CPU, PLUGIN__CPU),
+    PLUGIN__MEM: fmAlarmObject(ALARM_ID__MEM, PLUGIN__MEM),
+    PLUGIN__DF: fmAlarmObject(ALARM_ID__DF, PLUGIN__DF),
+    PLUGIN__VSWITCH_CPU: fmAlarmObject(ALARM_ID__VSWITCH_CPU,
+                                       PLUGIN__VSWITCH_CPU),
+    PLUGIN__VSWITCH_MEM: fmAlarmObject(ALARM_ID__VSWITCH_MEM,
+                                       PLUGIN__VSWITCH_MEM),
+    PLUGIN__VSWITCH_PORT: fmAlarmObject(ALARM_ID__VSWITCH_PORT,
+                                        PLUGIN__VSWITCH_PORT),
+    PLUGIN__VSWITCH_IFACE: fmAlarmObject(ALARM_ID__VSWITCH_IFACE,
+                                         PLUGIN__VSWITCH_IFACE),
+    PLUGIN__EXAMPLE: fmAlarmObject(ALARM_ID__EXAMPLE, PLUGIN__EXAMPLE)}
 
 
 #####################################################################
@@ -1359,7 +1359,7 @@ def _build_entity_id(plugin, plugin_instance):
     inst_error = False
 
     entity_id = 'host='
-    entity_id += PluginObject.host
+    entity_id += fmAlarmObject.host
 
     if plugin == PLUGIN__MEM:
         if plugin_instance != 'platform':
@@ -1498,7 +1498,7 @@ def _print_state(obj=None):
             objs.append(obj)
 
         collectd.debug("%s _print_state Lock ..." % PLUGIN)
-        with PluginObject.lock:
+        with fmAlarmObject.lock:
             for o in objs:
                 _print_obj(o)
                 if len(o.instance_objects):
@@ -1520,10 +1520,10 @@ def _database_setup(database):
 
     # http://influxdb-python.readthedocs.io/en/latest/examples.html
     # http://influxdb-python.readthedocs.io/en/latest/api-documentation.html
-    PluginObject.dbObj = InfluxDBClient('127.0.0.1', '8086', database)
-    if PluginObject.dbObj:
+    fmAlarmObject.dbObj = InfluxDBClient('127.0.0.1', '8086', database)
+    if fmAlarmObject.dbObj:
         try:
-            PluginObject.dbObj.create_database('collectd')
+            fmAlarmObject.dbObj.create_database('collectd')
 
             ############################################################
             #
@@ -1544,14 +1544,14 @@ def _database_setup(database):
             #
             ############################################################
 
-            PluginObject.dbObj.create_retention_policy(
+            fmAlarmObject.dbObj.create_retention_policy(
                 DATABASE_NAME, '1w', 1, database, True)
         except Exception as ex:
             if str(ex) == 'database already exists':
                 try:
                     collectd.info("%s influxdb:collectd %s" %
                                   (PLUGIN, str(ex)))
-                    PluginObject.dbObj.create_retention_policy(
+                    fmAlarmObject.dbObj.create_retention_policy(
                         DATABASE_NAME, '1w', 1, database, True)
                 except Exception as ex:
                     if str(ex) == 'retention policy already exists':
@@ -1568,7 +1568,7 @@ def _database_setup(database):
     if not error_str:
             found = False
             retention = \
-                PluginObject.dbObj.get_list_retention_policies(database)
+                fmAlarmObject.dbObj.get_list_retention_policies(database)
             for r in range(len(retention)):
                 if retention[r]["name"] == DATABASE_NAME:
                     collectd.info("%s influxdb:%s samples retention "
@@ -1577,7 +1577,7 @@ def _database_setup(database):
                     found = True
             if found is True:
                 collectd.info("%s influxdb:%s is setup" % (PLUGIN, database))
-                PluginObject.database_setup = True
+                fmAlarmObject.database_setup = True
             else:
                 collectd.error("%s influxdb:%s retention policy NOT setup" %
                                (PLUGIN, database))
@@ -1625,14 +1625,14 @@ def init_func():
     """Collectd FM Notifier Initialization Function"""
 
     mtcDegradeObj.port = MTCE_CMD_RX_PORT
-    collectd.error("%s mtce port %d" %
-                   (PLUGIN, mtcDegradeObj.port))
+    collectd.info("%s mtce port %d" %
+                  (PLUGIN, mtcDegradeObj.port))
 
-    PluginObject.lock = Lock()
+    fmAlarmObject.lock = Lock()
 
-    PluginObject.host = os.uname()[1]
+    fmAlarmObject.host = pluginObject.gethostname()
     collectd.info("%s %s:%s init function" %
-                  (PLUGIN, tsc.nodetype, PluginObject.host))
+                  (PLUGIN, tsc.nodetype, fmAlarmObject.host))
 
     # Constant CPU Plugin Object Settings
     obj = PLUGINS[PLUGIN__CPU]
@@ -1737,20 +1737,28 @@ def init_func():
     # ...
 
     if tsc.nodetype == 'controller':
-        PluginObject.database_setup_in_progress = True
+        fmAlarmObject.database_setup_in_progress = True
         _database_setup('collectd')
-        PluginObject.database_setup_in_progress = False
+        fmAlarmObject.database_setup_in_progress = False
+
+    pluginObject.init_completed()
+    return 0
 
 
 # The notifier function inspects the collectd notification and determines if
 # the representative alarm needs to be asserted, severity changed, or cleared.
 def notifier_func(nObject):
 
-    if PluginObject.fm_connectivity is False:
+    # do nothing till config is complete.
+    if pluginObject._config_complete is False:
+        if pluginObject.config_complete() is False:
+            return 0
+
+    if fmAlarmObject.fm_connectivity is False:
 
         # handle multi threading startup
-        with PluginObject.lock:
-            if PluginObject.fm_connectivity is True:
+        with fmAlarmObject.lock:
+            if fmAlarmObject.fm_connectivity is True:
                 return 0
 
             ##################################################################
@@ -1774,7 +1782,7 @@ def notifier_func(nObject):
                         want_alarm_clear = False
                         eid = alarm.entity_instance_id
                         # ignore alarms not for this host
-                        if PluginObject.host not in eid:
+                        if fmAlarmObject.host not in eid:
                             continue
 
                         base_obj = get_base_object(alarm_id)
@@ -1834,8 +1842,8 @@ def notifier_func(nObject):
                                               "startup alarm %s" %
                                               (PLUGIN_DEGRADE, ap, alarm_id))
 
-        PluginObject.fm_connectivity = True
-        collectd.info("%s initialization complete" % PLUGIN)
+        fmAlarmObject.fm_connectivity = True
+        collectd.info("%s connectivity with fm complete" % PLUGIN)
 
     collectd.debug('%s notification: %s %s:%s - %s %s %s [%s]' % (
         PLUGIN,
@@ -1867,11 +1875,11 @@ def notifier_func(nObject):
         return 0
 
     if tsc.nodetype == 'controller':
-        if PluginObject.database_setup is False:
-            if PluginObject.database_setup_in_progress is False:
-                PluginObject.database_setup_in_progress = True
+        if fmAlarmObject.database_setup is False:
+            if fmAlarmObject.database_setup_in_progress is False:
+                fmAlarmObject.database_setup_in_progress = True
                 _database_setup('collectd')
-                PluginObject.database_setup_in_progress = False
+                fmAlarmObject.database_setup_in_progress = False
 
     # get plugin object
     if nObject.plugin in PLUGINS:
@@ -1900,7 +1908,7 @@ def notifier_func(nObject):
             eid = _build_entity_id(nObject.plugin, nObject.plugin_instance)
             try:
                 # Need lock when reading/writing any obj.instance_objects list
-                with PluginObject.lock:
+                with fmAlarmObject.lock:
 
                     # we will take an exception if this object is not
                     # in the list. The exception handling code below will

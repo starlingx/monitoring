@@ -855,12 +855,12 @@ def config_func(config):
 def init_func():
     """Init the plugin"""
 
-    if obj.init_done is False:
-        if obj.init_ready() is False:
-            return 0
-
     # Only runs on worker nodes
     if 'worker' not in tsc.subfunctions:
+        return 0
+
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
         return 0
 
     # Check whether this host is openstack worker node or not
@@ -878,10 +878,9 @@ def init_func():
                 global OVS_VSWITCHD_SOCKET
                 OVS_VSWITCHD_SOCKET = \
                     "".join([OVS_VSWITCHD_PATH, ".", pid, ".ctl"])
-                obj.init_done = True
                 obj.hostname = obj.gethostname()
-                collectd.info("%s initialization complete" % PLUGIN)
                 obj.error_logged = False
+                obj.init_completed()
 
             elif obj.error_logged is False:
                 collectd.info("%s failed to retrieve pid for ovs-vswitchd in "
@@ -900,7 +899,7 @@ def init_func():
 def read_func():
     """collectd ovs interface/port monitor plugin read function"""
 
-    if obj.init_done is False:
+    if obj.init_complete is False:
         init_func()
         return 0
 

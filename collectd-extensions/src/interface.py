@@ -811,19 +811,13 @@ def config_func(config):
 def init_func():
     """Init the plugin"""
 
-    if obj.config_done is False:
-        collectd.info("%s configuration failed" % PLUGIN)
-        time.sleep(300)
-        return False
-
-    if obj.init_done is False:
-        if obj.init_ready() is False:
-            return 0
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
+        return 0
 
     obj.hostname = obj.gethostname()
-    obj.init_done = True
-    collectd.info("%s initialization complete" % PLUGIN)
 
+    obj.init_completed()
     return 0
 
 
@@ -831,7 +825,7 @@ def init_func():
 def read_func():
     """collectd interface monitor plugin read function"""
 
-    if obj.init_done is False:
+    if obj.init_complete is False:
         init_func()
         return 0
 
