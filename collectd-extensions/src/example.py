@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018 Wind River Systems, Inc.
+# Copyright (c) 2018-2020 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -7,19 +7,17 @@
 import os
 import random
 import collectd
+import plugin_common as pc
 
 PLUGIN = 'random number plugin'
 
-# static variables
-
 
 # define a class here that will persist over read calls
-class ExampleObject:
-    hostname = ""
+class ExampleObject(pc.PluginObject):
     plugin_data = ['1', '100']
 
 
-obj = ExampleObject()
+obj = ExampleObject(PLUGIN, '')
 
 
 # The config function - called once on collectd process startup
@@ -45,13 +43,23 @@ def config_func(config):
 # The init function - called once on collectd process startup
 def init_func():
 
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
+        return False
+
     # get current hostname
-    obj.hostname = os.uname()[1]
+    obj.hostname = obj.gethostname()
+
+    obj.init_completed()
     return 0
 
 
 # The sample read function - called on every audit interval
 def read_func():
+
+    if obj.init_complete is False:
+        init_func()
+        return 0
 
     # do the work to create the sample
     low = int(obj.plugin_data[0])

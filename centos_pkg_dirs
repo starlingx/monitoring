@@ -2,3 +2,4 @@ collectd-extensions
 influxdb-extensions
 monitor-tools
 vm-topology
+kube-cpusets

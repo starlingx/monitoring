@@ -1,0 +1,7 @@
+[run]
+branch = True
+source = kube_cpusets
+omit = kube_cpusets/tests/*
+
+[report]
+ignore_errors = True

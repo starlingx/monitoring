@@ -584,7 +584,8 @@ def read_timestamp_mode():
 #####################################################################
 def init_func():
 
-    if obj.init_ready() is False:
+    # do nothing till config is complete.
+    if obj.config_complete() is False:
         return False
 
     obj.hostname = obj.gethostname()
@@ -630,9 +631,9 @@ def init_func():
         obj.controller = True
 
     obj.virtual = obj.is_virtual()
-    obj.init_done = True
-    obj.log_throttle_count = 0
-    collectd.info("%s initialization complete" % PLUGIN)
+
+    obj.init_completed()
+    return 0
 
 
 #####################################################################
@@ -642,7 +643,6 @@ def init_func():
 # Description: The collectd audit entrypoint for PTP Monitoring
 #
 # Assumptions: collectd calls init_func one time.
-#
 #
 #              retry init if needed
 #              retry fm connect if needed
@@ -657,11 +657,7 @@ def read_func():
     if obj.virtual is True:
         return 0
 
-    # check and run init until it reports init_done True
-    if obj.init_done is False:
-        if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s re-running init" % PLUGIN)
-        obj.log_throttle_count += 1
+    if obj.init_complete is False:
         init_func()
         return 0
 
@@ -727,7 +723,6 @@ def read_func():
         else:
             collectd.info("%s no startup alarms found" % PLUGIN)
 
-        obj.config_complete = True
         obj.fm_connectivity = True
         # assert_all_alarms()
 
@@ -813,7 +808,8 @@ def read_func():
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', PLUGIN_CONF_FILE,
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                    PLUGIN_CONF_FILE,
                                     '-u', '-b', '0', 'GET PORT_DATA_SET'])
 
     port_locked = False
@@ -829,7 +825,8 @@ def read_func():
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', PLUGIN_CONF_FILE,
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                    PLUGIN_CONF_FILE,
                                     '-u', '-b', '0', 'GET TIME_STATUS_NP'])
 
     got_master_offset = False
