@@ -361,7 +361,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   # Build up output line by specific area
   my $L = ();
   $L = '';
-  $L .= sprintf "%6s %6s %6s ", "TID", "PID", "PPID";
+  $L .= sprintf "%7s %7s %7s ", "TID", "PID", "PPID";
   if ($::opt_P{$::P_ps} != $::P_none) {
     $L .= sprintf "%1s %2s %*s %2s %3s %4s ",
             "S", "P", $w_aff, "AFF", "PO", "NI", "PR";
@@ -406,7 +406,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
 
     # Build up output line by specific area
     $L = '';
-    $L .= sprintf "%6d %6d %6d ",
+    $L .= sprintf "%7d %7d %7d ",
             $tid, $::D_task{$tid}{'pid'}, $::D_task{$tid}{'ppid'};
     if ($::opt_P{$::P_ps} != $::P_none) {
       $L .= sprintf "%1s %2d %*s %2s %3d %4d ",
