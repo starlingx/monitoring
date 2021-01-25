@@ -3,6 +3,7 @@ Description=Collectd statistics daemon and extension services
 Documentation=man:collectd(1) man:collectd.conf(5)
 Before=pmon.service
 After=local-fs.target network-online.target
+After=config.service syslog.service
 Requires=local-fs.target network-online.target
 
 [Service]

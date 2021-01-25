@@ -19,7 +19,6 @@ Source5: plugin_common.py
 # collectd python plugin files - resource plugins
 Source11: cpu.py
 Source12: memory.py
-Source14: example.py
 Source15: ntpq.py
 Source16: interface.py
 Source17: remotels.py
@@ -31,7 +30,6 @@ Source100: python_plugins.conf
 Source101: cpu.conf
 Source102: memory.conf
 Source103: df.conf
-Source104: example.conf
 Source105: ntpq.conf
 Source106: interface.conf
 Source107: remotels.conf
@@ -82,7 +80,6 @@ install -m 700 %{SOURCE5} %{buildroot}%{local_python_extensions_dir}
 # collectd python plugin files - resource plugins
 install -m 700 %{SOURCE11} %{buildroot}%{local_python_extensions_dir}
 install -m 700 %{SOURCE12} %{buildroot}%{local_python_extensions_dir}
-install -m 700 %{SOURCE14} %{buildroot}%{local_python_extensions_dir}
 install -m 700 %{SOURCE15} %{buildroot}%{local_python_extensions_dir}
 install -m 700 %{SOURCE16} %{buildroot}%{local_python_extensions_dir}
 install -m 700 %{SOURCE17} %{buildroot}%{local_python_extensions_dir}
@@ -95,12 +92,19 @@ install -m 600 %{SOURCE100} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE101} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE102} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE103} %{buildroot}%{local_plugin_dir}
-install -m 600 %{SOURCE104} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE105} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE106} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE107} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE108} %{buildroot}%{local_plugin_dir}
 install -m 600 %{SOURCE109} %{buildroot}%{local_plugin_dir}
+
+%pre
+rm -f /etc/collectd.d/90-default-plugins-syslog.conf
+rm -f /etc/collectd.d/90-default-plugins-memory.conf
+rm -f /etc/collectd.d/90-default-plugins-load.conf
+rm -f /etc/collectd.d/90-default-plugins-interface.conf
+rm -f /etc/collectd.d/90-default-plugins-cpu.conf
+
 
 %clean
 rm -rf $RPM_BUILD_ROOT

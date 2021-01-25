@@ -555,6 +555,10 @@ def init_func():
     if obj.config_complete() is False:
         return 0
 
+    if obj._node_ready is False:
+        obj.node_ready()
+        return 0
+
     # get current hostname
     obj.hostname = obj.gethostname()
     if not obj.hostname:

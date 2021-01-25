@@ -194,7 +194,6 @@ DF_MANGLED_DICT = {
 ALARM_ID__CPU = "100.101"
 ALARM_ID__MEM = "100.103"
 ALARM_ID__DF = "100.104"
-ALARM_ID__EXAMPLE = "100.113"
 
 ALARM_ID__VSWITCH_CPU = "100.102"
 ALARM_ID__VSWITCH_MEM = "100.115"
@@ -209,8 +208,7 @@ ALARM_ID_LIST = [ALARM_ID__CPU,
                  ALARM_ID__VSWITCH_CPU,
                  ALARM_ID__VSWITCH_MEM,
                  ALARM_ID__VSWITCH_PORT,
-                 ALARM_ID__VSWITCH_IFACE,
-                 ALARM_ID__EXAMPLE]
+                 ALARM_ID__VSWITCH_IFACE]
 
 # ADD_NEW_PLUGIN: add plugin name definition
 # WARNING: This must line up exactly with the plugin
@@ -224,7 +222,6 @@ PLUGIN__VSWITCH_PORT = "vswitch_port"
 PLUGIN__VSWITCH_CPU = "vswitch_cpu"
 PLUGIN__VSWITCH_MEM = "vswitch_mem"
 PLUGIN__VSWITCH_IFACE = "vswitch_iface"
-PLUGIN__EXAMPLE = "example"
 
 # ADD_NEW_PLUGIN: add plugin name to list
 PLUGIN_NAME_LIST = [PLUGIN__CPU,
@@ -233,8 +230,7 @@ PLUGIN_NAME_LIST = [PLUGIN__CPU,
                     PLUGIN__VSWITCH_CPU,
                     PLUGIN__VSWITCH_MEM,
                     PLUGIN__VSWITCH_PORT,
-                    PLUGIN__VSWITCH_IFACE,
-                    PLUGIN__EXAMPLE]
+                    PLUGIN__VSWITCH_IFACE]
 
 # Used to find plugin name based on alarm id
 # for managing degrade for startup alarms.
@@ -555,8 +551,6 @@ class fmAlarmObject:
     database_setup = False                 # state of database setup
     database_setup_in_progress = False     # connection mutex
 
-    # Set to True once FM connectivity is verified
-    # Used to ensure alarms are queried on startup
     fm_connectivity = False
 
     def __init__(self, id, plugin):
@@ -1312,8 +1306,7 @@ PLUGINS = {
     PLUGIN__VSWITCH_PORT: fmAlarmObject(ALARM_ID__VSWITCH_PORT,
                                         PLUGIN__VSWITCH_PORT),
     PLUGIN__VSWITCH_IFACE: fmAlarmObject(ALARM_ID__VSWITCH_IFACE,
-                                         PLUGIN__VSWITCH_IFACE),
-    PLUGIN__EXAMPLE: fmAlarmObject(ALARM_ID__EXAMPLE, PLUGIN__EXAMPLE)}
+                                         PLUGIN__VSWITCH_IFACE)}
 
 
 #####################################################################
@@ -1744,12 +1737,6 @@ def init_func():
 
     ###########################################################################
 
-    obj = PLUGINS[PLUGIN__EXAMPLE]
-    obj.resource_name = "Example"
-    obj.instance_name = PLUGIN__EXAMPLE
-    obj.repair = "Not Applicable"
-    collectd.info("%s monitoring %s usage" % (PLUGIN, obj.resource_name))
-
     # ...
     # ADD_NEW_PLUGIN: Add new plugin object initialization here ...
     # ...
@@ -1772,8 +1759,17 @@ def notifier_func(nObject):
         if pluginObject.config_complete() is False:
             return 0
 
-    if fmAlarmObject.fm_connectivity is False:
+    if pluginObject._node_ready is False:
+        collectd.info("%s %s not ready ; from:%s:%s:%s" %
+                      (PLUGIN,
+                       fmAlarmObject.host,
+                       nObject.host,
+                       nObject.plugin,
+                       nObject.plugin_instance))
+        pluginObject.node_ready()
+        return 0
 
+    if fmAlarmObject.fm_connectivity is False:
         # handle multi threading startup
         with fmAlarmObject.lock:
             if fmAlarmObject.fm_connectivity is True:
@@ -1791,8 +1787,12 @@ def notifier_func(nObject):
                 try:
                     alarms = api.get_faults_by_id(alarm_id)
                 except Exception as ex:
-                    collectd.error("%s 'get_faults_by_id' exception ; %s" %
-                                   (PLUGIN, ex))
+                    collectd.warning("%s 'get_faults_by_id' exception ; %s" %
+                                     (PLUGIN, ex))
+
+                    # if fm is not responding then the node is not ready
+                    pluginObject._node_ready = False
+                    pluginObject.node_ready_count = 0
                     return 0
 
                 if alarms:
@@ -1861,7 +1861,7 @@ def notifier_func(nObject):
                                               (PLUGIN_DEGRADE, eid, alarm_id))
 
         fmAlarmObject.fm_connectivity = True
-        collectd.info("%s connectivity with fm complete" % PLUGIN)
+        collectd.info("%s node ready" % PLUGIN)
 
     collectd.debug('%s notification: %s %s:%s - %s %s %s [%s]' % (
         PLUGIN,

@@ -22,6 +22,7 @@ import plugin_common as pc
 import re
 import socket
 import time
+import tsconfig.tsconfig as tsc
 
 PLUGIN = 'platform cpu usage plugin'
 PLUGIN_DEBUG = 'DEBUG platform cpu'
@@ -413,7 +414,11 @@ def init_func():
 
     # do nothing till config is complete.
     if obj.config_complete() is False:
-        return False
+        return pc.PLUGIN_PASS
+
+    if obj._node_ready is False:
+        obj.node_ready()
+        return pc.PLUGIN_PASS
 
     obj.hostname = socket.gethostname()
 
@@ -472,7 +477,7 @@ def read_func():
 
     if obj.init_complete is False:
         init_func()
-        return 0
+        return pc.PLUGIN_PASS
 
     # epoch time in floating seconds
     now0 = time.time()

@@ -169,6 +169,10 @@ def read_func():
         init_func()
         return 0
 
+    if obj._node_ready is False:
+        obj.node_ready()
+        return 0
+
     # get current state
     current_enabled_state = obj.enabled
 

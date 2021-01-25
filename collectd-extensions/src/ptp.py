@@ -661,7 +661,9 @@ def read_func():
         init_func()
         return 0
 
-    if obj.fm_connectivity is False:
+    if obj._node_ready is False:
+        if obj.node_ready() is False:
+            return 0
 
         try:
             # query FM for existing alarms.
@@ -722,9 +724,6 @@ def read_func():
                                            alarm.entity_instance_id))
         else:
             collectd.info("%s no startup alarms found" % PLUGIN)
-
-        obj.fm_connectivity = True
-        # assert_all_alarms()
 
     # This plugin supports PTP in-service state change by checking
     # service state on every audit ; every 5 minutes.

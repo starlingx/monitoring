@@ -114,7 +114,7 @@ class PluginObject(object):
         self._config_complete = False    # set to True once config is complete
         self.config_done = False         # set true if config_func completed ok
         self.init_complete = False       # set true if init_func completed ok
-        self.fm_connectivity = False     # set true when fm connectivity ok
+        self._node_ready = False         # set true when node is ready
 
         self.alarm_type = fm_constants.FM_ALARM_TYPE_7     # OPERATIONAL
         self.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
@@ -146,9 +146,8 @@ class PluginObject(object):
         self.http_retry_count = 0        # track http error cases
         self.HTTP_RETRY_THROTTLE = 6     # http retry threshold
         self.phase = 0                   # tracks current phase; init, sampling
-
-        collectd.debug("%s Common PluginObject constructor [%s]" %
-                       (plugin, url))
+        self.node_ready_threshold = 3    # wait for node ready before sampling
+        self.node_ready_count = 0        # node ready count up counter
 
     ###########################################################################
     #
@@ -204,6 +203,35 @@ class PluginObject(object):
                 self.log_throttle_count = 0
                 collectd.info("%s configuration completed" % self.plugin)
 
+        return True
+
+    ###########################################################################
+    #
+    # Name       : node_ready
+    #
+    # Description: Test for node ready condition.
+    #              Currently that's just a thresholded count
+    #
+    # Parameters : plugin name
+    #
+    # Returns    : False if node is not ready
+    #              True if node is ready
+    #
+    ###########################################################################
+
+    def node_ready(self):
+        """Check for node ready state"""
+
+        if tsc.nodetype == 'controller':
+            self.node_ready_count += 1
+            if self.node_ready_count < self.node_ready_threshold:
+                collectd.info("%s node ready count %d of %d" %
+                              (self.plugin,
+                               self.node_ready_count,
+                               self.node_ready_threshold))
+                return False
+
+        self._node_ready = True
         return True
 
     ###########################################################################
