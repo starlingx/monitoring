@@ -122,9 +122,6 @@ PLUGIN = 'alarm notifier'
 # This plugin's degrade function
 PLUGIN_DEGRADE = 'degrade notifier'
 
-# Path to the plugin's drop dir
-PLUGIN_PATH = '/etc/collectd.d/'
-
 # the name of the collectd samples database
 DATABASE_NAME = 'collectd samples'
 
@@ -550,7 +547,7 @@ class fmAlarmObject:
     lock = None                            # global lock for mread_func mutex
     database_setup = False                 # state of database setup
     database_setup_in_progress = False     # connection mutex
-
+    plugin_path = None
     fm_connectivity = False
 
     def __init__(self, id, plugin):
@@ -1239,7 +1236,7 @@ class fmAlarmObject:
         if self.id == ALARM_ID__DF:
 
             # read the df.conf file and return/get a list of mount points
-            conf_file = PLUGIN_PATH + 'df.conf'
+            conf_file = fmAlarmObject.plugin_path + 'df.conf'
             if not os.path.exists(conf_file):
                 collectd.error("%s cannot create filesystem "
                                "instance objects ; missing : %s" %
@@ -1424,7 +1421,7 @@ def _build_entity_id(plugin, plugin_instance):
 
 def _get_df_mountpoints():
 
-    conf_file = PLUGIN_PATH + 'df.conf'
+    conf_file = fmAlarmObject.plugin_path + 'df.conf'
     if not os.path.exists(conf_file):
         collectd.error("%s cannot create filesystem "
                        "instance objects ; missing : %s" %
@@ -1644,6 +1641,16 @@ def init_func():
     fmAlarmObject.host = pluginObject.gethostname()
     collectd.info("%s %s:%s init function" %
                   (PLUGIN, tsc.nodetype, fmAlarmObject.host))
+
+    # The path to where collectd is looking for its plugins is specified
+    # at the end of the /etc/collectd.conf file.
+    # Because so we search for the 'Include' label in reverse order.
+    for line in reversed(open("/etc/collectd.conf", 'r').readlines()):
+        if line.startswith('Include'):
+            plugin_path = line.split(' ')[1].strip("\n").strip('"') + '/'
+            fmAlarmObject.plugin_path = plugin_path
+            collectd.info("plugin path: %s" % fmAlarmObject.plugin_path)
+            break
 
     # Constant CPU Plugin Object Settings
     obj = PLUGINS[PLUGIN__CPU]
