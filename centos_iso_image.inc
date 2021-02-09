@@ -13,3 +13,6 @@ vm-topology
 
 # kube-cpusets
 kube-cpusets
+
+# kube-memory
+kube-memory

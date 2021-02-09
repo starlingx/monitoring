@@ -1,0 +1,12 @@
+Metadata-Version: 1.1
+Name: kube-memory
+Version: 1.0
+Summary: Display services and kubernetes containers memory usage
+Home-page:
+Author: Windriver
+Author-email: info@windriver.com
+License: Apache-2.0
+
+Description: Display services and kubernetes containers memory usage
+
+Platform: UNKNOWN

@@ -1,0 +1,7 @@
+[run]
+branch = True
+source = kube_memory
+omit = kube_memory/tests/*
+
+[report]
+ignore_errors = True
