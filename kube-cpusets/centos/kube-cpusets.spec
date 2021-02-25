@@ -13,13 +13,13 @@ Source0:        %{pypi_name}-%{version}.tar.gz
 
 BuildArch:      noarch
 
-BuildRequires: python
-BuildRequires: python-setuptools
-BuildRequires: python2-pip
-BuildRequires: python2-wheel
+BuildRequires: python3
+BuildRequires: python3-setuptools
+BuildRequires: python3-pip
+BuildRequires: python3-wheel
 
-Requires: python
-Requires: python-devel
+Requires: python3
+Requires: python3-devel
 Requires: /usr/bin/env
 Requires: /bin/bash
 
@@ -28,7 +28,7 @@ Requires: /bin/bash
 %description
 Display kubernetes containers cpusets per numa node
 
-%define pythonroot /usr/lib64/python2.7/site-packages
+%define pythonroot %{python3_sitearch}
 
 %prep
 %autosetup -p 1 -n %{pypi_name}-%{version}
@@ -39,11 +39,11 @@ rm -f requirements.txt
 rm -f test-requirements.txt
 
 %build
-%{__python2} setup.py build
-%py2_build_wheel
+%{__python3} setup.py build
+%py3_build_wheel
 
 %install
-%{__python2} setup.py install --skip-build --root %{buildroot}
+%{__python3} setup.py install --skip-build --root %{buildroot}
 mkdir -p $RPM_BUILD_ROOT/wheels
 install -m 644 dist/*.whl $RPM_BUILD_ROOT/wheels/
 
@@ -51,8 +51,8 @@ install -m 644 dist/*.whl $RPM_BUILD_ROOT/wheels/
 %defattr(-,root,root,-)
 %doc LICENSE
 %{_bindir}/kube-cpusets
-%{python2_sitelib}/kube_cpusets
-%{python2_sitelib}/*.egg-info
+%{python3_sitelib}/kube_cpusets
+%{python3_sitelib}/*.egg-info
 
 %package wheels
 Summary: %{name} wheels
