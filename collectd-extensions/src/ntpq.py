@@ -1,5 +1,5 @@
 ############################################################################
-# Copyright (c) 2018-2019 Wind River Systems, Inc.
+# Copyright (c) 2018-2021 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -166,15 +166,9 @@ def _raise_alarm(ip=None):
         if obj.alarm_raised is True:
             return False
 
-        if obj.peer_selected:
-            reason = "NTP cannot reach external time source; " \
-                     "syncing with peer controller only"
-            fm_severity = fm_constants.FM_ALARM_SEVERITY_MINOR
-        else:
-            reason = "NTP configuration does not contain any valid "
-            reason += "or reachable NTP servers."
-            fm_severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-
+        reason = "NTP configuration does not contain any valid "
+        reason += "or reachable NTP servers."
+        fm_severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         eid = obj.base_eid
 
     else:
@@ -625,6 +619,59 @@ def init_func():
 
 ###############################################################################
 #
+# Name       : _get_one_line_data
+#
+# Description: Original ntpq response possibly have 2 lines data for 1 record.
+#              This function concatinate 2 lines into 1 line
+#
+# Example:
+#
+#     remote           refid      st t when poll reach   delay   offset  jitter
+#==============================================================================
+# 192.168.204.3
+#                 127.0.0.1       12 u    3   64  373    0.003    2.711   0.847
+#+162.159.200.1
+#                 10.44.9.236      3 u   25   64  377   29.304   -1.645  11.298
+#*162.159.200.123
+#                 10.44.9.236      3 u   24   64  377   27.504   -0.865   9.443
+#
+# To
+#     remote           refid      st t when poll reach   delay   offset  jitter
+#==============================================================================
+# 192.168.204.3   127.0.0.1       12 u    3   64  373    0.003    2.711   0.847
+#+162.159.200.1   10.44.9.236      3 u   25   64  377   29.304   -1.645  11.298
+#*162.159.200.123 10.44.9.236      3 u   24   64  377   27.504   -0.865   9.443
+# (space before column refid would be more)
+#
+# Parameters : Original ntpq response
+#
+# Returns    : One lines ntpq response
+#
+###############################################################################
+def _get_one_line_data(ntpq_lines):
+    header = ntpq_lines[0].split()
+    header_col_num = len(header)
+    list_oneline = list(ntpq_lines[:2])
+
+    line_skip = False
+    for i in range(2, len(ntpq_lines)):
+        if len(ntpq_lines[i]) > 0:
+            if line_skip is False:
+                one_line = ntpq_lines[i]
+                cols_num = len(ntpq_lines[i].split())
+                if cols_num != header_col_num and len(ntpq_lines) >= (i + 1):
+                    next_cols_num = len(ntpq_lines[i + 1].split())
+                    if header_col_num == (cols_num + next_cols_num):
+                        one_line += ntpq_lines[i + 1]
+                        line_skip = True
+                list_oneline.append(one_line)
+            else:
+                line_skip = False
+    return list_oneline
+
+
+###############################################################################
+#
 # Name       : read_func
 #
 # Description: The sample read interface this plugin publishes to collectd.
@@ -678,7 +725,7 @@ def read_func():
         return 0
 
     # Get the ntp query output into a list of lines
-    obj.ntpq = data.split('\n')
+    obj.ntpq = _get_one_line_data(data.split('\n'))
 
     # keep track of changes ; only log on changes
     reachable_list_changed = False
@@ -757,6 +804,7 @@ def read_func():
                         collectd.debug("%s selected server is '%s'" %
                                        (PLUGIN, obj.selected_server))
                 else:
+                    collectd.info("%s selected server is peer" % PLUGIN)
                     # refer to peer
                     refid = ''
                     for i in range(1, len(cols)):
@@ -766,12 +814,12 @@ def read_func():
 
                     if refid not in ('', '127.0.0.1') and \
                             not _is_controller(refid) and \
-                            socket.AF_INET == ip_family:
+                            socket.AF_INET == _is_ip_address(refid):
                         # ipv4, peer controller refer to a time source is not
                         # itself or a controller (this node)
                         obj.selected_server = ip
-                        collectd.debug("peer controller has a reliable "
-                                       "source")
+                        collectd.info("%s peer controller has a reliable "
+                                      "source: %s" % (PLUGIN, refid))
 
         # anything else is unreachable
         else:
