@@ -1,4 +1,4 @@
 # hacking pulls in flake8
-hacking
+hacking < 4.0.1
 bashate >= 0.2
 bandit;python_version>="3.5"
