@@ -373,6 +373,9 @@ def init_func():
     if obj.config_complete() is False:
         return 0
 
+    # override node ready threshold for this plugin
+    obj.node_ready_threshold = 1
+
     obj.hostname = socket.gethostname()
     collectd.info('%s: init function for %s' % (PLUGIN, obj.hostname))
 
@@ -396,6 +399,10 @@ def read_func():
 
     if obj.init_complete is False:
         init_func()
+        return 0
+
+    if obj._node_ready is False:
+        obj.node_ready()
         return 0
 
     # Get epoch time in floating seconds

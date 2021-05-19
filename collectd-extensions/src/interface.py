@@ -829,6 +829,10 @@ def read_func():
         init_func()
         return 0
 
+    if obj._node_ready is False:
+        obj.node_ready()
+        return 0
+
     if obj.phase < RUN_PHASE__ALARMS_CLEARED:
 
         # clear all alarms on first audit

@@ -105,8 +105,9 @@ debug_lists = False
 want_state_audit = False
 want_vswitch = False
 
-# number of notifier loops before the state is object dumped
-DEBUG_AUDIT = 2
+# Number of notifier loop between each audit.
+# @ 30 sec interval audit rate is every 5 minutes
+AUDIT_RATE = 10
 
 # write a 'value' log on a the resource sample change of more than this amount
 LOG_STEP = 10
@@ -121,9 +122,6 @@ PLUGIN = 'alarm notifier'
 
 # This plugin's degrade function
 PLUGIN_DEGRADE = 'degrade notifier'
-
-# Path to the plugin's drop dir
-PLUGIN_PATH = '/etc/collectd.d/'
 
 # the name of the collectd samples database
 DATABASE_NAME = 'collectd samples'
@@ -194,7 +192,6 @@ DF_MANGLED_DICT = {
 ALARM_ID__CPU = "100.101"
 ALARM_ID__MEM = "100.103"
 ALARM_ID__DF = "100.104"
-ALARM_ID__EXAMPLE = "100.113"
 
 ALARM_ID__VSWITCH_CPU = "100.102"
 ALARM_ID__VSWITCH_MEM = "100.115"
@@ -209,8 +206,11 @@ ALARM_ID_LIST = [ALARM_ID__CPU,
                  ALARM_ID__VSWITCH_CPU,
                  ALARM_ID__VSWITCH_MEM,
                  ALARM_ID__VSWITCH_PORT,
-                 ALARM_ID__VSWITCH_IFACE,
-                 ALARM_ID__EXAMPLE]
+                 ALARM_ID__VSWITCH_IFACE]
+
+AUDIT_ALARM_ID_LIST = [ALARM_ID__CPU,
+                       ALARM_ID__MEM,
+                       ALARM_ID__DF]
 
 # ADD_NEW_PLUGIN: add plugin name definition
 # WARNING: This must line up exactly with the plugin
@@ -224,7 +224,6 @@ PLUGIN__VSWITCH_PORT = "vswitch_port"
 PLUGIN__VSWITCH_CPU = "vswitch_cpu"
 PLUGIN__VSWITCH_MEM = "vswitch_mem"
 PLUGIN__VSWITCH_IFACE = "vswitch_iface"
-PLUGIN__EXAMPLE = "example"
 
 # ADD_NEW_PLUGIN: add plugin name to list
 PLUGIN_NAME_LIST = [PLUGIN__CPU,
@@ -233,8 +232,7 @@ PLUGIN_NAME_LIST = [PLUGIN__CPU,
                     PLUGIN__VSWITCH_CPU,
                     PLUGIN__VSWITCH_MEM,
                     PLUGIN__VSWITCH_PORT,
-                    PLUGIN__VSWITCH_IFACE,
-                    PLUGIN__EXAMPLE]
+                    PLUGIN__VSWITCH_IFACE]
 
 # Used to find plugin name based on alarm id
 # for managing degrade for startup alarms.
@@ -554,9 +552,7 @@ class fmAlarmObject:
     lock = None                            # global lock for mread_func mutex
     database_setup = False                 # state of database setup
     database_setup_in_progress = False     # connection mutex
-
-    # Set to True once FM connectivity is verified
-    # Used to ensure alarms are queried on startup
+    plugin_path = None
     fm_connectivity = False
 
     def __init__(self, id, plugin):
@@ -625,14 +621,16 @@ class fmAlarmObject:
         # total notification count
         self.count = 0
 
-        # Debug: state audit controls
-        self.audit_threshold = 0
-        self.audit_count = 0
+        # audit counters
+        self.alarm_audit_threshold = 0
+        self.state_audit_count = 0
 
         # For plugins that have multiple instances like df (filesystem plugin)
         # we need to create an instance of this object for each one.
         # This dictionary is used to associate an instance with its object.
         self.instance_objects = {}
+
+        self.fault = None
 
     def _ilog(self, string):
         """Create a collectd notifier info log with the string param"""
@@ -667,18 +665,18 @@ class fmAlarmObject:
         if self.id == ALARM_ID__CPU:
             _print_state()
 
-        self.audit_count += 1
+        self.state_audit_count += 1
         if self.warnings:
             collectd.info("%s AUDIT %d: %s warning list %s:%s" %
                           (PLUGIN,
-                           self.audit_count,
+                           self.state_audit_count,
                            self.plugin,
                            location,
                            self.warnings))
         if self.failures:
             collectd.info("%s AUDIT %d: %s failure list %s:%s" %
                           (PLUGIN,
-                           self.audit_count,
+                           self.state_audit_count,
                            self.plugin,
                            location,
                            self.failures))
@@ -1245,7 +1243,7 @@ class fmAlarmObject:
         if self.id == ALARM_ID__DF:
 
             # read the df.conf file and return/get a list of mount points
-            conf_file = PLUGIN_PATH + 'df.conf'
+            conf_file = fmAlarmObject.plugin_path + 'df.conf'
             if not os.path.exists(conf_file):
                 collectd.error("%s cannot create filesystem "
                                "instance objects ; missing : %s" %
@@ -1312,8 +1310,7 @@ PLUGINS = {
     PLUGIN__VSWITCH_PORT: fmAlarmObject(ALARM_ID__VSWITCH_PORT,
                                         PLUGIN__VSWITCH_PORT),
     PLUGIN__VSWITCH_IFACE: fmAlarmObject(ALARM_ID__VSWITCH_IFACE,
-                                         PLUGIN__VSWITCH_IFACE),
-    PLUGIN__EXAMPLE: fmAlarmObject(ALARM_ID__EXAMPLE, PLUGIN__EXAMPLE)}
+                                         PLUGIN__VSWITCH_IFACE)}
 
 
 #####################################################################
@@ -1431,7 +1428,7 @@ def _build_entity_id(plugin, plugin_instance):
 
 def _get_df_mountpoints():
 
-    conf_file = PLUGIN_PATH + 'df.conf'
+    conf_file = fmAlarmObject.plugin_path + 'df.conf'
     if not os.path.exists(conf_file):
         collectd.error("%s cannot create filesystem "
                        "instance objects ; missing : %s" %
@@ -1471,7 +1468,7 @@ def _print_obj(obj):
 
     collectd.info("%s %s %s - %s - %s\n" %
                   (PLUGIN, prefix, obj.resource_name, obj.plugin, obj.id))
-
+    collectd.info("%s %s  fault obj: %s\n" % (PLUGIN, prefix, obj.fault))
     collectd.info("%s %s  entity id: %s\n" % (PLUGIN, prefix, obj.entity_id))
     collectd.info("%s %s degrade_id: %s\n" % (PLUGIN, prefix, obj.degrade_id))
 
@@ -1652,6 +1649,16 @@ def init_func():
     collectd.info("%s %s:%s init function" %
                   (PLUGIN, tsc.nodetype, fmAlarmObject.host))
 
+    # The path to where collectd is looking for its plugins is specified
+    # at the end of the /etc/collectd.conf file.
+    # Because so we search for the 'Include' label in reverse order.
+    for line in reversed(open("/etc/collectd.conf", 'r').readlines()):
+        if line.startswith('Include'):
+            plugin_path = line.split(' ')[1].strip("\n").strip('"') + '/'
+            fmAlarmObject.plugin_path = plugin_path
+            collectd.info("plugin path: %s" % fmAlarmObject.plugin_path)
+            break
+
     # Constant CPU Plugin Object Settings
     obj = PLUGINS[PLUGIN__CPU]
     obj.resource_name = "Platform CPU"
@@ -1744,12 +1751,6 @@ def init_func():
 
     ###########################################################################
 
-    obj = PLUGINS[PLUGIN__EXAMPLE]
-    obj.resource_name = "Example"
-    obj.instance_name = PLUGIN__EXAMPLE
-    obj.repair = "Not Applicable"
-    collectd.info("%s monitoring %s usage" % (PLUGIN, obj.resource_name))
-
     # ...
     # ADD_NEW_PLUGIN: Add new plugin object initialization here ...
     # ...
@@ -1772,8 +1773,17 @@ def notifier_func(nObject):
         if pluginObject.config_complete() is False:
             return 0
 
-    if fmAlarmObject.fm_connectivity is False:
+    if pluginObject._node_ready is False:
+        collectd.info("%s %s not ready ; from:%s:%s:%s" %
+                      (PLUGIN,
+                       fmAlarmObject.host,
+                       nObject.host,
+                       nObject.plugin,
+                       nObject.plugin_instance))
+        pluginObject.node_ready()
+        return 0
 
+    if fmAlarmObject.fm_connectivity is False:
         # handle multi threading startup
         with fmAlarmObject.lock:
             if fmAlarmObject.fm_connectivity is True:
@@ -1791,8 +1801,12 @@ def notifier_func(nObject):
                 try:
                     alarms = api.get_faults_by_id(alarm_id)
                 except Exception as ex:
-                    collectd.error("%s 'get_faults_by_id' exception ; %s" %
-                                   (PLUGIN, ex))
+                    collectd.warning("%s 'get_faults_by_id' exception ; %s" %
+                                     (PLUGIN, ex))
+
+                    # if fm is not responding then the node is not ready
+                    pluginObject._node_ready = False
+                    pluginObject.node_ready_count = 0
                     return 0
 
                 if alarms:
@@ -1810,7 +1824,7 @@ def notifier_func(nObject):
                         if eid.split(base_eid)[1]:
                             want_alarm_clear = True
 
-                        collectd.info('%s found %s %s alarm [%s]' %
+                        collectd.info('%s alarm %s:%s:%s found at startup' %
                                       (PLUGIN,
                                        alarm.severity,
                                        alarm_id,
@@ -1818,8 +1832,9 @@ def notifier_func(nObject):
 
                         if want_alarm_clear is True:
                             if clear_alarm(alarm_id, eid) is False:
-                                collectd.error("%s %s:%s clear failed" %
-                                               (PLUGIN,
+                                collectd.error("%s alarm %s:%s:%s clear "
+                                               "failed" %
+                                               (PLUGIN, alarm.severity,
                                                 alarm_id,
                                                 eid))
                             continue
@@ -1861,7 +1876,7 @@ def notifier_func(nObject):
                                               (PLUGIN_DEGRADE, eid, alarm_id))
 
         fmAlarmObject.fm_connectivity = True
-        collectd.info("%s connectivity with fm complete" % PLUGIN)
+        collectd.info("%s node ready" % PLUGIN)
 
     collectd.debug('%s notification: %s %s:%s - %s %s %s [%s]' % (
         PLUGIN,
@@ -1975,15 +1990,6 @@ def notifier_func(nObject):
     # if obj.warnings or obj.failures:
     #     _print_state(obj)
 
-    # If want_state_audit is True then run the audit.
-    # Primarily used for debug
-    # default state is False
-    if want_state_audit:
-        obj.audit_threshold += 1
-        if obj.audit_threshold == DEBUG_AUDIT:
-            obj.audit_threshold = 0
-            obj._state_audit("audit")
-
     # manage reading value change ; store last and log if gt obj.step
     action = obj.manage_change(nObject)
     if action == "done":
@@ -2005,6 +2011,83 @@ def notifier_func(nObject):
         _clear_alarm_for_missing_filesystems()
         if len(mtcDegradeObj.degrade_list):
             mtcDegradeObj.remove_degrade_for_missing_filesystems()
+
+        obj.alarm_audit_threshold += 1
+        if obj.alarm_audit_threshold >= AUDIT_RATE:
+            if want_state_audit:
+                obj._state_audit("audit")
+            obj.alarm_audit_threshold = 0
+
+            #################################################################
+            #
+            # Audit Asserted Alarms
+            #
+            # Loop over the list of auditable alarm ids building two
+            # dictionaries, one containing warning (major) and the other
+            # failure (critical) with alarm info needed to detect and
+            # correct stale, missing or severity mismatched alarms for
+            # the listed alarm ids <100.xxx>.
+            #
+            # Note: Conversion in terminology from
+            #         warning -> major and
+            #         failures -> critical
+            #       is done because fm speaks in terms of major and critical
+            #       while the plugin speaks in terms of warning and failure.
+            #
+            major_alarm_dict = {}
+            critical_alarm_dict = {}
+            for alarm_id in AUDIT_ALARM_ID_LIST:
+
+                tmp_base_obj = get_base_object(alarm_id)
+                if tmp_base_obj is None:
+                    collectd.error("%s audit %s base object lookup failed" %
+                                   (PLUGIN, alarm_id))
+                    continue
+
+                # Build 2 dictionaries containing current alarmed info.
+                # Dictionary entries are indexed by entity id to fetch the
+                # alarm id and last fault object used to create the alarm
+                # for the mismatch and missing case handling.
+                #
+                # { eid : { alarm : <alarm id>, fault : <fault obj> }}, ... }
+
+                # major list for base object from warnings list
+                if tmp_base_obj.entity_id in tmp_base_obj.warnings:
+                    info = {}
+                    info[pc.AUDIT_INFO_ALARM] = alarm_id
+                    info[pc.AUDIT_INFO_FAULT] = tmp_base_obj.fault
+                    major_alarm_dict[tmp_base_obj.entity_id] = info
+
+                # major list for instance objects from warnings list
+                for _inst_obj in tmp_base_obj.instance_objects:
+                    inst_obj = tmp_base_obj.instance_objects[_inst_obj]
+                    if inst_obj.entity_id in tmp_base_obj.warnings:
+                        info = {}
+                        info[pc.AUDIT_INFO_ALARM] = alarm_id
+                        info[pc.AUDIT_INFO_FAULT] = inst_obj.fault
+                        major_alarm_dict[inst_obj.entity_id] = info
+
+                # critical list for base object from failures list
+                if tmp_base_obj.entity_id in tmp_base_obj.failures:
+                    info = {}
+                    info[pc.AUDIT_INFO_ALARM] = alarm_id
+                    info[pc.AUDIT_INFO_FAULT] = tmp_base_obj.fault
+                    critical_alarm_dict[tmp_base_obj.entity_id] = info
+
+                # critical list for instance objects from failures list
+                for _inst_obj in tmp_base_obj.instance_objects:
+                    inst_obj = tmp_base_obj.instance_objects[_inst_obj]
+                    if inst_obj.entity_id in tmp_base_obj.failures:
+                        info = {}
+                        info[pc.AUDIT_INFO_ALARM] = alarm_id
+                        info[pc.AUDIT_INFO_FAULT] = inst_obj.fault
+                        critical_alarm_dict[inst_obj.entity_id] = info
+
+            pluginObject.alarms_audit(api, AUDIT_ALARM_ID_LIST,
+                                      major_alarm_dict,
+                                      critical_alarm_dict)
+            # end alarms audit
+            #################################################################
 
     # exit early if there is no alarm update to be made
     if obj.debounce(base_obj,
@@ -2046,7 +2129,7 @@ def notifier_func(nObject):
             reason = obj.reason_warning
 
         # build the alarm object
-        fault = fm_api.Fault(
+        obj.fault = fm_api.Fault(
             alarm_id=obj.id,
             alarm_state=_alarm_state,
             entity_type_id=fm_constants.FM_ENTITY_TYPE_HOST,
@@ -2060,7 +2143,7 @@ def notifier_func(nObject):
             suppression=base_obj.suppression)
 
         try:
-            alarm_uuid = api.set_fault(fault)
+            alarm_uuid = api.set_fault(obj.fault)
             if pc.is_uuid_like(alarm_uuid) is False:
                 collectd.error("%s 'set_fault' failed ; %s:%s ; %s" %
                                (PLUGIN,

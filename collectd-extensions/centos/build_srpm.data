@@ -1,6 +1,7 @@
 SRC_DIR="$PKG_BASE"
 
 COPY_LIST="$PKG_BASE/src/LICENSE \
+  $PKG_BASE/src/README \
   $PKG_BASE/src/collectd.conf.pmon \
   $PKG_BASE/src/collectd.service \
   $PKG_BASE/src/fm_notifier.py \

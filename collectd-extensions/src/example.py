@@ -61,6 +61,10 @@ def read_func():
         init_func()
         return 0
 
+    if obj._node_ready is False:
+        obj.node_ready()
+        return 0
+
     # do the work to create the sample
     low = int(obj.plugin_data[0])
     high = int(obj.plugin_data[1])

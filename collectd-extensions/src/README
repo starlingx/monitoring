@@ -1,0 +1,6 @@
+The upstream default plugin loader files in this
+directory are not used.
+
+The /etc/collectd.conf file is updated to load its
+plugins from /etc/collectd.d/starlingx while the
+starlingx collectd-extensions package is installed.

@@ -81,7 +81,8 @@ BASE_GROUPS = [CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER]
 BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
 
 # Groupings of pods by kubernetes namespace
-K8S_NAMESPACE_SYSTEM = ['kube-system']
+K8S_NAMESPACE_SYSTEM = ['kube-system', 'armada', 'cert-manager', 'portieris',
+                        'vault', 'notification']
 K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
 
 # Pod parent cgroup name based on annotation.
@@ -96,6 +97,9 @@ RESERVED_CPULIST_KEY = 'PLATFORM_CPU_LIST'
 # plugin return values
 PLUGIN_PASS = 0
 PLUGIN_FAIL = 1
+
+AUDIT_INFO_ALARM = 'alarm'
+AUDIT_INFO_FAULT = 'fault'
 
 
 class PluginObject(object):
@@ -114,7 +118,7 @@ class PluginObject(object):
         self._config_complete = False    # set to True once config is complete
         self.config_done = False         # set true if config_func completed ok
         self.init_complete = False       # set true if init_func completed ok
-        self.fm_connectivity = False     # set true when fm connectivity ok
+        self._node_ready = False         # set true when node is ready
 
         self.alarm_type = fm_constants.FM_ALARM_TYPE_7     # OPERATIONAL
         self.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
@@ -146,9 +150,8 @@ class PluginObject(object):
         self.http_retry_count = 0        # track http error cases
         self.HTTP_RETRY_THROTTLE = 6     # http retry threshold
         self.phase = 0                   # tracks current phase; init, sampling
-
-        collectd.debug("%s Common PluginObject constructor [%s]" %
-                       (plugin, url))
+        self.node_ready_threshold = 3    # wait for node ready before sampling
+        self.node_ready_count = 0        # node ready count up counter
 
     ###########################################################################
     #
@@ -162,8 +165,10 @@ class PluginObject(object):
 
     def init_completed(self):
         """Declare plugin init complete"""
-
-        collectd.info("%s initialization completed" % self.plugin)
+        self.hostname = self.gethostname()
+        self.base_eid = 'host=' + self.hostname
+        collectd.info("%s %s initialization completed" %
+                      (self.plugin, self.hostname))
         self.init_complete = True
 
     ###########################################################################
@@ -204,6 +209,35 @@ class PluginObject(object):
                 self.log_throttle_count = 0
                 collectd.info("%s configuration completed" % self.plugin)
 
+        return True
+
+    ###########################################################################
+    #
+    # Name       : node_ready
+    #
+    # Description: Test for node ready condition.
+    #              Currently that's just a thresholded count
+    #
+    # Parameters : plugin name
+    #
+    # Returns    : False if node is not ready
+    #              True if node is ready
+    #
+    ###########################################################################
+
+    def node_ready(self):
+        """Check for node ready state"""
+
+        if tsc.nodetype == 'controller':
+            self.node_ready_count += 1
+            if self.node_ready_count < self.node_ready_threshold:
+                collectd.info("%s node ready count %d of %d" %
+                              (self.plugin,
+                               self.node_ready_count,
+                               self.node_ready_threshold))
+                return False
+
+        self._node_ready = True
         return True
 
     ###########################################################################
@@ -319,6 +353,230 @@ class PluginObject(object):
                         return False
 
         return True
+
+    #####################################################################
+    #
+    # Name       : clear_alarm
+    #
+    # Description: Clear the specified alarm.
+    #
+    # Returns    : True if operation succeeded
+    #              False if there was an error exception.
+    #
+    # Assumptions: Caller can decide to retry based on return status.
+    #
+    #####################################################################
+    def clear_alarm(self, fm, alarm_id, eid):
+        """Clear the specified alarm:eid
+
+        :param fm  The Fault Manager's API Object
+        :param alarm_id The alarm identifier , ie 100.103
+        :param eid The entity identifier ; host=<hostname>.<instance>
+        """
+
+        try:
+            if fm.clear_fault(alarm_id, eid) is True:
+                collectd.info("%s %s:%s alarm cleared" %
+                              (self.plugin, alarm_id, eid))
+            else:
+                collectd.info("%s %s:%s alarm already cleared" %
+                              (self.plugin, alarm_id, eid))
+            return True
+
+        except Exception as ex:
+            collectd.error("%s 'clear_fault' exception ; %s:%s ; %s" %
+                           (self.plugin, alarm_id, eid, ex))
+            return False
+
+    #########################################################################
+    #
+    # Name : __missing_or_mismatch_alarm_handler
+    #
+    # Purpose: Find and correct missing or mismatch alarms
+    #
+    # Scope: Private
+    #
+    #########################################################################
+    def __missing_or_mismatch_alarm_handler(self,
+                                            fm,
+                                            alarms,
+                                            alarm_id,
+                                            severity,
+                                            sev_alarm_dict):
+        """Find and correct missing or mismatch alarms
+
+        :param fm  The Fault Manager's API Object
+        :param alarms List of database alarms for alarm id and this host
+        :param alarm_id The alarm id in context
+        :param severity Specifies the severity level of sev_alarm_dict
+        :param sev_alarm_dict An alarm dictionary for either (not both) major
+                              or critical alarms
+        """
+        plugin_prefix = self.plugin + ' audit'
+        for eid in sev_alarm_dict:
+            found = False
+            if alarm_id == sev_alarm_dict[eid].get(AUDIT_INFO_ALARM):
+                error_case = "missing"
+                if alarms:
+                    for alarm in alarms:
+                        if alarm.entity_instance_id == eid:
+                            if alarm.severity == severity:
+                                collectd.info("%s alarm %s:%s:%s is correct" %
+                                              (plugin_prefix, severity,
+                                               alarm_id, eid))
+                                found = True
+                            else:
+                                error_case = "mismatch"
+                            break
+
+                if found is False:
+
+                    fault = sev_alarm_dict[eid].get(AUDIT_INFO_FAULT)
+                    if fault:
+                        collectd.info("%s alarm %s:%s:%s %s ; refreshing" %
+                                      (plugin_prefix,
+                                       severity, alarm_id, eid, error_case))
+                        fm.set_fault(fault)
+                    else:
+                        collectd.info("%s alarm %s:%s:%s %s" %
+                                      (plugin_prefix,
+                                       severity, alarm_id, eid, error_case))
+
+    #########################################################################
+    #
+    # Name: alarms_audit
+    #
+    # Purpose: Ensure the alarm state in the FM database matches the plugin
+    #
+    # Description: Query FM for the specified alarm id list. Handle missing,
+    #              stale or severity mismatched alarms.
+    #
+    # Algorithm  : Each alarm id is queried and the response is filtered by
+    #              current host. The plugin's running state takes precedence.
+    #              This audit will only ever raise, modify or clear alarms in
+    #              the database, never change the alarm state of the plugin.
+    #
+    #                - clear any asserted alarms that have a clear state
+    #                  in the plugin.
+    #                - raise an alarm that is cleared in fm but asserted
+    #                  in the plugin.
+    #                - correct alarm severity in fm database to align with
+    #                  the plugin.
+    #
+    # Assumptions: The severity dictionary arguments (major and critical)
+    #              are used to detect severity mismatches and support alarm
+    #              ids with varying entity ids.
+    #
+    #              The dictionaries are a list of key value pairs ; aid:eid
+    #                - alarm id as 'aid'
+    #                - entity_id as 'eid'
+    #
+    #              No need to check for fm api call success and retry on
+    #              failure. Stale alarm clear will be retried on next audit.
+    #
+    #########################################################################
+    def alarms_audit(self,
+                     fm,
+                     audit_alarm_id_list,
+                     major_alarm_dict,
+                     critical_alarm_dict):
+        """Audit the fm database for this plugin's alarms state
+
+        :param fm The Fault Manager's API Object
+        :param audit_alarm_id_list A list of alarm ids to query
+        :param major_alarm_dict    A dictionary of major    alarms by aid:eid
+        :param critical_alarm_dict A dictionary of critical alarms by aid:eid
+        """
+
+        if len(audit_alarm_id_list) == 0:
+            return
+
+        plugin_prefix = self.plugin + ' audit'
+
+        if len(major_alarm_dict):
+            collectd.debug("%s major_alarm_dict: %s" %
+                           (plugin_prefix, major_alarm_dict))
+
+        if len(critical_alarm_dict):
+            collectd.debug("%s critical_alarm_dict: %s" %
+                           (plugin_prefix, critical_alarm_dict))
+
+        for alarm_id in audit_alarm_id_list:
+            collectd.debug("%s searching for all '%s' alarms" %
+                           (plugin_prefix, alarm_id))
+            try:
+                database_alarms = []
+                tmp = fm.get_faults_by_id(alarm_id)
+                if tmp is not None:
+                    database_alarms = tmp
+
+                # database alarms might contain same alarm id for other
+                # hosts and needs to be filtered
+                alarms = []
+                for alarm in database_alarms:
+                    base_eid = alarm.entity_instance_id.split('.')[0]
+                    if self.base_eid == base_eid:
+                        collectd.debug("%s alarm %s:%s:%s in fm" %
+                                       (plugin_prefix,
+                                        alarm.severity, alarm_id,
+                                        alarm.entity_instance_id))
+                        alarms.append(alarm)
+
+            except Exception as ex:
+                collectd.error("%s get_faults_by_id %s failed "
+                               "with exception ; %s" %
+                               (plugin_prefix, alarm_id, ex))
+                continue
+
+            # Service database alarms case
+
+            # Stale database alarms handling case
+            remove_alarms_list = []
+            if alarms:
+                for alarm in alarms:
+                    found = False
+                    for eid in major_alarm_dict:
+                        if alarm.entity_instance_id == eid:
+                            found = True
+                            break
+                    if found is False:
+                        for eid in critical_alarm_dict:
+                            if alarm.entity_instance_id == eid:
+                                found = True
+                                break
+
+                    if found is False:
+                        collectd.info("%s alarm %s:%s:%s is stale ; clearing" %
+                                      (plugin_prefix,
+                                       alarm.severity, alarm_id,
+                                       alarm.entity_instance_id))
+
+                        # clear stale alarm.
+                        self.clear_alarm(fm, alarm_id,
+                                         alarm.entity_instance_id)
+                        remove_alarms_list.append(alarm)
+                for alarm in remove_alarms_list:
+                    alarms.remove(alarm)
+            else:
+                collectd.debug("%s database has no %s alarms" %
+                               (plugin_prefix, alarm_id))
+
+            # If major alarms exist then check for
+            # missing or mismatch state in fm database
+            if len(major_alarm_dict):
+                self.__missing_or_mismatch_alarm_handler(fm,
+                                                         alarms,
+                                                         alarm_id,
+                                                         'major',
+                                                         major_alarm_dict)
+            # If critical alarms exist then check for
+            # missing or mismatch state in fm database.
+            if len(critical_alarm_dict):
+                self.__missing_or_mismatch_alarm_handler(fm,
+                                                         alarms,
+                                                         alarm_id,
+                                                         'critical',
+                                                         critical_alarm_dict)
 
     ###########################################################################
     #
