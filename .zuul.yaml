@@ -5,12 +5,36 @@
     check:
       jobs:
         - openstack-tox-linters
+        - kube-cpusets-tox-py27
+        - kube-cpusets-tox-py36
+        - kube-cpusets-tox-flake8
+        - kube-cpusets-tox-pylint
+        - kube-memory-tox-py27
+        - kube-memory-tox-py36
+        - kube-memory-tox-flake8
+        - kube-memory-tox-pylint
     gate:
       jobs:
         - openstack-tox-linters
+        - kube-cpusets-tox-py27
+        - kube-cpusets-tox-py36
+        - kube-cpusets-tox-flake8
+        - kube-cpusets-tox-pylint
+        - kube-memory-tox-py27
+        - kube-memory-tox-py36
+        - kube-memory-tox-flake8
+        - kube-memory-tox-pylint
     post:
       jobs:
         - stx-monitoring-upload-git-mirror
+        - kube-cpusets-tox-py27
+        - kube-cpusets-tox-py36
+        - kube-cpusets-tox-flake8
+        - kube-cpusets-tox-pylint
+        - kube-memory-tox-py27
+        - kube-memory-tox-py36
+        - kube-memory-tox-flake8
+        - kube-memory-tox-pylint
 
 - job:
     name: stx-monitoring-upload-git-mirror
@@ -24,6 +48,119 @@
       - name: git_mirror_credentials
         secret: stx-monitoring-github-secret
         pass-to-parent: true
+
+- job:
+    name: kube-cpusets-tox-pylint
+    parent: openstack-tox-pylint
+    description: |
+      Run pylint test for kube-cpusets
+    required-projects:
+      - starlingx/config
+    nodeset: ubuntu-bionic
+    files:
+      - kube-cpusets/*
+    vars:
+      tox_envlist: pylint
+      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-cpusets-tox-flake8
+    parent: tox
+    description: |
+      Run flake8 test for kube-cpusets
+    required-projects:
+      - starlingx/config
+    nodeset: ubuntu-bionic
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      tox_envlist: flake8
+      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-cpusets-tox-py36
+    parent: tox
+    description: |
+      Run py36 test for kube-cpusets
+    required-projects:
+      - starlingx/config
+    nodeset: ubuntu-bionic
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      tox_envlist: py36
+      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-cpusets-tox-py27
+    parent: tox
+    description: |
+      Run py27 test for kube-cpusets
+    nodeset: ubuntu-bionic
+    required-projects:
+      - starlingx/config
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      tox_envlist: py27
+      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-memory-tox-pylint
+    parent: tox
+    required-projects:
+      - starlingx/config
+    nodeset: ubuntu-bionic
+    description: |
+      Run pylint test for kube-memory
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: pylint
+      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-flake8
+    parent: tox
+    description: |
+      Run flake8 test for kube-memory
+    nodeset: ubuntu-bionic
+    required-projects:
+      - starlingx/config
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: flake8
+      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-py36
+    parent: tox
+    description: |
+      Run py36 test for kube-memory
+    nodeset: ubuntu-bionic
+    required-projects:
+      - starlingx/config
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: py36
+      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-py27
+    parent: tox
+    description: |
+      Run py27 test for kube-memory
+    nodeset: ubuntu-bionic
+    required-projects:
+      - starlingx/config
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: py27
+      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
 
 - secret:
     name: stx-monitoring-github-secret
