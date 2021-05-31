@@ -1684,8 +1684,7 @@ def init_func():
     obj = PLUGINS[PLUGIN__DF]
     obj.resource_name = "File System"
     obj.instance_name = PLUGIN__DF
-    obj.repair = "Monitor and if condition persists, "
-    obj.repair += "contact next level of support."
+    obj.repair = "Reduce usage or resize filesystem."
 
     # The FileSystem (DF) plugin has multiple instances
     # One instance per file system mount point being monitored.
