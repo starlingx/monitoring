@@ -45,6 +45,7 @@ Requires: collectd-python
 Requires: fm-api
 Requires: python-httplib2
 Requires: python-oslo-concurrency
+Requires: python-oslo-utils
 Requires: tsconfig
 Requires: /bin/systemctl
 
