@@ -93,10 +93,6 @@ from fm_api import fm_api
 import tsconfig.tsconfig as tsc
 import plugin_common as pc
 
-# only load influxdb on the controller
-if tsc.nodetype == 'controller':
-    from influxdb import InfluxDBClient
-
 api = fm_api.FaultAPIsV2()
 
 # Debug control
@@ -122,9 +118,6 @@ PLUGIN = 'alarm notifier'
 
 # This plugin's degrade function
 PLUGIN_DEGRADE = 'degrade notifier'
-
-# the name of the collectd samples database
-DATABASE_NAME = 'collectd samples'
 
 READING_TYPE__PERCENT_USAGE = '% usage'
 
@@ -547,11 +540,8 @@ mtcDegradeObj = DegradeObject(MTCE_CMD_RX_PORT)
 # fmAlarmObject Class
 class fmAlarmObject:
 
-    dbObj = None                           # shared database connection obj
     host = None                            # saved hostname
     lock = None                            # global lock for mread_func mutex
-    database_setup = False                 # state of database setup
-    database_setup_in_progress = False     # connection mutex
     plugin_path = None
     fm_connectivity = False
 
@@ -1527,79 +1517,6 @@ def _print_state(obj=None):
                        (PLUGIN, ex))
 
 
-def _database_setup(database):
-    """Setup the influx database for collectd resource samples"""
-
-    collectd.info("%s setting up influxdb:%s database" %
-                  (PLUGIN, database))
-
-    error_str = ""
-
-    # http://influxdb-python.readthedocs.io/en/latest/examples.html
-    # http://influxdb-python.readthedocs.io/en/latest/api-documentation.html
-    fmAlarmObject.dbObj = InfluxDBClient('127.0.0.1', '8086', database)
-    if fmAlarmObject.dbObj:
-        try:
-            fmAlarmObject.dbObj.create_database('collectd')
-
-            ############################################################
-            #
-            # TODO: Read current retention period from service parameter
-            #       Make it a puppet implementation.
-            #
-            # Create a '1 week' samples retention policy
-            # -----------------------------------------
-            # name     = 'collectd samples'
-            # duration = set retention period in time
-            #               xm - minutes
-            #               xh - hours
-            #               xd - days
-            #               xw - weeks
-            #               xy - years
-            # database = 'collectd'
-            # default  = True ; make it the default
-            #
-            ############################################################
-
-            fmAlarmObject.dbObj.create_retention_policy(
-                DATABASE_NAME, '1w', 1, database, True)
-        except Exception as ex:
-            if str(ex) == 'database already exists':
-                try:
-                    collectd.info("%s influxdb:collectd %s" %
-                                  (PLUGIN, str(ex)))
-                    fmAlarmObject.dbObj.create_retention_policy(
-                        DATABASE_NAME, '1w', 1, database, True)
-                except Exception as ex:
-                    if str(ex) == 'retention policy already exists':
-                        collectd.info("%s influxdb:collectd %s" %
-                                      (PLUGIN, str(ex)))
-                    else:
-                        error_str = "failure from influxdb ; "
-                        error_str += str(ex)
-            else:
-                error_str = "failed to create influxdb:" + database
-    else:
-        error_str = "failed to connect to influxdb:" + database
-
-    if not error_str:
-            found = False
-            retention = \
-                fmAlarmObject.dbObj.get_list_retention_policies(database)
-            for r in range(len(retention)):
-                if retention[r]["name"] == DATABASE_NAME:
-                    collectd.info("%s influxdb:%s samples retention "
-                                  "policy: %s" %
-                                  (PLUGIN, database, retention[r]))
-                    found = True
-            if found is True:
-                collectd.info("%s influxdb:%s is setup" % (PLUGIN, database))
-                fmAlarmObject.database_setup = True
-            else:
-                collectd.error("%s influxdb:%s retention policy NOT setup" %
-                               (PLUGIN, database))
-
-
 def _clear_alarm_for_missing_filesystems():
     """Clear alarmed file systems that are no longer mounted or present"""
 
@@ -1754,11 +1671,6 @@ def init_func():
     # ADD_NEW_PLUGIN: Add new plugin object initialization here ...
     # ...
 
-    if tsc.nodetype == 'controller':
-        fmAlarmObject.database_setup_in_progress = True
-        _database_setup('collectd')
-        fmAlarmObject.database_setup_in_progress = False
-
     pluginObject.init_completed()
     return 0
 
@@ -1905,13 +1817,6 @@ def notifier_func(nObject):
         collectd.debug('%s with unsupported severity %d' %
                        (PLUGIN, nObject.severity))
         return 0
-
-    if tsc.nodetype == 'controller':
-        if fmAlarmObject.database_setup is False:
-            if fmAlarmObject.database_setup_in_progress is False:
-                fmAlarmObject.database_setup_in_progress = True
-                _database_setup('collectd')
-                fmAlarmObject.database_setup_in_progress = False
 
     # get plugin object
     if nObject.plugin in PLUGINS:

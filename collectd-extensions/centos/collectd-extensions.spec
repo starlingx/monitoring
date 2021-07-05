@@ -44,7 +44,6 @@ Requires: collectd
 Requires: collectd-python
 Requires: fm-api
 Requires: python-httplib2
-Requires: python-influxdb
 Requires: python-oslo-concurrency
 Requires: tsconfig
 Requires: /bin/systemctl
