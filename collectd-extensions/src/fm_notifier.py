@@ -88,6 +88,7 @@ import re
 import socket
 import collectd
 from threading import RLock as Lock
+from oslo_utils import encodeutils
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 import tsconfig.tsconfig as tsc
@@ -387,7 +388,7 @@ class DegradeObject:
                 collectd.info("%s: %s" % (PLUGIN_DEGRADE, message))
 
                 mtce_socket.settimeout(1.0)
-                mtce_socket.sendto(message, (self.addr, self.port))
+                mtce_socket.sendto(encodeutils.safe_encode(message), (self.addr, self.port))
                 mtce_socket.close()
             else:
                 collectd.error("%s %s failed to open socket (%s)" %

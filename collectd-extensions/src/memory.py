@@ -261,7 +261,7 @@ def get_platform_memory():
 
     # Walk the first level cgroups and get memory usage
     # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
-    dir_list = os.walk(MEMCONT).next()[1]
+    dir_list = next(os.walk(MEMCONT))[1]
     for name in dir_list:
         cg_path = '/'.join([MEMCONT, name])
         m = get_cgroup_memory(cg_path)

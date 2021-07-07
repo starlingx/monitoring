@@ -46,6 +46,7 @@ Requires: fm-api
 Requires: python3-httplib2
 Requires: python3-influxdb
 Requires: python3-oslo-concurrency
+Requires: python3-oslo-utils
 Requires: tsconfig
 Requires: /bin/systemctl
 
