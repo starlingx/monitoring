@@ -7,10 +7,12 @@
         - openstack-tox-linters
         - kube-cpusets-tox-py27
         - kube-cpusets-tox-py36
+        - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
         - kube-memory-tox-py27
         - kube-memory-tox-py36
+        - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
     gate:
@@ -18,10 +20,12 @@
         - openstack-tox-linters
         - kube-cpusets-tox-py27
         - kube-cpusets-tox-py36
+        - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
         - kube-memory-tox-py27
         - kube-memory-tox-py36
+        - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
     post:
@@ -29,10 +33,12 @@
         - stx-monitoring-upload-git-mirror
         - kube-cpusets-tox-py27
         - kube-cpusets-tox-py36
+        - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
         - kube-memory-tox-py27
         - kube-memory-tox-py36
+        - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
 
@@ -92,6 +98,22 @@
       tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
 
 - job:
+    name: kube-cpusets-tox-py39
+    parent: tox-py39
+    description: |
+      Run py39 for kube-cpusets
+    required-projects:
+      - starlingx/config
+    nodeset: debian-bullseye
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      python_version: 3.9
+      tox_envlist: py39
+      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+
+
+- job:
     name: kube-cpusets-tox-py27
     parent: tox
     description: |
@@ -146,6 +168,22 @@
     vars:
       tox_envlist: py36
       tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-py39
+    parent: tox-py39
+    description: |
+      Run py39 test for kube-memory
+    nodeset: debian-bullseye
+    required-projects:
+      - starlingx/config
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      python_version: 3.9
+      tox_envlist: py39
+      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
 
 - job:
     name: kube-memory-tox-py27
