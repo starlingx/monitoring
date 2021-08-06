@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2020 Wind River Systems, Inc.
+# Copyright (c) 2018-2021 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -23,6 +23,8 @@ import re
 import socket
 import time
 import tsconfig.tsconfig as tsc
+
+from kubernetes.client.rest import ApiException
 
 PLUGIN = 'platform cpu usage plugin'
 PLUGIN_DEBUG = 'DEBUG platform cpu'
@@ -257,38 +259,44 @@ def update_cpu_data(init=False):
         if obj.debug:
             collectd.info('%s Refresh k8s pod information.' % (PLUGIN_DEBUG))
         obj.k8s_pods = set()
-        pods = obj._k8s_client.kube_get_local_pods()
-        for i in pods:
-            # NOTE: parent pod cgroup name contains annotation config.hash as
-            # part of its name, otherwise it contains the pod uid.
-            uid = i.metadata.uid
-            if ((i.metadata.annotations) and
-                    (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
-                hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
-                                                      None)
-                if hash_uid:
-                    if obj.debug:
-                        collectd.info('%s POD_ANNOTATION_KEY: '
-                                      'hash=%s, uid=%s, '
-                                      'name=%s, namespace=%s, qos_class=%s'
-                                      % (PLUGIN_DEBUG,
-                                         hash_uid,
-                                         i.metadata.uid,
-                                         i.metadata.name,
-                                         i.metadata.namespace,
-                                         i.status.qos_class))
-                    uid = hash_uid
+        try:
+            pods = obj._k8s_client.kube_get_local_pods()
+            for i in pods:
+                # NOTE: parent pod cgroup name contains annotation config.hash as
+                # part of its name, otherwise it contains the pod uid.
+                uid = i.metadata.uid
+                if ((i.metadata.annotations) and
+                        (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
+                    hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
+                                                          None)
+                    if hash_uid:
+                        if obj.debug:
+                            collectd.info('%s POD_ANNOTATION_KEY: '
+                                          'hash=%s, uid=%s, '
+                                          'name=%s, namespace=%s, qos_class=%s'
+                                          % (PLUGIN_DEBUG,
+                                             hash_uid,
+                                             i.metadata.uid,
+                                             i.metadata.name,
+                                             i.metadata.namespace,
+                                             i.status.qos_class))
+                        uid = hash_uid
 
-            obj.k8s_pods.add(uid)
-            if uid not in obj._cache:
-                obj._cache[uid] = pc.POD_object(i.metadata.uid,
-                                                i.metadata.name,
-                                                i.metadata.namespace,
-                                                i.status.qos_class)
-    # Remove stale _cache entries
-    remove_uids = set(obj._cache.keys()) - obj.k8s_pods
-    for uid in remove_uids:
-        del obj._cache[uid]
+                obj.k8s_pods.add(uid)
+                if uid not in obj._cache:
+                    obj._cache[uid] = pc.POD_object(i.metadata.uid,
+                                                    i.metadata.name,
+                                                    i.metadata.namespace,
+                                                    i.status.qos_class)
+
+            # Remove stale _cache entries
+            remove_uids = set(obj._cache.keys()) - obj.k8s_pods
+            for uid in remove_uids:
+                del obj._cache[uid]
+        except ApiException:
+            # continue with remainder of calculations, keeping cache
+            collectd.warning("cpu plugin encountered kube ApiException")
+            pass
 
     # Save initial state information
     if init:
