@@ -512,7 +512,7 @@ def read_func():
     # Dispatch overall platform usage percent value
     if obj.platform_memory_percent > 0.0:
         val = collectd.Values(host=obj.hostname)
-        val.type = 'percent'
+        val.type = 'memory'
         val.type_instance = 'used'
         val.plugin = 'memory'
         val.plugin_instance = 'platform'
