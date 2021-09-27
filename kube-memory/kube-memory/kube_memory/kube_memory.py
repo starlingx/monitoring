@@ -18,6 +18,7 @@ Usage: kube-memory [-h] [--debug]
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -51,6 +52,14 @@ GREP_CMD = ["grep", "-rs", "total_rss"]
 LOG = logging.getLogger(__name__)
 
 
+def py2_round(number, decimal=0):
+    # This function will keep the behavior of py2 round method
+    param = 10 ** decimal
+    if number > 0:
+        return float(math.floor((number * param) + 0.5)) / param  # pylint: disable=W1619
+    return float(math.ceil((number * param) - 0.5)) / param  # pylint: disable=W1619
+
+
 def mem_to_mebibytes(n_bytes):
     """Convert a string that represents memory in bytes into mebibytes(MiB)
 
@@ -58,8 +67,8 @@ def mem_to_mebibytes(n_bytes):
        e.g., '1829108992' is converted to 1744.374.
     """
     try:
-        mebibytes = (float(n_bytes) / BYTES_IN_MEBIBYTE)
-        return str(round(mebibytes, DECIMAL_DIGITS))
+        mebibytes = (float(n_bytes) / BYTES_IN_MEBIBYTE)  # pylint: disable=W1619
+        return str(py2_round(mebibytes, DECIMAL_DIGITS))
     except (ValueError, TypeError):
         return "-"
 
@@ -434,13 +443,13 @@ def gather_info_and_display():
         mem_info['MemAvailable'])) * KBYTE
     total_mebib = float(anon_mebib + avail_mebib)
 
-    anon_percent = round(100 * anon_mebib / total_mebib, DECIMAL_DIGITS)
+    anon_percent = py2_round(100 * anon_mebib / total_mebib, DECIMAL_DIGITS)  # pylint: disable=W1619
 
     reserved_mebib = get_platform_reserved_memory()
     # Calculate platform memory in terms of percent reserved
     if reserved_mebib > 0.0:
-        platform_memory_percent = round(
-            100 * platform_mebib / reserved_mebib, DECIMAL_DIGITS)
+        platform_memory_percent = py2_round(
+            100 * platform_mebib / reserved_mebib, DECIMAL_DIGITS)  # pylint: disable=W1619
 
     pt_platf = prettytable.PrettyTable(
         ['Reserved',
