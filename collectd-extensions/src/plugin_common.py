@@ -82,7 +82,8 @@ BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
 
 # Groupings of pods by kubernetes namespace
 K8S_NAMESPACE_SYSTEM = ['kube-system', 'armada', 'cert-manager', 'portieris',
-                        'vault', 'notification']
+                        'vault', 'notification', 'platform-deployment-manager',
+                        'flux-helm']
 K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
 
 # Pod parent cgroup name based on annotation.
