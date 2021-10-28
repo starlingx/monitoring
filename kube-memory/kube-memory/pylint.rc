@@ -135,9 +135,7 @@ enable=E1603,E1609,E1610,E1602,E1606,E1608,E1607,E1605,E1604,E1601,E1611,W1652,
 #  C0111: Missing %s docstring
 # Disable Python3 checkers:
 #  W1618: no-absolute-import
-#  W1619: old-division
-#  W1633: round-builtin
-disable= R0914, R0915, W0703, C0325, C0111, C0330, W1618, W1619, W1633
+disable= R0914, R0915, W0703, C0325, C0111, C0330, W1618
 
 [REPORTS]
 
