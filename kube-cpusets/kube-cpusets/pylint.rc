@@ -137,10 +137,7 @@ enable=E1603,E1609,E1610,E1602,E1606,E1608,E1607,E1605,E1604,E1601,E1611,W1652,
 #  R0915: Too many statements
 # Disable Python3 checkers:
 #  W1618: no-absolute-import
-#  W1636: map-builtin-not-iterating
-#  W1638: range-builtin-not-iterating
-disable=C0103, C0111, C0325, C0330, R0912, R0914, R0915, W0703, W1618, W1636,
-        W1638
+disable=C0103, C0111, C0325, C0330, R0912, R0914, R0915, W0703, W1618
 
 [REPORTS]
 
