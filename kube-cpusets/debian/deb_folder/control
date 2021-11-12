@@ -1,0 +1,27 @@
+Source: kube-cpusets
+Section: admin
+Priority: optional
+Maintainer: StarlingX Developers <starlingx-discuss@lists.starlingx.io>
+Build-Depends: debhelper-compat (= 13),
+ dh-python,
+ python3-all,
+ python3-setuptools,
+ python3-wheel
+Build-Depends-Indep:
+ python3-prettytable,
+Standards-Version: 4.1.2
+Homepage: https://www.starlingx.io
+
+Package: kube-cpusets
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+ python3-prettytable,
+Description: Display kubernetes containers cpusets per numa-node
+ This is the python3 version of the package.
+
+Package: kube-cpusets-wheels
+Architecture: all
+Depends: ${misc:Depends}
+Description: Contains python wheels for kube-cpusets
+ This is the support package for the PEP 427 wheel version of the package,
+ required for using pip inside a virtual environment.

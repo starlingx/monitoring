@@ -1,0 +1,5 @@
+kube-cpusets (1.0-1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Leonardo Fagundes Luz Serrano <Leonardo.FagundesLuzSerrano@windriver.com>  Thu, 11 Nov 2021 17:23:08 -0300
