@@ -1,0 +1,6 @@
+etc/collectd.d/*
+opt/collectd/extensions/config/*
+opt/collectd/extensions/python/*
+
+# %config(noreplace)
+etc/systemd/system/collectd.service
