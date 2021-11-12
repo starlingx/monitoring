@@ -1,0 +1,17 @@
+Source: monitor-tools
+Section: admin
+Priority: optional
+Maintainer: StarlingX Developers <starlingx-discuss@lists.starlingx.io>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.1.2
+Homepage: https://www.starlingx.io
+
+Package: monitor-tools
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ initscripts
+Description: Monitor tools package
+ This package contains data collection tools to monitor host performance.
+ Tools are general purpose engineering and debugging related.
+ Includes overall memory, cpu occupancy, per-task cpu,
+ per-task scheduling, per-task io.
