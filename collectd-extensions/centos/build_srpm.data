@@ -23,5 +23,7 @@ COPY_LIST="$PKG_BASE/src/LICENSE \
   $PKG_BASE/src/ovs_interface.py \
   $PKG_BASE/src/ovs_interface.conf \
   $PKG_BASE/src/example.py \
-  $PKG_BASE/src/example.conf"
+  $PKG_BASE/src/example.conf \
+  $PKG_BASE/src/service_res.py  \
+  $PKG_BASE/src/service_res.conf"
 TIS_PATCH_VER=PKG_GITREVCOUNT
