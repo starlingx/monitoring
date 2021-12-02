@@ -1,11 +1,11 @@
 #!/usr/bin/perl
 ########################################################################
 #
-# Copyright (c) 2015-2016 Wind River Systems, Inc.
+# Copyright (c) 2015-2021 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# 
+#
 ########################################################################
 #
 # Description:
@@ -16,6 +16,8 @@
 # Usage: schedtop OPTIONS
 #  [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]
 #  [--reset-hwm] [--idle] [--sort=<cpu|io>]
+#  [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-only] [--watch-quiet]
+#  [--trig-delay=time]
 #  [--help]
 
 use strict;
@@ -48,6 +50,7 @@ our %task_0 = ();
 our %task_1 = ();
 our %tids_0 = ();
 our %tids_1 = ();
+our %tids_w = ();
 our %D_task  = ();
 our %D_percpu = ();
 our %loadavg = ();
@@ -64,6 +67,7 @@ our $affinity_mask = Math::BigInt->new('0');
 our $w_aff = 10;
 our $num_tasks = 0;
 our $num_blk = 0;
+our $num_state_D = 0;
 our $is_schedstat = 1;
 our $USER_HZ = 100; # no easy way to get this
 our $CLOCK_NS = SI_G / $USER_HZ;
@@ -82,7 +86,12 @@ our ($arg_debug,
      $arg_reset_hwm,
      $arg_idle,
      $arg_sort,
-     $arg_print) = ();
+     $arg_print,
+     @arg_watch_cmd,
+     $arg_watch_only,
+     $arg_watch_quiet,
+     $arg_trig_delay,
+     ) = ();
 
 #-------------------------------------------------------------------------------
 # MAIN Program
@@ -110,7 +119,7 @@ my @delta_list = (
 );
 
 my @state_list = (
-  'exec_max', 'wait_max',
+  'exec_max', 'wait_max', 'block_max',
   'pid', 'ppid', 'state', 'comm', 'cmdline', 'wchan', 'affinity',
   'VmSize', 'VmRSS', 'start_time',
   'nice', 'policy', 'priority', 'rt_priority', 'task_cpu'
@@ -132,6 +141,10 @@ $| = 1;
   \$::arg_idle,
   \$::arg_sort,
   \$::arg_print,
+  \@::arg_watch_cmd,
+  \$::arg_watch_only,
+  \$::arg_watch_quiet,
+  \$::arg_trig_delay,
 );
 
 # Set default print options
@@ -183,6 +196,14 @@ printf "selected options: ".
   (defined $::arg_idle ? 'idle_tasks' : 'no_idle_tasks'),
   (defined $::arg_reset_hwm ? 'reset-hwm' : 'unchanged'),
   $::arg_sort, $::arg_print;
+if (@::arg_watch_cmd) {
+  printf "selected watch/trigger options: ".
+          "watch-cmd=%s, only=%s, quiet=%s, delay=%d ms\n",
+    join(',', @::arg_watch_cmd),
+    (defined $::arg_watch_only ? 'true' : 'false'),
+    (defined $::arg_watch_quiet ? 'true' : 'false'),
+    $::arg_trig_delay;
+}
 
 # Capture timestamp
 $b0 = new Benchmark;
@@ -224,8 +245,11 @@ if ($is_schedstat) {
 &get_tids(\%::tids_1);
 # Get current scheduling and io info for all tids
 &read_sched(\%::tids_1, \%::task_1);
+# Track watched tids for monitoring
+&track_watched_tids(\%::tids_1, \%::tids_w, \%::task_1, \@::arg_watch_cmd);
 
 # determine column sort order
+my $s_keyw = 'watched';
 my ($s_key1, $s_key2, $s_key3) = ();
 if ($::arg_sort eq 'cpu') {
   ($s_key1, $s_key2, $s_key3) = ('exec_runtime', 'nr_switches', 'pid');
@@ -244,7 +268,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   foreach my $cpu (keys %::percpu_1) { $::percpu_0{$cpu} = $::percpu_1{$cpu}; }
   foreach my $tid (keys %::tids_1)   { $::tids_0{$tid} = $::tids_1{$tid}; }
   foreach my $tid (keys %::task_1)   {
-    foreach my $var (keys $::task_1{$tid}) {
+    foreach my $var (keys %{$::task_1{$tid}}) {
       $::task_0{$tid}{$var} = $::task_1{$tid}{$var};
     }
   }
@@ -270,8 +294,16 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   } else {
     &read_stat(\%::percpu_1);
   }
-  # Get list of pids and tids
-  &get_tids(\%::tids_1);
+  if (defined $::arg_watch_only) {
+    # Get list of pids and tids from watched commands;
+    # this reduces cpu impact dramatically
+    foreach my $tid (keys %::tids_w) {
+      $::tids_1{$tid} = $::tids_w{$tid};
+    }
+  } else {
+    # Get list of pids and tids
+    &get_tids(\%::tids_1);
+  }
   # Get current scheduling and io info for all tids
   &read_sched(\%::tids_1, \%::task_1);
   # Get current uptime
@@ -280,6 +312,12 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   &get_loadavg(\%::loadavg, \$::runq, \$::num_tasks);
   # Get current processes blocked
   &get_blocked(\$::num_blk);
+
+  # Get current processes in uninterruptible disk sleep.
+  $num_state_D = 0;
+  foreach my $tid (keys %::task_1) {
+    $::num_state_D++ if ($::task_1{$tid}{'state'} eq 'D');
+  }
 
   # Delta calculation
   %::D_task = (); %::D_percpu = ();
@@ -295,6 +333,11 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     # state information
     foreach my $state (@state_list) {
       $::D_task{$tid}{$state} = $::task_1{$tid}{$state};
+    }
+    if (exists $::tids_w{$tid}) {
+      $::D_task{$tid}{'watched'} = 1;
+    } else {
+      $::D_task{$tid}{'watched'} = 0;
     }
 
     # derived calculations
@@ -333,6 +376,36 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     $occ_total += $::D_percpu{$cpu}{'occ'};
   }
 
+  # Trigger sysrq and coredump if we exceed watch trigger threshold
+  my $trigger = 0;
+  if ($::arg_trig_delay > 0) {
+    foreach my $tid (keys %::tids_w) {
+      if ($::D_task{$tid}{'wait_max'} > $::arg_trig_delay) {
+        $trigger = 1;
+        if (!defined $::arg_watch_quiet) {
+          printf "TRIGGER: delay: %.3f > %.3f milliseconds, tid: %d, comm: %s\n",
+            $::D_task{$tid}{'wait_max'}, $::arg_trig_delay, $tid, $::task_1{$tid}{'comm'};
+        }
+      }
+      if ($::D_task{$tid}{'block_max'} > $::arg_trig_delay) {
+        $trigger = 1;
+        if (!defined $::arg_watch_quiet) {
+          printf "TRIGGER: block: %.3f > %.3f milliseconds, tid: %d, comm: %s\n",
+            $::D_task{$tid}{'block_max'}, $::arg_trig_delay, $tid, $::task_1{$tid}{'comm'};
+        }
+      }
+    }
+  }
+  if ($trigger) {
+    if (!defined $::arg_watch_quiet) {
+      printf "TRIGGER sysrq.";
+    }
+    &sysrq_trigger_crash();
+  }
+
+  # Suppress all output
+  next if (defined $::arg_watch_quiet);
+
   # Print summary
   &schedtop_header(
     \$::tr_1,
@@ -342,6 +415,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     \$::loadavg,
     \$::runq,
     \$::num_blk,
+    \$::num_state_D,
     \$::num_tasks,
     \$::print_host
   );
@@ -372,7 +446,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     $L .= sprintf "%6s %6s %7s ", "ctxt", "migr", "occ";
   }
   if ($::opt_P{$::P_del} != $::P_none) {
-    $L .= sprintf "%7s %7s %7s %7s ", "tlen", "tmax", "delay", "dmax";
+    $L .= sprintf "%7s %7s %7s %7s %7s ", "tlen", "tmax", "delay", "dmax", "bmax";
   }
   if ($::opt_P{$::P_io} == $::P_lite) {
     $L .= sprintf "%7s %6s ", "iowt", "iocnt";
@@ -392,9 +466,10 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   }
   print $L, "\n";
 
-  foreach my $tid (sort {($D_task{$b}{$s_key1} <=> $D_task{$a}{$s_key1}) or
-                           ($D_task{$b}{$s_key2} <=> $D_task{$a}{$s_key2}) or
-                           ($D_task{$b}{$s_key3} <=> $D_task{$a}{$s_key3})} keys %D_task) {
+  foreach my $tid (sort {($D_task{$b}{$s_keyw} <=> $D_task{$a}{$s_keyw}) or
+                         ($D_task{$b}{$s_key1} <=> $D_task{$a}{$s_key1}) or
+                         ($D_task{$b}{$s_key2} <=> $D_task{$a}{$s_key2}) or
+                         ($D_task{$b}{$s_key3} <=> $D_task{$a}{$s_key3})} keys %D_task) {
     my $exec_runtime = $::D_task{$tid}{'exec_runtime'};
     my $nr_switches = $::D_task{$tid}{'nr_switches'};
     my $aff = $::D_task{$tid}{'affinity'}->as_hex();
@@ -423,9 +498,10 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
               $::D_task{$tid}{'occ'},
     }
     if ($::opt_P{$::P_del} != $::P_none) {
-      $L .= sprintf "%7.3f %7.1f %7.3f %7.1f ",
+      $L .= sprintf "%7.3f %7.1f %7.3f %7.1f %7.1f ",
               $::D_task{$tid}{'tlen'}, $::D_task{$tid}{'exec_max'},
-              $::D_task{$tid}{'wait_sum'}, $::D_task{$tid}{'wait_max'};
+              $::D_task{$tid}{'wait_sum'}, $::D_task{$tid}{'wait_max'},
+              $::D_task{$tid}{'block_max'};
     }
     if ($::opt_P{$::P_io} == $::P_lite) {
       $L .= sprintf "%7.2f %6d ",
@@ -451,7 +527,8 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
       $L .= sprintf "%s", $::D_task{$tid}{'cmdline'};
     } elsif ($::opt_P{$::P_cmd} == $::P_full) {
       $L .= sprintf "%-15s %s",
-              $::D_task{$tid}{'comm'}, $::D_task{$tid}{'cmdline'};
+              substr($::D_task{$tid}{'comm'}, 0, 15),
+              $::D_task{$tid}{'cmdline'};
     }
     print $L, "\n";
   }
@@ -561,6 +638,45 @@ sub reset_sched_hwm
   }
 }
 
+# Trigger a crash dump via sysrq, result in /var/crash .
+# The following requires root privilege:
+#   echo 1 > /proc/sys/kernel/sysrq
+#   echo c > /proc/sysrq-trigger
+sub sysrq_trigger_crash
+{
+  my $file1 = '/proc/sys/kernel/sysrq';
+  open(my $fh1, "> $file1") || croak "Cannot open file: $file1 ($!)";
+  print $fh1 "1\n";
+  close($fh1);
+
+  my $file2 = '/proc/sysrq-trigger';
+  open(my $fh2, "> $file2") || croak "Cannot open file: $file2 ($!)";
+  print $fh2 "c\n";
+  close($fh2);
+}
+
+# Track watched tids for monitoring
+sub track_watched_tids
+{
+  (local *::tids, local *::tids_w, local *::task, local *::arg_watch_cmd) = @_;
+
+  foreach my $tid (keys %::tids) {
+    my $pid = $::tids{$tid};
+    my $comm = $::task{$tid}{'comm'};
+    my $watched = 0;
+    foreach my $cmd (@::arg_watch_cmd) {
+      if (($cmd =~ /^\d+$/) && ($tid == $cmd)) {
+        $::tids_w{$tid} = $pid;
+        printf "watching: tid=%7d, comm=%s\n", $tid, $comm;
+      }
+      if ((defined $comm) && ($comm =~ /^\Q$cmd\E/)) {
+        $::tids_w{$tid} = $pid;
+        printf "watching: tid=%7d, comm=%s\n", $tid, $comm;
+      }
+    }
+  }
+}
+
 # Parse cpu and scheduling info for each tid
 # - ignore the specific tid if there is incomplete data,
 #   (i.e., cannot obtain info because task has died,
@@ -591,6 +707,7 @@ sub read_sched
     my ($nr_switches, $nr_migrations) = (0,0);
     my ($exec_runtime, $exec_max) = (0.0, 0.0);
     my ($wait_max, $wait_sum, $wait_count) = (0.0, 0.0, 0);
+    my ($block_max) = (0.0);
     my ($iowait_sum, $iowait_count) = (0.0, 0);
     my ($VmSize, $VmRSS) = ();
     my $Cpus_allowed = Math::BigInt->new('0');
@@ -659,6 +776,8 @@ sub read_sched
     LOOP_SCHED: while (<$fh>) {
       if (/^se\.statistics.{1,2}wait_max\s+:\s+(\S+)/) {
         $wait_max = $1;
+      } elsif (/^se\.statistics.{1,2}block_max\s+:\s+(\S+)/) {
+        $block_max = $1;
       } elsif (/^se\.statistics.{1,2}wait_sum\s+:\s+(\S+)/) {
         $wait_sum = $1;
       } elsif (/^se\.statistics.{1,2}wait_count\s+:\s+(\S+)/) {
@@ -682,7 +801,7 @@ sub read_sched
     close($fh);
     SKIP_SCHED:;
 
-    #cat /proc/1/io 
+    #cat /proc/1/io
     #rchar: 3432590242
     #wchar: 438665986
     #syscr: 316595
@@ -825,7 +944,7 @@ sub read_sched
     #  env_start     address above which program environment is placed
     #  env_end       address below which program environment is placed
     #  exit_code     the thread's exit_code in the form reported by the waitpid system call
-  
+
     # parse /proc/<pid>/task/<tid>/stat
     $file = '/proc/' . $pid . '/task/' . $tid . '/stat';
     my $dummy;
@@ -852,6 +971,7 @@ sub read_sched
     if (defined $sched_valid) {
       $::task{$tid}{'exec_runtime'}  = $exec_runtime;
       $::task{$tid}{'exec_max'}      = $exec_max;
+      $::task{$tid}{'block_max'}     = $block_max;
       $::task{$tid}{'wait_max'}      = $wait_max;
       $::task{$tid}{'wait_sum'}      = $wait_sum;
       $::task{$tid}{'wait_count'}    = $wait_count;
@@ -862,6 +982,7 @@ sub read_sched
     } else {
       $::task{$tid}{'exec_runtime'}  = 0;
       $::task{$tid}{'exec_max'}      = 0;
+      $::task{$tid}{'block_max'}     = 0;
       $::task{$tid}{'wait_max'}      = 0;
       $::task{$tid}{'wait_sum'}      = 0;
       $::task{$tid}{'wait_count'}    = 0;
@@ -1076,6 +1197,7 @@ sub schedtop_header {
    local *::loadavg,
    local *::runq,
    local *::num_blk,
+   local *::num_state_D,
    local *::num_tasks,
    local *::print_host,
   ) = @_;
@@ -1107,22 +1229,22 @@ sub schedtop_header {
     $skew = sprintf " skew:%.3f ms", $skew_ms;
   }
 
-  #schedtop -- 2014/03/03 02:00:21.357  dt:2050.003 ms  ldavg:0.07, 0.09, 0.08  runq:1  blk:0  nproc:440  up:6:13:00:56  skew:0.001 ms
+  #schedtop -- 2014/03/03 02:00:21.357  dt:2050.003 ms  ldavg:0.07, 0.09, 0.08  runq:1  blk:0  D:0  nproc:440  up:6:13:00:56  skew:0.001 ms
   printf "%s %s -- ".
     "%4d-%02d-%02d %02d:%02d:%02d.%03d  ".
     "dt:%.3f ms  ".
-    "ldavg:%.2f, %.2f, %.2f  runq:%d  blk:%d  nproc:%d  ".
+    "ldavg:%.2f, %.2f, %.2f  runq:%d  blk:%d  D:%d  nproc:%d  ".
     "up:%d:%02d:%02d:%02d %s\n",
     $::TOOLNAME, $::VERSION,
     1900+$year, 1+$mon, $mday, $hour, $min, $sec, $msec,
     $::tm_elapsed*1000.0,
     $::loadavg{'1'}, $::loadavg{'5'}, $::loadavg{'15'},
-    $::runq, $::num_blk, $::num_tasks,
+    $::runq, $::num_blk, $::num_state_D, $::num_tasks,
     $up_dd, $up_hh, $up_mm, $up_ss,
     $skew;
 
   return if (!($::print_host));
-  
+
   # After first print, disable print host information
   $::print_host = 0;
 
@@ -1204,8 +1326,12 @@ sub parse_schedtop_args {
    local *::arg_idle,
    local *::arg_sort,
    local *::arg_print,
+   local *::arg_watch_cmd,
+   local *::arg_watch_only,
+   local *::arg_watch_quiet,
+   local *::arg_trig_delay,
   ) = @_;
- 
+
   # Local variables
   my ($fail, $arg_help);
 
@@ -1221,15 +1347,19 @@ sub parse_schedtop_args {
   # Process input arguments
   $fail = 0;
   GetOptions(
-    "debug:i",     \$::arg_debug,
-    "delay=f",     \$::arg_delay,
-    "period=i",    \$::arg_period,
-    "repeat=i",    \$::arg_repeat,
-    "reset-hwm",   \$::arg_reset_hwm,
-    "idle",        \$::arg_idle,
-    "sort=s",      \$::arg_sort,
-    "print=s",     \$::arg_print,
-    "help|h",      \$arg_help
+    "debug:i",      \$::arg_debug,
+    "delay=f",      \$::arg_delay,
+    "period=i",     \$::arg_period,
+    "repeat=i",     \$::arg_repeat,
+    "reset-hwm",    \$::arg_reset_hwm,
+    "idle",         \$::arg_idle,
+    "sort=s",       \$::arg_sort,
+    "print=s",      \$::arg_print,
+    "watch-cmd=s@", \@::arg_watch_cmd,
+    "watch-only",   \$::arg_watch_only,
+    "watch-quiet",  \$::arg_watch_quiet,
+    "trig-delay=i", \$::arg_trig_delay,
+    "help|h",       \$arg_help
   ) || GetOptionsMessage();
 
   # Print help documentation if user has selected --help
@@ -1253,6 +1383,30 @@ sub parse_schedtop_args {
     $fail = 1;
     warn "$::TOOLNAME: Input error: --print=$::arg_print invalid; valid options are: brief, full\n";
   }
+  if ((defined $::arg_watch_only) && !(@::arg_watch_cmd)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: --watch-only requires --watch-cmd option.\n";
+  }
+  if ((defined $::arg_watch_quiet) && !(@::arg_watch_cmd)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: --watch-quiet requires --watch-cmd option.\n";
+  }
+  if ((defined $::arg_trig_delay) && !(@::arg_watch_cmd)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: --trig-delay requires --watch-cmd option.\n";
+  }
+  if ((defined $::arg_trig_delay) && ($::arg_trig_delay < 1)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: --trig-delay %d is less than 1.\n",
+          $::arg_trig_delay;
+  }
+  if (@::arg_watch_cmd) {
+    my @cmds = @::arg_watch_cmd;
+    @::arg_watch_cmd = ();
+    for my $cmd (@cmds) {
+      push(@::arg_watch_cmd, split(',', $cmd));
+    }
+  }
   if (@::ARGV) {
     $fail = 1;
     warn "$::TOOLNAME: Input error: not expecting these options: '@::ARGV'.\n";
@@ -1268,6 +1422,7 @@ sub parse_schedtop_args {
   }
   $::arg_sort ||= 'cpu';
   $::arg_print ||= 'full';
+  $::arg_trig_delay ||= 0;
 
   # Upon missing or invalid options, print usage
   if ($fail == 1) {
@@ -1277,7 +1432,7 @@ sub parse_schedtop_args {
 }
 
 # Print out a warning message and usage
-sub GetOptionsMessage {  
+sub GetOptionsMessage {
   warn "$::TOOLNAME: Error processing input arguments.\n";
   &Usage();
   exit 1;
@@ -1288,9 +1443,11 @@ sub Usage {
   printf "Usage: $::TOOLNAME OPTIONS\n";
   printf " [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]\n";
   printf " [--reset-hwm] [--idle] [--sort=<cpu|io>] [--print=<brief|full>]\n";
+  printf " [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-only] [--watch-quiet]\n";
+  printf " [--trig-delay=time]\n";
   printf " [--help]\n";
 
-  printf "\n"; 
+  printf "\n";
 }
 
 # Print tool help
@@ -1305,6 +1462,13 @@ sub ListHelp {
   printf " --idle             : specify printing of idle tasks\n";
   printf " --sort=<cpu|io>    : sort order, select from 'cpu' or 'io'\n";
   printf " --print=<brief|full> : select 'brief' or 'full' fields to display\n";
+  printf("Watch specific tasks or commands:\n");
+  printf(" --watch-cmd=tid1,cmd1,... : watch specific tids or 'comm' names\n");
+  printf("   (matches from beginning of comm with partial name, eg, --watch-cmd=sirq)\n");
+  printf(" --watch-only       : display only watched tasks (reduces impact of tool)\n");
+  printf(" --watch-quiet      : suppress output after watch starts\n");
+  printf("Trigger crash dump via sysrq:\n");
+  printf " --trig-delay=time : trigger delay threshold (ms)\n";
   printf " --help             : this help\n";
   exit 0;
 }
