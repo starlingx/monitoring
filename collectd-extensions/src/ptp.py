@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2020 Wind River Systems, Inc.
+# Copyright (c) 2019-2022 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -36,6 +36,7 @@ import tsconfig.tsconfig as tsc
 import plugin_common as pc
 from fm_api import constants as fm_constants
 from fm_api import fm_api
+from glob import glob
 
 debug = False
 
@@ -67,6 +68,8 @@ PLUGIN_SERVICE = 'ptp4l.service'
 #
 PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
+PTPINSTANCE_PATH = '/etc/ptpinstance/'
+PTPINSTANCE_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -140,16 +143,20 @@ class PTP_ctrl_object:
 
     def __init__(self):
 
-        self.gm_log_throttle = 0
+        self.log_throttle_count = 0
+        self.phase = 0
         self.nolock_alarm_object = None
         self.process_alarm_object = None
         self.oot_alarm_object = None
 
+# For backward compatility, we keep the host-based ptp alarms.
+PTP_HOST_BASED = 'host_based'
 
-ctrl = PTP_ctrl_object()
+# PTP crtl objects for each PTP instances
+ptpinstances = {}
 
 
-# Alarm object list, one entry for each interface and alarm cause case
+# Alarm object list, one entry for each interface/instance and alarm cause case
 ALARM_OBJ_LIST = []
 
 
@@ -460,13 +467,14 @@ def raise_alarm(alarm_cause, interface=None, data=0):
 # Description: Create alarm objects for specified interface
 #
 #####################################################################
-def create_interface_alarm_objects(interface=None):
+def create_interface_alarm_objects(interface=None, instance=None):
     """Create alarm objects"""
 
     collectd.debug("%s Alarm Object Create: Interface:%s " %
                    (PLUGIN, interface))
 
     if interface is None:
+        ctrl = PTP_ctrl_object()
         o = PTP_alarm_object()
         o.alarm = ALARM_CAUSE__PROCESS
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
@@ -502,7 +510,48 @@ def create_interface_alarm_objects(interface=None):
         ALARM_OBJ_LIST.append(o)
         ctrl.nolock_alarm_object = o
 
+        ptpinstances[PTP_HOST_BASED] = ctrl
+
     else:
+        if instance:
+            ctrl = PTP_ctrl_object()
+            o = PTP_alarm_object(instance)
+            o.alarm = ALARM_CAUSE__PROCESS
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname + ' does not support the provisioned '
+            o.reason += PTP + ' mode '
+            o.repair = 'Check host hardware reference manual '
+            o.repair += 'to verify that the selected PTP mode is supported'
+            o.eid = obj.base_eid + '.instance=' + instance + '.ptp'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN  # 'unknown'
+            ALARM_OBJ_LIST.append(o)
+            ctrl.process_alarm_object = o
+
+            o = PTP_alarm_object(instance)
+            o.alarm = ALARM_CAUSE__OOT
+            o.severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+            o.reason = obj.hostname + ' '
+            o.reason += PTP + " clocking is out of tolerance by "
+            o.repair = "Check quality of the clocking network"
+            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=out-of-tolerance'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
+            ALARM_OBJ_LIST.append(o)
+            ctrl.oot_alarm_object = o
+
+            o = PTP_alarm_object(instance)
+            # Only applies to storage and worker nodes
+            o.alarm = ALARM_CAUSE__NO_LOCK
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' is not locked to remote PTP Grand Master'
+            o.repair = 'Check network'
+            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=no-lock'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
+            ALARM_OBJ_LIST.append(o)
+            ctrl.nolock_alarm_object = o
+
+            ptpinstances[instance] = ctrl
+
         o = PTP_alarm_object(interface)
         o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
@@ -547,12 +596,12 @@ def create_interface_alarm_objects(interface=None):
 # Description: Refresh the timestamping mode if it changes
 #
 #####################################################################
-def read_timestamp_mode():
+def read_timestamp_mode(conf_file):
     """Load timestamping mode"""
 
-    if os.path.exists(PLUGIN_CONF_FILE):
+    if os.path.exists(conf_file):
         current_mode = obj.mode
-        with open(PLUGIN_CONF_FILE, 'r') as infile:
+        with open(conf_file, 'r') as infile:
             for line in infile:
                 if PLUGIN_CONF_TIMESTAMPING in line:
                     obj.mode = line.split()[1].strip('\n')
@@ -563,9 +612,11 @@ def read_timestamp_mode():
                 collectd.info("%s Timestamping Mode: %s" %
                               (PLUGIN, obj.mode))
         else:
-            collectd.error("%s failed to get Timestamping Mode" % PLUGIN)
+            collectd.error("%s failed to get Timestamping Mode from %s" %
+                           (PLUGIN, conf_file))
     else:
-        collectd.error("%s failed to load ptp4l configuration" % PLUGIN)
+        collectd.error("%s failed to load ptp4l configuration from %s" %
+                       (PLUGIN, conf_file))
         obj.mode = None
 
 
@@ -620,9 +671,39 @@ def init_func():
         collectd.error("%s failed to load ptp4l configuration" % PLUGIN)
         obj.mode = None
 
+    if os.path.exists(PTPINSTANCE_PATH):
+        filenames = glob(PTPINSTANCE_CONF_FILE_PATTERN)
+        if len(filenames) == 0:
+            collectd.debug("No ptp instances configured")
+        else:
+            for filename in filenames:
+                instance_name = filename.split('-')[1].split('.')[0]
+                ptpinstances[instance_name] = None
+                with open(filename, 'r') as infile:
+                    for line in infile:
+                        if line[0] == '[':
+                            interface = line.split(']')[0].split('[')[1]
+                            if interface and interface != 'global':
+                                interfaces[interface] = _get_supported_modes(interface)
+                                create_interface_alarm_objects(interface, instance_name)
+                        if PLUGIN_CONF_TIMESTAMPING in line:
+                            obj.mode = line.split()[1].strip('\n')
+                if obj.mode:
+                    collectd.info("%s instance %s Timestamping Mode: %s" %
+                                  (PLUGIN, instance_name, obj.mode))
+                else:
+                    collectd.error("%s instance %s failed to get Timestamping Mode" %
+                                   (PLUGIN, instance_name))
+    else:
+        collectd.error("%s failed to load ptp4l instance configuration" % PLUGIN)
+        obj.mode = None
+
     for key, value in interfaces.items():
         collectd.info("%s interface %s supports timestamping modes: %s" %
                       (PLUGIN, key, value))
+
+    for key, value in ptpinstances.items():
+        collectd.info("%s instance %s found" % (PLUGIN, key))
 
     # remove '# to dump alarm object data
     # print_alarm_objects()
@@ -725,151 +806,165 @@ def read_func():
         else:
             collectd.info("%s no startup alarms found" % PLUGIN)
 
-    # This plugin supports PTP in-service state change by checking
-    # service state on every audit ; every 5 minutes.
-    data = subprocess.check_output([SYSTEMCTL,
-                                    SYSTEMCTL_IS_ENABLED_OPTION,
-                                    PLUGIN_SERVICE])
-    collectd.debug("%s PTP admin state:%s" % (PLUGIN, data.rstrip()))
-
-    if data.rstrip() == SYSTEMCTL_IS_DISABLED_RESPONSE:
-
-        # Manage execution phase
-        if obj.phase != RUN_PHASE__DISABLED:
-            obj.phase = RUN_PHASE__DISABLED
-            obj.log_throttle_count = 0
-
-        if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s PTP Service Disabled" % PLUGIN)
-        obj.log_throttle_count += 1
-
-        for o in ALARM_OBJ_LIST:
-            if o.raised is True:
-                if clear_alarm(o.eid) is True:
-                    o.raised = False
-                else:
-                    collectd.error("%s %s:%s clear alarm failed "
-                                   "; will retry" %
-                                   (PLUGIN, PLUGIN_ALARMID, o.eid))
-        return 0
-
-    data = subprocess.check_output([SYSTEMCTL,
-                                    SYSTEMCTL_IS_ACTIVE_OPTION,
-                                    PLUGIN_SERVICE])
-
-    if data.rstrip() == SYSTEMCTL_IS_INACTIVE_RESPONSE:
-
-        # Manage execution phase
-        if obj.phase != RUN_PHASE__NOT_RUNNING:
-            obj.phase = RUN_PHASE__NOT_RUNNING
-            obj.log_throttle_count = 0
-
-        if ctrl.process_alarm_object.alarm == ALARM_CAUSE__PROCESS:
-            if ctrl.process_alarm_object.raised is False:
-                collectd.error("%s PTP service enabled but not running" %
-                               PLUGIN)
-                if raise_alarm(ALARM_CAUSE__PROCESS) is True:
-                    ctrl.process_alarm_object.raised = True
-
-        # clear all other alarms if the 'process' alarm is raised
-        elif ctrl.process_alarm_object.raised is True:
-            if clear_alarm(ctrl.process_alarm_object.eid) is True:
-                msg = 'cleared'
-                ctrl.process_alarm_object.raised = False
-            else:
-                msg = 'failed to clear'
-            collectd.info("%s %s %s:%s" %
-                          (PLUGIN, msg, PLUGIN_ALARMID,
-                           ctrl.process_alarm_object.eid))
-        return 0
-
-    # Handle clearing the 'process' alarm if it is asserted and
-    # the process is now running
-    if ctrl.process_alarm_object.raised is True:
-        if clear_alarm(ctrl.process_alarm_object.eid) is True:
-            ctrl.process_alarm_object.raised = False
-            collectd.info("%s PTP service enabled and running" % PLUGIN)
-
-    # Auto refresh the timestamping mode in case collectd runs
-    # before the ptp manifest or the mode changes on the fly by
-    # an in-service manifest.
-    # Every 4 audits.
     obj.audits += 1
-    if not obj.audits % 4:
-        read_timestamp_mode()
+    for instance_name, ctrl in ptpinstances.items():
+        if instance_name == PTP_HOST_BASED:
+            ptp_service = PLUGIN_SERVICE
+            conf_file = PLUGIN_CONF_FILE
+            instance = None
+        else:
+            ptp_service = 'ptp4l@' + instance_name + '.service'
+            conf_file = PTPINSTANCE_PATH + 'ptp4l-' + instance_name + '.conf'
+            instance = instance_name
+        # This plugin supports PTP in-service state change by checking
+        # service state on every audit ; every 5 minutes.
+        data = subprocess.check_output([SYSTEMCTL,
+                                        SYSTEMCTL_IS_ENABLED_OPTION,
+                                        ptp_service])
+        collectd.debug("%s PTP service %s admin state:%s" % (PLUGIN, ptp_service, data.rstrip()))
 
-    # Manage execution phase
-    if obj.phase != RUN_PHASE__SAMPLING:
-        obj.phase = RUN_PHASE__SAMPLING
-        obj.log_throttle_count = 0
+        if data.rstrip() == SYSTEMCTL_IS_DISABLED_RESPONSE:
 
-    # Let's read the port status information
-    #
-    # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
-    #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                    PLUGIN_CONF_FILE,
-                                    '-u', '-b', '0', 'GET PORT_DATA_SET'])
+            # Manage execution phase
+            if ctrl.phase != RUN_PHASE__DISABLED:
+                ctrl.phase = RUN_PHASE__DISABLED
+                ctrl.log_throttle_count = 0
 
-    port_locked = False
-    obj.resp = data.split('\n')
-    for line in obj.resp:
-        if 'portState' in line:
-            collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
-            port_state = line.split()[1]
-            if port_state == 'SLAVE':
-                port_locked = True
+            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                collectd.info("%s PTP Service %s Disabled" % (PLUGIN, ptp_service))
+            ctrl.log_throttle_count += 1
 
-    # Let's read the clock info, Grand Master sig and skew
-    #
-    # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
-    #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                    PLUGIN_CONF_FILE,
-                                    '-u', '-b', '0', 'GET TIME_STATUS_NP'])
+            for o in [ctrl.nolock_alarm_object, ctrl.process_alarm_object, ctrl.oot_alarm_object]:
+                if o.raised is True:
+                    if clear_alarm(o.eid) is True:
+                        o.raised = False
+                    else:
+                        collectd.error("%s %s:%s clear alarm failed "
+                                       "; will retry" %
+                                       (PLUGIN, PLUGIN_ALARMID, o.eid))
+            continue
 
-    got_master_offset = False
-    master_offset = 0
-    my_identity = ''
-    gm_identity = ''
-    gm_present = False
-    obj.resp = data.split('\n')
-    for line in obj.resp:
-        if 'RESPONSE MANAGEMENT TIME_STATUS_NP' in line:
-            collectd.debug("%s key       : %s" %
-                           (PLUGIN, line.split()[0].split('-')[0]))
-            my_identity = line.split()[0].split('-')[0]
-        if 'master_offset' in line:
-            collectd.debug("%s Offset    : %s" % (PLUGIN, line.split()[1]))
-            master_offset = float(line.split()[1])
-            got_master_offset = True
-        if 'gmPresent' in line:
-            collectd.debug("%s gmPresent : %s" % (PLUGIN, line.split()[1]))
-            gm_present = line.split()[1]
-        if 'gmIdentity' in line:
-            collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
-            gm_identity = line.split()[1]
+        data = subprocess.check_output([SYSTEMCTL,
+                                        SYSTEMCTL_IS_ACTIVE_OPTION,
+                                        ptp_service])
 
-    # Handle case where this host is the Grand Master
-    #   ... or assumes it is.
-    if my_identity == gm_identity or port_locked is False:
-        if ctrl.nolock_alarm_object.raised is False:
-            if raise_alarm(ALARM_CAUSE__NO_LOCK, None, 0) is True:
-                ctrl.nolock_alarm_object.raised = True
+        if data.rstrip() == SYSTEMCTL_IS_INACTIVE_RESPONSE:
 
-        # produce a throttled log while this host is not locked to the GM
-        if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s %s not locked to remote Grand Master "
-                          "(%s)" % (PLUGIN, obj.hostname, gm_identity))
-        obj.log_throttle_count += 1
+            # Manage execution phase
+            if ctrl.phase != RUN_PHASE__NOT_RUNNING:
+                ctrl.phase = RUN_PHASE__NOT_RUNNING
+                ctrl.log_throttle_count = 0
 
-        # No samples if we are not locked to a Grand Master
-        return 0
+            if ctrl.process_alarm_object.alarm == ALARM_CAUSE__PROCESS:
+                if ctrl.process_alarm_object.raised is False:
+                    collectd.error("%s PTP service %s enabled but not running" %
+                                   (PLUGIN, ptp_service))
+                    if raise_alarm(ALARM_CAUSE__PROCESS, instance_name) is True:
+                        ctrl.process_alarm_object.raised = True
 
-    # Handle clearing nolock alarm
-    elif ctrl.nolock_alarm_object.raised is True:
-        if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
-            ctrl.nolock_alarm_object.raised = False
+            # clear all other alarms if the 'process' alarm is raised
+            elif ctrl.process_alarm_object.raised is True:
+                if clear_alarm(ctrl.process_alarm_object.eid) is True:
+                    msg = 'cleared'
+                    ctrl.process_alarm_object.raised = False
+                else:
+                    msg = 'failed to clear'
+                collectd.info("%s %s %s:%s" %
+                              (PLUGIN, msg, PLUGIN_ALARMID,
+                               ctrl.process_alarm_object.eid))
+            continue
+
+        # Handle clearing the 'process' alarm if it is asserted and
+        # the process is now running
+        if ctrl.process_alarm_object.raised is True:
+            if clear_alarm(ctrl.process_alarm_object.eid) is True:
+                ctrl.process_alarm_object.raised = False
+                collectd.info("%s PTP service %s enabled and running" %
+                              (PLUGIN, ptp_service))
+
+        # Auto refresh the timestamping mode in case collectd runs
+        # before the ptp manifest or the mode changes on the fly by
+        # an in-service manifest.
+        # Every 4 audits.
+        if not obj.audits % 4:
+            read_timestamp_mode(conf_file)
+
+        # Manage execution phase
+        if ctrl.phase != RUN_PHASE__SAMPLING:
+            ctrl.phase = RUN_PHASE__SAMPLING
+            ctrl.log_throttle_count = 0
+
+        # Let's read the port status information
+        #
+        # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
+        #
+        data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                        conf_file,
+                                        '-u', '-b', '0', 'GET PORT_DATA_SET'])
+
+        port_locked = False
+        obj.resp = data.split('\n')
+        for line in obj.resp:
+            if 'portState' in line:
+                collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
+                port_state = line.split()[1]
+                if port_state == 'SLAVE':
+                    port_locked = True
+
+        # Let's read the clock info, Grand Master sig and skew
+        #
+        # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
+        #
+        data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                        conf_file,
+                                        '-u', '-b', '0', 'GET TIME_STATUS_NP'])
+
+        got_master_offset = False
+        master_offset = 0
+        my_identity = ''
+        gm_identity = ''
+        gm_present = False
+        obj.resp = data.split('\n')
+        for line in obj.resp:
+            if 'RESPONSE MANAGEMENT TIME_STATUS_NP' in line:
+                collectd.debug("%s key       : %s" %
+                               (PLUGIN, line.split()[0].split('-')[0]))
+                my_identity = line.split()[0].split('-')[0]
+            if 'master_offset' in line:
+                collectd.debug("%s Offset    : %s" % (PLUGIN, line.split()[1]))
+                master_offset = float(line.split()[1])
+                got_master_offset = True
+            if 'gmPresent' in line:
+                collectd.debug("%s gmPresent : %s" % (PLUGIN, line.split()[1]))
+                gm_present = line.split()[1]
+            if 'gmIdentity' in line:
+                collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
+                gm_identity = line.split()[1]
+
+        # Handle case where this host is the Grand Master
+        #   ... or assumes it is.
+        if my_identity == gm_identity or port_locked is False:
+            if ctrl.nolock_alarm_object.raised is False:
+                if raise_alarm(ALARM_CAUSE__NO_LOCK, instance, 0) is True:
+                    ctrl.nolock_alarm_object.raised = True
+
+            # produce a throttled log while this host is not locked to the GM
+            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                if instance:
+                    collectd.info("%s %s %s not locked to remote Grand Master "
+                                  "(%s)" % (PLUGIN, obj.hostname, instance, gm_identity))
+                else:
+                    collectd.info("%s %s not locked to remote Grand Master "
+                                  "(%s)" % (PLUGIN, obj.hostname, gm_identity))
+            ctrl.log_throttle_count += 1
+
+            # No samples if we are not locked to a Grand Master
+            continue
+
+        # Handle clearing nolock alarm
+        elif ctrl.nolock_alarm_object.raised is True:
+            if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
+                ctrl.nolock_alarm_object.raised = False
 
     # Keep this FIT test code but make it commented out for security
     # if os.path.exists('/var/run/fit/ptp_data'):
@@ -882,83 +977,85 @@ def read_func():
     #                           (PLUGIN, master_offset))
     #             break
 
-    # Send sample and Manage the Out-Of-Tolerance alarm
-    if got_master_offset is True:
+        # Send sample and Manage the Out-Of-Tolerance alarm
+        if got_master_offset is True:
 
-        if not (obj.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s %s is collecting samples [%5d] "
-                          "with Grand Master %s" %
-                          (PLUGIN, obj.hostname,
-                           float(master_offset), gm_identity))
+            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                collectd.info("%s %s instance %s is collecting samples [%5d] "
+                              "with Grand Master %s" %
+                              (PLUGIN, obj.hostname, instance,
+                               float(master_offset), gm_identity))
 
-        obj.log_throttle_count += 1
+            ctrl.log_throttle_count += 1
 
-        # setup the sample structure and dispatch
-        val = collectd.Values(host=obj.hostname)
-        val.type = PLUGIN_TYPE
-        val.type_instance = PLUGIN_TYPE_INSTANCE
-        val.plugin = 'ptp'
-        val.dispatch(values=[float(master_offset)])
+            # setup the sample structure and dispatch
+            val = collectd.Values(host=obj.hostname)
+            val.type = PLUGIN_TYPE
+            val.type_instance = PLUGIN_TYPE_INSTANCE
+            val.plugin = 'ptp'
+            val.dispatch(values=[float(master_offset)])
 
-        # Manage the sample OOT alarm severity
-        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-        if abs(master_offset) > OOT_MAJOR_THRESHOLD:
-            severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        elif abs(master_offset) > OOT_MINOR_THRESHOLD:
-            severity = fm_constants.FM_ALARM_SEVERITY_MINOR
+            # Manage the sample OOT alarm severity
+            severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+            if abs(master_offset) > OOT_MAJOR_THRESHOLD:
+                severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            elif abs(master_offset) > OOT_MINOR_THRESHOLD:
+                severity = fm_constants.FM_ALARM_SEVERITY_MINOR
 
-        # Handle clearing of Out-Of-Tolerance alarm
-        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
-            if ctrl.oot_alarm_object.raised is True:
-                if clear_alarm(ctrl.oot_alarm_object.eid) is True:
-                    ctrl.oot_alarm_object.severity = \
-                        fm_constants.FM_ALARM_SEVERITY_CLEAR
-                    ctrl.oot_alarm_object.raised = False
+            # Handle clearing of Out-Of-Tolerance alarm
+            if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+                if ctrl.oot_alarm_object.raised is True:
+                    if clear_alarm(ctrl.oot_alarm_object.eid) is True:
+                        ctrl.oot_alarm_object.severity = \
+                            fm_constants.FM_ALARM_SEVERITY_CLEAR
+                        ctrl.oot_alarm_object.raised = False
 
+            else:
+                # Special Case:
+                # -------------
+                # Don't raise minor alarm when in software timestamping mode.
+                # Too much skew in software or legacy mode ; alarm would bounce.
+                # TODO: Consider making ptp a real time process
+                if severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
+                        and obj.mode != 'hardware':
+                    return 0
+
+                # Handle debounce of the OOT alarm.
+                # Debounce by 1 for the same severity level.
+                if ctrl.oot_alarm_object.severity != severity:
+                    ctrl.oot_alarm_object.severity = severity
+
+                # This will keep refreshing the alarm text with the current
+                # skew value while still debounce on state transitions.
+                #
+                # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
+                #
+                elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
+                    # Handle raising the Minor OOT Alarm.
+                    rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
+                    if rc is True:
+                        ctrl.oot_alarm_object.raised = True
+
+                elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
+                    # Handle raising the Major OOT Alarm.
+                    rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
+                    if rc is True:
+                        ctrl.oot_alarm_object.raised = True
+
+                # Record the value that is alarmable
+                if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
+                    collectd.info("%s Grand Master ID: %s ; "
+                                  "HOST ID: %s ; "
+                                  "PTP instance: %s ; "
+                                  "GM Present:%s ; "
+                                  "Skew:%5d" % (PLUGIN,
+                                                gm_identity,
+                                                my_identity,
+                                                instance,
+                                                gm_present,
+                                                master_offset))
         else:
-            # Special Case:
-            # -------------
-            # Don't raise minor alarm when in software timestamping mode.
-            # Too much skew in software or legacy mode ; alarm would bounce.
-            # TODO: Consider making ptp a real time process
-            if severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
-                    and obj.mode != 'hardware':
-                return 0
-
-            # Handle debounce of the OOT alarm.
-            # Debounce by 1 for the same severity level.
-            if ctrl.oot_alarm_object.severity != severity:
-                ctrl.oot_alarm_object.severity = severity
-
-            # This will keep refreshing the alarm text with the current
-            # skew value while still debounce on state transitions.
-            #
-            # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
-            #
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
-                # Handle raising the Minor OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, None, master_offset)
-                if rc is True:
-                    ctrl.oot_alarm_object.raised = True
-
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
-                # Handle raising the Major OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, None, master_offset)
-                if rc is True:
-                    ctrl.oot_alarm_object.raised = True
-
-            # Record the value that is alarmable
-            if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                collectd.info("%s Grand Master ID: %s ; "
-                              "HOST ID: %s ; "
-                              "GM Present:%s ; "
-                              "Skew:%5d" % (PLUGIN,
-                                            gm_identity,
-                                            my_identity,
-                                            gm_present,
-                                            master_offset))
-    else:
-        collectd.info("%s No Clock Sync" % PLUGIN)
+            collectd.info("%s No Clock Sync" % PLUGIN)
 
     return 0
 
