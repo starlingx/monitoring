@@ -1,0 +1,7 @@
+---
+debname: kube-cpusets
+debver: 1.0-1
+src_path: kube-cpusets
+revision:
+  dist: $STX_DIST
+  PKG_GITREVCOUNT: true
