@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME=kube-memory
+
+export ROOT = debian/tmp
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_install:
+	python3 setup.py install -f --install-layout=deb --root=$(CURDIR)/debian/tmp
+
+	python3 setup.py bdist_wheel \
+		--universal \
+		-d $(CURDIR)/debian/kube-memory-wheels/usr/share/python3-wheels
+
+	install -m 755 -d $(ROOT)/etc/collect.d
+	install -m 755 collect_kube_memory.sh $(ROOT)/etc/collect.d/collect_kube_memory
+
+	dh_install
+
+override_dh_python3:
+	dh_python3 --shebang=/usr/bin/python3
