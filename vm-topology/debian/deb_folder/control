@@ -1,0 +1,51 @@
+Source: vm-topology
+Section: admin
+Priority: optional
+Maintainer: StarlingX Developers <starlingx-discuss@lists.starlingx.io>
+Build-Depends: debhelper-compat (= 13),
+ dh-python,
+ libvirt0,
+ python3-all,
+ python3-setuptools,
+ python3-wheel,
+Build-Depends-Indep:
+ python3-cinderclient,
+ python3-glanceclient,
+ python3-keyring,
+ python3-keystoneauth1,
+ python3-keystoneclient,
+ python3-keystonemiddleware,
+ python3-novaclient,
+ python3-oslo.config,
+ python3-oslo.serialization,
+ python3-prettytable,
+ python3-psutil,
+ python3-sqlalchemy,
+Standards-Version: 4.1.2
+Homepage: https://www.starlingx.io
+
+Package: vm-topology
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+ libvirt0,
+ python3-cinderclient,
+ python3-glanceclient,
+ python3-keyring,
+ python3-keystoneauth1,
+ python3-keystoneclient,
+ python3-keystonemiddleware,
+ python3-novaclient,
+ python3-oslo.config,
+ python3-oslo.serialization,
+ python3-prettytable,
+ python3-psutil,
+ python3-sqlalchemy,
+Description: Show compute resources and VM topology
+ This is the python3 version of the package.
+
+Package: vm-topology-wheels
+Architecture: all
+Depends: ${misc:Depends}
+Description: Contains python wheels for vm-topology
+ This is the support package for the PEP 427 wheel version of the package,
+ required for using pip inside a virtual environment.
