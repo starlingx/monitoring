@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+
+export ROOT = debian/tmp
+
+%:
+	dh $@
+
+override_dh_install:
+	install -d $(ROOT)/usr/bin
+	install -p memtop $(ROOT)/usr/bin
+	install -p schedtop $(ROOT)/usr/bin
+	install -p occtop $(ROOT)/usr/bin
+
+	dh_install
