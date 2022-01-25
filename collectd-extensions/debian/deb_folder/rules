@@ -1,0 +1,62 @@
+#!/usr/bin/make -f
+
+export ROOT = $(CURDIR)/debian/tmp
+export LOCAL_UNIT_DIR = $(ROOT)/etc/systemd/system
+export LOCAL_DEFAULT_PLUGIN_DIR = $(ROOT)/etc/collectd.d
+export LOCAL_STARLINGX_PLUGIN_DIR = $(ROOT)/etc/collectd.d/starlingx
+export LOCAL_PYTHON_EXTENSIONS_DIR = $(ROOT)/opt/collectd/extensions/python
+export LOCAL_CONFIG_EXTENSIONS_DIR = $(ROOT)/opt/collectd/extensions/config
+
+%:
+	dh $@
+
+override_dh_install:
+	install -m 755 -d $(ROOT)/etc
+	install -m 755 -d $(LOCAL_UNIT_DIR)
+	install -m 755 -d $(LOCAL_DEFAULT_PLUGIN_DIR)
+	install -m 755 -d $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 755 -d $(LOCAL_CONFIG_EXTENSIONS_DIR)
+	install -m 755 -d $(LOCAL_PYTHON_EXTENSIONS_DIR)
+
+	# support files ; service and pmon conf
+	install -m 644 collectd.service $(LOCAL_UNIT_DIR)
+	install -m 600 collectd.conf.pmon $(LOCAL_CONFIG_EXTENSIONS_DIR)
+
+	# collectd python plugin files - notifiers
+	install -m 700 fm_notifier.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 plugin_common.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+
+	# install README file into /etc/collectd.d
+	install -m 644 README $(LOCAL_DEFAULT_PLUGIN_DIR)
+
+	# collectd python plugin files - resource plugins
+	install -m 700 cpu.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 memory.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ntpq.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 remotels.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ptp.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ovs_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 service_res.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+
+	# collectd plugin conf files into /etc/collectd.d/starlingx
+	install -m 600 python_plugins.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 cpu.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 memory.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 df.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 ntpq.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 interface.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 remotels.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 ptp.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 ovs_interface.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+	install -m 600 service_res.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
+
+	dh_install
+
+# Prevent debhelper from changing permissions
+override_dh_fixperms:
+	dh_fixperms \
+	-Xcollectd.service \
+	-Xcollectd.conf.pmon \
+	-X*.py \
+	-X*.conf
