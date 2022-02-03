@@ -133,6 +133,7 @@ class PluginObject(object):
         self.enabled = False             # tracks a plugin's enabled state
         self.alarmed = False             # tracks the current alarmed state
         self.mode = ''                   # mode specific to plugin
+        self.capabilities = {}           # capabilities specific to plugin
 
         # http and json specific variables
         self.url = url                   # target url

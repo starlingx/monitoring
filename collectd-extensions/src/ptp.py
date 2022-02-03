@@ -34,6 +34,7 @@ import collectd
 import subprocess
 import tsconfig.tsconfig as tsc
 import plugin_common as pc
+import re
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 from glob import glob
@@ -69,7 +70,15 @@ PLUGIN_SERVICE = 'ptp4l.service'
 PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
 PTPINSTANCE_PATH = '/etc/ptpinstance/'
-PTPINSTANCE_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
+PTPINSTANCE_CLOCK_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'clock-*.conf'
+PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
+PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
+
+PTP_INSTANCE_TYPE_PTP4L = 'ptp4l'
+PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
+PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
+PTP_INSTANCE_TYPE_CLOCK = 'clock'
+
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -108,6 +117,9 @@ ALARM_CAUSE__NO_LOCK = 3
 ALARM_CAUSE__UNSUPPORTED_HW = 4
 ALARM_CAUSE__UNSUPPORTED_SW = 5
 ALARM_CAUSE__UNSUPPORTED_LEGACY = 6
+ALARM_CAUSE__GNSS_SIGNAL_LOSS = 7
+ALARM_CAUSE__1PPS_SIGNAL_LOSS = 8
+
 
 # Run Phase
 RUN_PHASE__INIT = 0
@@ -118,6 +130,37 @@ RUN_PHASE__SAMPLING = 3
 # Clock Sync Out-Of-Tolerance thresholds
 OOT_MINOR_THRESHOLD = int(1000)
 OOT_MAJOR_THRESHOLD = int(1000000)
+
+# DPLL device status info
+ICE_DEBUG_FS = '/sys/kernel/debug/ice/'
+
+# clock states
+CLOCK_STATE_INVALID = 'invalid'
+CLOCK_STATE_FREERUN = 'freerun'
+CLOCK_STATE_LOCKED = 'locked'
+CLOCK_STATE_LOCKED_HO_ACK = 'locked_ho_ack'
+CLOCK_STATE_HOLDOVER = 'holdover'
+CLOCK_STATE_UNLOCKED = 'unlocked'
+
+# Synce Clock Generation Unit (CGU) input pin names
+CGU_PIN_SDP22 = 'CVL-SDP22'
+CGU_PIN_SDP20 = 'CVL-SDP20'
+CGU_PIN_RCLKA = 'C827_RCLKA'
+CGU_PIN_RCLKB = 'C827_RCLKB'
+CGU_PIN_SMA1 = 'SMA1'
+CGU_PIN_SMA2 = 'SMA2/U.FL2'
+CGU_PIN_GNSS_1PPS = 'GNSS-1PPS'
+VALID_CGU_PIN_NAMES = [
+    CGU_PIN_SDP22,
+    CGU_PIN_SDP20,
+    CGU_PIN_RCLKA,
+    CGU_PIN_RCLKB,
+    CGU_PIN_SMA1,
+    CGU_PIN_SMA2,
+    CGU_PIN_GNSS_1PPS]
+
+# regex pattern match
+re_dict = re.compile(r'^(\w+)\s+(\w+)')
 
 # Instantiate the common plugin control object
 obj = pc.PluginObject(PLUGIN, "")
@@ -145,16 +188,27 @@ class PTP_ctrl_object:
 
         self.log_throttle_count = 0
         self.phase = 0
+        self.pci_slot_name = None
+        self.interface = None
+        self.instance_type = PTP_INSTANCE_TYPE_PTP4L
+        self.clock_ports = {}
         self.nolock_alarm_object = None
         self.process_alarm_object = None
         self.oot_alarm_object = None
+        self.gnss_signal_loss_alarm_object = None
+        self.pps_signal_loss_alarm_object = None
 
 # For backward compatility, we keep the host-based ptp alarms.
 PTP_HOST_BASED = 'host_based'
 
+# Parameter in sysfs device/uevent file
+PCI_SLOT_NAME = 'PCI_SLOT_NAME'
+
 # PTP crtl objects for each PTP instances
 ptpinstances = {}
 
+# dpll status of each CGU input for GNSS
+dpll_status = {}
 
 # Alarm object list, one entry for each interface/instance and alarm cause case
 ALARM_OBJ_LIST = []
@@ -421,6 +475,10 @@ def raise_alarm(alarm_cause, interface=None, data=0):
         reason = 'Provisioned ' + PTP + ' \'' + obj.mode
         reason += '\' time stamping mode seems to be unsupported by this host'
 
+    elif alarm_cause in [ALARM_CAUSE__1PPS_SIGNAL_LOSS,
+                         ALARM_CAUSE__GNSS_SIGNAL_LOSS]:
+        reason += ' state: ' + data
+
     try:
         fault = fm_api.Fault(
             alarm_id=PLUGIN_ALARMID,
@@ -515,6 +573,7 @@ def create_interface_alarm_objects(interface=None, instance=None):
     else:
         if instance:
             ctrl = PTP_ctrl_object()
+            ctrl.interface = interface
             o = PTP_alarm_object(instance)
             o.alarm = ALARM_CAUSE__PROCESS
             o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
@@ -549,6 +608,30 @@ def create_interface_alarm_objects(interface=None, instance=None):
             o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
             ALARM_OBJ_LIST.append(o)
             ctrl.nolock_alarm_object = o
+
+            o = PTP_alarm_object(instance)
+            # Only applies to storage and worker nodes
+            o.alarm = ALARM_CAUSE__GNSS_SIGNAL_LOSS
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' GNSS signal loss'
+            o.repair = 'Check network'
+            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=signal-loss'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
+            ctrl.gnss_signal_loss_alarm_object = o
+
+            o = PTP_alarm_object(instance)
+            # Only applies to storage and worker nodes
+            o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' 1PPS signal loss'
+            o.repair = 'Check network'
+            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=signal-loss'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
+            ctrl.pps_signal_loss_alarm_object = o
 
             ptpinstances[instance] = ctrl
 
@@ -620,6 +703,147 @@ def read_timestamp_mode(conf_file):
         obj.mode = None
 
 
+def get_pci_slot(instance, interface):
+    """get pci slot from uevent"""
+    slot = None
+    filename = '/sys/class/net/' + interface + '/device/uevent'
+    if os.path.exists(filename):
+        with open(filename, 'r') as infile:
+            for line in infile:
+                if PCI_SLOT_NAME in line:
+                    slot = line.split('=')[1].strip('\n')
+                    ptpinstances[instance].pci_slot_name = slot
+                    break
+
+        if not ptpinstances[instance].pci_slot_name:
+            collectd.error("%s failed to get pci slot name of interface %s" %
+                           (PLUGIN, interface))
+    else:
+        collectd.error("%s file %s does not exist" % (PLUGIN, filename))
+    return slot
+
+
+def init_dpll_status(pci_slot):
+    """initialize dpll status"""
+    pins = {}
+    for pin in VALID_CGU_PIN_NAMES:
+        pins[pin] = {'state': CLOCK_STATE_INVALID,
+                     'eec_cgu_state': CLOCK_STATE_INVALID,
+                     'pps_cgu_state': CLOCK_STATE_INVALID}
+    dpll_status[pci_slot] = pins
+
+
+def read_ptp4l_config():
+    """read ptp4l conf files"""
+    filenames = glob(PTPINSTANCE_PTP4L_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.debug("%s No PTP conf file configured for %s" %
+                       (PLUGIN, type))
+    else:
+        for filename in filenames:
+            instance = filename.split('-')[1].split('.')[0]
+            ptpinstances[instance] = None
+            with open(filename, 'r') as infile:
+                for line in infile:
+                    if line[0] == '[':
+                        interface = line.split(']')[0].split('[')[1]
+                        if interface and interface != 'global':
+                            if (ptpinstances[instance] and
+                                    ptpinstances[instance].interface == interface):
+                                # ignore the duplicate interface in the file
+                                continue
+                            interfaces[interface] = _get_supported_modes(interface)
+                            create_interface_alarm_objects(interface, instance)
+                            ptpinstances[instance].instance_type = \
+                                PTP_INSTANCE_TYPE_PTP4L
+
+                    if PLUGIN_CONF_TIMESTAMPING in line:
+                        obj.mode = line.split()[1].strip('\n')
+
+            if obj.mode:
+                collectd.info("%s instance %s Timestamping Mode: %s" %
+                              (PLUGIN, instance, obj.mode))
+            else:
+                collectd.error("%s instance %s failed to get Timestamping Mode" %
+                               (PLUGIN, instance))
+
+
+def read_ts2phc_config():
+    """read ts2phc conf files"""
+    filenames = glob(PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.info("%s No ts2phc conf file configured" % PLUGIN)
+        return
+
+    for filename in filenames:
+        instance = filename.split('-')[1].split('.')[0]
+        ptpinstances[instance] = None
+        with open(filename, 'r') as infile:
+            pci_slot = None
+            for line in infile:
+                if 'ts2phc.nmea_serialport' in line:
+                    tty = line.split(' ')[1].strip('\n')
+                    bus_device = tty.split('_')[1]
+                    function = tty.split('_')[2]
+                    pci_slot = '0000:' + bus_device[0:2] + ':' + \
+                               bus_device[2:4] + '.' + function
+                    continue
+                if line[0] == '[':
+                    interface = line.split(']')[0].split('[')[1]
+                    if interface and interface != 'global':
+                        if (ptpinstances[instance] and
+                                ptpinstances[instance].interface == interface):
+                            # ignore the duplicate interface in the file
+                            continue
+                        create_interface_alarm_objects(interface, instance)
+                        ptpinstances[instance].pci_slot_name = pci_slot
+                        ptpinstances[instance].instance_type = \
+                            PTP_INSTANCE_TYPE_TS2PHC
+                        init_dpll_status(pci_slot)
+                        obj.capabilities['primary_nic'] = interface
+        collectd.info("%s ts2phc instance %s %s" %
+                      (PLUGIN, instance, ptpinstances[instance].pci_slot_name))
+
+
+def read_clock_config():
+    """read clock conf files"""
+    filenames = glob(PTPINSTANCE_CLOCK_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.info("%s No clock conf file configured" % PLUGIN)
+    else:
+        found_port = False
+        for filename in filenames:
+            instance = filename.split('-')[1].split('.')[0]
+            ptpinstances[instance] = None
+            m = {}
+            with open(filename, 'r') as infile:
+                for line in infile:
+                    if line[0] == '[':
+                        interface = line.split(']')[0].split('[')[1]
+                        if interface and interface != 'global':
+                            if (ptpinstances[instance] and
+                                    ptpinstances[instance].interface == interface):
+                                # ignore the duplicate interface in the file
+                                continue
+                            create_interface_alarm_objects(interface, instance)
+                            ptpinstances[instance].instance_type = \
+                                PTP_INSTANCE_TYPE_CLOCK
+                            get_pci_slot(instance, interface)
+                            init_dpll_status(get_pci_slot(instance, interface))
+                            found_port = True
+                            m = {}
+                            ptpinstances[instance].clock_ports[interface] = {}
+                    elif found_port:
+                        match = re_dict.search(line)
+                        if match:
+                            k = match.group(1)
+                            v = match.group(2)
+                            m[k] = v
+                    ptpinstances[instance].clock_ports[interface] = m
+            collectd.info("%s instance:%s clock ports:%s" %
+                          (PLUGIN, instance, ptpinstances[instance].clock_ports))
+
+
 #####################################################################
 #
 # Name       : init_func
@@ -641,6 +865,7 @@ def init_func():
 
     obj.hostname = obj.gethostname()
     obj.base_eid = 'host=' + obj.hostname
+    obj.capabilities = {'primary_nic': None}
 
     # Create the interface independent alarm objects.
     create_interface_alarm_objects()
@@ -672,38 +897,24 @@ def init_func():
         obj.mode = None
 
     if os.path.exists(PTPINSTANCE_PATH):
-        filenames = glob(PTPINSTANCE_CONF_FILE_PATTERN)
-        if len(filenames) == 0:
-            collectd.debug("No ptp instances configured")
-        else:
-            for filename in filenames:
-                instance_name = filename.split('-')[1].split('.')[0]
-                ptpinstances[instance_name] = None
-                with open(filename, 'r') as infile:
-                    for line in infile:
-                        if line[0] == '[':
-                            interface = line.split(']')[0].split('[')[1]
-                            if interface and interface != 'global':
-                                interfaces[interface] = _get_supported_modes(interface)
-                                create_interface_alarm_objects(interface, instance_name)
-                        if PLUGIN_CONF_TIMESTAMPING in line:
-                            obj.mode = line.split()[1].strip('\n')
-                if obj.mode:
-                    collectd.info("%s instance %s Timestamping Mode: %s" %
-                                  (PLUGIN, instance_name, obj.mode))
-                else:
-                    collectd.error("%s instance %s failed to get Timestamping Mode" %
-                                   (PLUGIN, instance_name))
+        read_ptp4l_config()
+        read_ts2phc_config()
+        read_clock_config()
     else:
-        collectd.error("%s failed to load ptp4l instance configuration" % PLUGIN)
+        collectd.error("%s instance configuration directory %s not found" %
+                       (PLUGIN, PTPINSTANCE_PATH))
         obj.mode = None
 
     for key, value in interfaces.items():
         collectd.info("%s interface %s supports timestamping modes: %s" %
                       (PLUGIN, key, value))
 
-    for key, value in ptpinstances.items():
-        collectd.info("%s instance %s found" % (PLUGIN, key))
+    for key, ctrl in ptpinstances.items():
+        collectd.info("%s instance:%s type:%s found" %
+                      (PLUGIN, key, ctrl.instance_type))
+
+    for key, value in dpll_status.items():
+        collectd.debug("%s pci slot: %s info:%s" % (PLUGIN, key, value))
 
     # remove '# to dump alarm object data
     # print_alarm_objects()
@@ -715,6 +926,124 @@ def init_func():
 
     obj.init_completed()
     return 0
+
+
+def read_dpll_status(pci_slot):
+    """read dpll status from sysfs file"""
+    filename = ICE_DEBUG_FS + pci_slot + '/cgu'
+    current_dpll_type = None
+    processing_cgu_input_status = False
+    if os.path.exists(filename):
+        with open(filename, 'r') as infile:
+            for line in infile:
+                if 'CGU Input status' in line:
+                    processing_cgu_input_status = True
+                    continue
+                if processing_cgu_input_status:
+                    for i in VALID_CGU_PIN_NAMES:
+                        if i in line:
+                            pin = line.split('|')[0].strip().split('(')[0].rstrip()
+                            state = line.split('|')[1].strip()
+                            dpll_status[pci_slot][pin].update({'state': state})
+                            if pin == CGU_PIN_GNSS_1PPS:
+                                processing_cgu_input_status = False
+                    continue
+                if 'Current reference' in line:
+                    pin_name = line.split(':')[1].strip('\n\t')
+                    continue
+                if 'Status' in line:
+                    status = line.split(':')[1].strip('\n\t')
+                    if current_dpll_type == 'EEC':
+                        dpll_status[pci_slot][pin_name].update(
+                            {'eec_cgu_state': status})
+                    elif current_dpll_type == 'PPS':
+                        dpll_status[pci_slot][pin_name].update(
+                            {'pps_cgu_state': status})
+                    continue
+                if 'EEC DPLL' in line:
+                    current_dpll_type = 'EEC'
+                    continue
+                if 'PPS DPLL' in line:
+                    current_dpll_type = 'PPS'
+                    continue
+
+            collectd.debug("%s pci_slot %s DPLL: %s" %
+                           (PLUGIN, pci_slot, dpll_status[pci_slot]))
+    return dpll_status
+
+
+def check_gnss_alarm(alarm_object, instance, state):
+    """check for GNSS alarm"""
+    severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+    if not state or state in [CLOCK_STATE_HOLDOVER,
+                              CLOCK_STATE_FREERUN,
+                              CLOCK_STATE_INVALID]:
+        severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+    elif state == CLOCK_STATE_UNLOCKED:
+        severity = fm_constants.FM_ALARM_SEVERITY_MINOR
+    elif state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK]:
+        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+
+    if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+        if alarm_object.raised is True:
+            if clear_alarm(alarm_object.eid) is True:
+                alarm_object.severity = \
+                    fm_constants.FM_ALARM_SEVERITY_CLEAR
+                alarm_object.raised = False
+    else:
+        if alarm_object.severity != severity:
+            alarm_object.severity = severity
+        if alarm_object.raised is False:
+            rc = raise_alarm(alarm_object.alarm, instance, state)
+            if rc is True:
+                alarm_object.raised = True
+
+
+def process_ptp_synce():
+    """process ptp synce alarms"""
+    # Check GNSS signal status on primary NIC
+    # Check SMA/1PPS signal status on secondary NIC
+
+    pin_lookup = {
+        'sma1': CGU_PIN_SMA1,
+        'sma2': CGU_PIN_SMA2,
+        # 'syncE': CGU_PIN_RCLKA
+    }
+    for instance, ctrl in ptpinstances.items():
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC:
+            pci_slot = ctrl.pci_slot_name
+            state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
+            collectd.info("%s Monitoring instance:%s interface: %s "
+                          "pin:%s states:%s " %
+                          (PLUGIN, instance, ctrl.interface, CGU_PIN_GNSS_1PPS,
+                           dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]))
+            check_gnss_alarm(ctrl.gnss_signal_loss_alarm_object,
+                             instance, state)
+            if state != CLOCK_STATE_LOCKED_HO_ACK:
+                if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                    collectd.info("%s %s not locked to remote GNSS"
+                                  % (PLUGIN, obj.hostname))
+                ctrl.log_throttle_count += 1
+            break
+        elif ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
+            for interface, pin_function in ctrl.clock_ports.items():
+                if interface == obj.capabilities['primary_nic']:
+                    # no need to check pins on the primary NIC
+                    continue
+                for key, function in pin_function.items():
+                    if key in pin_lookup.keys():
+                        pin = pin_lookup[key]
+                    else:
+                        # Do not care about the other pins
+                        continue
+                    pci_slot = ctrl.pci_slot_name
+                    collectd.info("%s Monitoring instance:%s interface: %s "
+                                  "pin:%s states:%s " %
+                                  (PLUGIN, instance, interface, pin,
+                                   dpll_status[pci_slot][pin]))
+                    check_gnss_alarm(ctrl.pps_signal_loss_alarm_object,
+                                     instance,
+                                     dpll_status[pci_slot][pin]['pps_cgu_state'])
 
 
 #####################################################################
@@ -813,9 +1142,11 @@ def read_func():
             conf_file = PLUGIN_CONF_FILE
             instance = None
         else:
-            ptp_service = 'ptp4l@' + instance_name + '.service'
-            conf_file = PTPINSTANCE_PATH + 'ptp4l-' + instance_name + '.conf'
             instance = instance_name
+            ptp_service = ctrl.instance_type + '@' + instance_name + '.service'
+            conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                         '-' + instance_name + '.conf')
+
         # This plugin supports PTP in-service state change by checking
         # service state on every audit ; every 5 minutes.
         data = subprocess.check_output([SYSTEMCTL,
@@ -894,77 +1225,92 @@ def read_func():
             ctrl.phase = RUN_PHASE__SAMPLING
             ctrl.log_throttle_count = 0
 
-        # Let's read the port status information
-        #
-        # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
-        #
-        data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                        conf_file,
-                                        '-u', '-b', '0', 'GET PORT_DATA_SET'])
+        if (instance_name == PTP_HOST_BASED or 
+                obj.capabilities['primary_nic'] is None):
+            # Host-based PTP or non-synce PTP
+            check_ptp_regular(instance, ctrl, conf_file)
+        elif (ptpinstances[instance].instance_type in
+                [PTP_INSTANCE_TYPE_CLOCK, PTP_INSTANCE_TYPE_TS2PHC]):
+            read_dpll_status(ptpinstances[instance].pci_slot_name)
 
-        port_locked = False
-        obj.resp = data.split('\n')
-        for line in obj.resp:
-            if 'portState' in line:
-                collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
-                port_state = line.split()[1]
-                if port_state == 'SLAVE':
-                    port_locked = True
+    if obj.capabilities['primary_nic']:
+        process_ptp_synce()
 
-        # Let's read the clock info, Grand Master sig and skew
-        #
-        # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
-        #
-        data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                        conf_file,
-                                        '-u', '-b', '0', 'GET TIME_STATUS_NP'])
+    return 0
 
-        got_master_offset = False
-        master_offset = 0
-        my_identity = ''
-        gm_identity = ''
-        gm_present = False
-        obj.resp = data.split('\n')
-        for line in obj.resp:
-            if 'RESPONSE MANAGEMENT TIME_STATUS_NP' in line:
-                collectd.debug("%s key       : %s" %
-                               (PLUGIN, line.split()[0].split('-')[0]))
-                my_identity = line.split()[0].split('-')[0]
-            if 'master_offset' in line:
-                collectd.debug("%s Offset    : %s" % (PLUGIN, line.split()[1]))
-                master_offset = float(line.split()[1])
-                got_master_offset = True
-            if 'gmPresent' in line:
-                collectd.debug("%s gmPresent : %s" % (PLUGIN, line.split()[1]))
-                gm_present = line.split()[1]
-            if 'gmIdentity' in line:
-                collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
-                gm_identity = line.split()[1]
 
-        # Handle case where this host is the Grand Master
-        #   ... or assumes it is.
-        if my_identity == gm_identity or port_locked is False:
-            if ctrl.nolock_alarm_object.raised is False:
-                if raise_alarm(ALARM_CAUSE__NO_LOCK, instance, 0) is True:
-                    ctrl.nolock_alarm_object.raised = True
+def check_ptp_regular(instance, ctrl, conf_file):
+    # Let's read the port status information
+    #
+    # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
+    #
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                    conf_file,
+                                    '-u', '-b', '0', 'GET PORT_DATA_SET'])
 
-            # produce a throttled log while this host is not locked to the GM
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                if instance:
-                    collectd.info("%s %s %s not locked to remote Grand Master "
-                                  "(%s)" % (PLUGIN, obj.hostname, instance, gm_identity))
-                else:
-                    collectd.info("%s %s not locked to remote Grand Master "
-                                  "(%s)" % (PLUGIN, obj.hostname, gm_identity))
-            ctrl.log_throttle_count += 1
+    port_locked = False
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if 'portState' in line:
+            collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
+            port_state = line.split()[1]
+            if port_state == 'SLAVE':
+                port_locked = True
 
-            # No samples if we are not locked to a Grand Master
-            continue
+    # Let's read the clock info, Grand Master sig and skew
+    #
+    # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
+    #
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                    conf_file,
+                                    '-u', '-b', '0', 'GET TIME_STATUS_NP'])
 
-        # Handle clearing nolock alarm
-        elif ctrl.nolock_alarm_object.raised is True:
-            if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
-                ctrl.nolock_alarm_object.raised = False
+    got_master_offset = False
+    master_offset = 0
+    my_identity = ''
+    gm_identity = ''
+    gm_present = False
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if 'RESPONSE MANAGEMENT TIME_STATUS_NP' in line:
+            collectd.debug("%s key       : %s" %
+                           (PLUGIN, line.split()[0].split('-')[0]))
+            my_identity = line.split()[0].split('-')[0]
+        if 'master_offset' in line:
+            collectd.debug("%s Offset    : %s" % (PLUGIN, line.split()[1]))
+            master_offset = float(line.split()[1])
+            got_master_offset = True
+        if 'gmPresent' in line:
+            collectd.debug("%s gmPresent : %s" % (PLUGIN, line.split()[1]))
+            gm_present = line.split()[1]
+        if 'gmIdentity' in line:
+            collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
+            gm_identity = line.split()[1]
+
+    # Handle case where this host is the Grand Master
+    #   ... or assumes it is.
+    if my_identity == gm_identity or port_locked is False:
+        if ctrl.nolock_alarm_object.raised is False:
+            if raise_alarm(ALARM_CAUSE__NO_LOCK, instance, 0) is True:
+                ctrl.nolock_alarm_object.raised = True
+
+        # produce a throttled log while this host is not locked to the GM
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            if instance:
+                collectd.info("%s %s %s not locked to remote Grand Master "
+                              "(%s)" % (PLUGIN, obj.hostname, instance, gm_identity))
+            else:
+                collectd.info("%s %s not locked to remote Grand Master "
+                              "(%s)" % (PLUGIN, obj.hostname, gm_identity))
+        ctrl.log_throttle_count += 1
+
+        # No samples if we are not locked to a Grand Master
+        return 0
+
+    # Handle clearing nolock alarm
+    elif ctrl.nolock_alarm_object.raised is True:
+        if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
+            ctrl.nolock_alarm_object.raised = False
 
     # Keep this FIT test code but make it commented out for security
     # if os.path.exists('/var/run/fit/ptp_data'):
@@ -977,85 +1323,85 @@ def read_func():
     #                           (PLUGIN, master_offset))
     #             break
 
-        # Send sample and Manage the Out-Of-Tolerance alarm
-        if got_master_offset is True:
+    # Send sample and Manage the Out-Of-Tolerance alarm
+    if got_master_offset is True:
 
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s %s instance %s is collecting samples [%5d] "
-                              "with Grand Master %s" %
-                              (PLUGIN, obj.hostname, instance,
-                               float(master_offset), gm_identity))
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info("%s %s instance %s is collecting samples [%5d] "
+                          "with Grand Master %s" %
+                          (PLUGIN, obj.hostname, instance,
+                           float(master_offset), gm_identity))
 
-            ctrl.log_throttle_count += 1
+        ctrl.log_throttle_count += 1
 
-            # setup the sample structure and dispatch
-            val = collectd.Values(host=obj.hostname)
-            val.type = PLUGIN_TYPE
-            val.type_instance = PLUGIN_TYPE_INSTANCE
-            val.plugin = 'ptp'
-            val.dispatch(values=[float(master_offset)])
+        # setup the sample structure and dispatch
+        val = collectd.Values(host=obj.hostname)
+        val.type = PLUGIN_TYPE
+        val.type_instance = PLUGIN_TYPE_INSTANCE
+        val.plugin = 'ptp'
+        val.dispatch(values=[float(master_offset)])
 
-            # Manage the sample OOT alarm severity
-            severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-            if abs(master_offset) > OOT_MAJOR_THRESHOLD:
-                severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-            elif abs(master_offset) > OOT_MINOR_THRESHOLD:
-                severity = fm_constants.FM_ALARM_SEVERITY_MINOR
+        # Manage the sample OOT alarm severity
+        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+        if abs(master_offset) > OOT_MAJOR_THRESHOLD:
+            severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        elif abs(master_offset) > OOT_MINOR_THRESHOLD:
+            severity = fm_constants.FM_ALARM_SEVERITY_MINOR
 
-            # Handle clearing of Out-Of-Tolerance alarm
-            if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                if ctrl.oot_alarm_object.raised is True:
-                    if clear_alarm(ctrl.oot_alarm_object.eid) is True:
-                        ctrl.oot_alarm_object.severity = \
-                            fm_constants.FM_ALARM_SEVERITY_CLEAR
-                        ctrl.oot_alarm_object.raised = False
+        # Handle clearing of Out-Of-Tolerance alarm
+        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+            if ctrl.oot_alarm_object.raised is True:
+                if clear_alarm(ctrl.oot_alarm_object.eid) is True:
+                    ctrl.oot_alarm_object.severity = \
+                        fm_constants.FM_ALARM_SEVERITY_CLEAR
+                    ctrl.oot_alarm_object.raised = False
 
-            else:
-                # Special Case:
-                # -------------
-                # Don't raise minor alarm when in software timestamping mode.
-                # Too much skew in software or legacy mode ; alarm would bounce.
-                # TODO: Consider making ptp a real time process
-                if severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
-                        and obj.mode != 'hardware':
-                    return 0
-
-                # Handle debounce of the OOT alarm.
-                # Debounce by 1 for the same severity level.
-                if ctrl.oot_alarm_object.severity != severity:
-                    ctrl.oot_alarm_object.severity = severity
-
-                # This will keep refreshing the alarm text with the current
-                # skew value while still debounce on state transitions.
-                #
-                # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
-                #
-                elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
-                    # Handle raising the Minor OOT Alarm.
-                    rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
-                    if rc is True:
-                        ctrl.oot_alarm_object.raised = True
-
-                elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
-                    # Handle raising the Major OOT Alarm.
-                    rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
-                    if rc is True:
-                        ctrl.oot_alarm_object.raised = True
-
-                # Record the value that is alarmable
-                if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                    collectd.info("%s Grand Master ID: %s ; "
-                                  "HOST ID: %s ; "
-                                  "PTP instance: %s ; "
-                                  "GM Present:%s ; "
-                                  "Skew:%5d" % (PLUGIN,
-                                                gm_identity,
-                                                my_identity,
-                                                instance,
-                                                gm_present,
-                                                master_offset))
         else:
-            collectd.info("%s No Clock Sync" % PLUGIN)
+            # Special Case:
+            # -------------
+            # Don't raise minor alarm when in software timestamping mode.
+            # Too much skew in software or legacy mode ; alarm would bounce.
+            # TODO: Consider making ptp a real time process
+            if severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
+                    and obj.mode != 'hardware':
+                return 0
+
+            # Handle debounce of the OOT alarm.
+            # Debounce by 1 for the same severity level.
+            if ctrl.oot_alarm_object.severity != severity:
+                ctrl.oot_alarm_object.severity = severity
+
+            # This will keep refreshing the alarm text with the current
+            # skew value while still debounce on state transitions.
+            #
+            # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
+            #
+            elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
+                # Handle raising the Minor OOT Alarm.
+                rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
+                if rc is True:
+                    ctrl.oot_alarm_object.raised = True
+
+            elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
+                # Handle raising the Major OOT Alarm.
+                rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
+                if rc is True:
+                    ctrl.oot_alarm_object.raised = True
+
+            # Record the value that is alarmable
+            if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
+                collectd.info("%s Grand Master ID: %s ; "
+                              "HOST ID: %s ; "
+                              "PTP instance: %s ; "
+                              "GM Present:%s ; "
+                              "Skew:%5d" % (PLUGIN,
+                                            gm_identity,
+                                            my_identity,
+                                            instance,
+                                            gm_present,
+                                            master_offset))
+    else:
+        collectd.info("%s No Clock Sync" % PLUGIN)
 
     return 0
 
