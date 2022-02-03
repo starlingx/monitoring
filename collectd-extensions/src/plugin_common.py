@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2020 Wind River Systems, Inc.
+# Copyright (c) 2019-2022 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -21,6 +21,7 @@ from oslo_concurrency import processutils
 from fm_api import constants as fm_constants
 import tsconfig.tsconfig as tsc
 
+from kubernetes import __version__ as K8S_MODULE_VERSION
 from kubernetes import client
 from kubernetes import config
 from kubernetes.client import Configuration
@@ -34,6 +35,7 @@ PLUGIN_HTTP_HEADERS = {'Accept': 'application/json', 'Connection': 'close'}
 MIN_AUDITS_B4_FIRST_QUERY = 2
 
 # Kubernetes client constants
+K8S_MODULE_MAJOR_VERSION = int(K8S_MODULE_VERSION.split('.')[0])
 KUBELET_CONF = '/etc/kubernetes/kubelet.conf'
 SSL_TLS_SUPPRESS = True
 
@@ -661,7 +663,10 @@ class K8sClient(object):
             # Suppress the "InsecureRequestWarning: Unverified HTTPS request"
             # seen with each kubelet client API call.
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            c = Configuration()
+            if K8S_MODULE_MAJOR_VERSION < 12:
+                c = Configuration()
+            else:
+                c = Configuration().get_default_copy()
             c.verify_ssl = False
             Configuration.set_default(c)
 
