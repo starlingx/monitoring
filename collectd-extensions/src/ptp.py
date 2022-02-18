@@ -745,7 +745,8 @@ def read_ptp4l_config():
                        (PLUGIN, type))
     else:
         for filename in filenames:
-            instance = filename.split('ptp4l-')[1].split('.conf')[0]
+            pattern = PTP_INSTANCE_TYPE_PTP4L + '-(.*?)' + '.conf'
+            instance = re.search(pattern, filename).group(1)
             ptpinstances[instance] = None
             with open(filename, 'r') as infile:
                 for line in infile:
@@ -866,8 +867,13 @@ def read_clock_config():
                     v = match.group(2)
                     m[k] = v
                     ptpinstances[instance].clock_ports[interface] = m
-    collectd.info("%s instance:%s ports:%s" %
-                  (PLUGIN, instance, ptpinstances[instance].clock_ports))
+    if found_port:
+        collectd.info("%s instance:%s ports:%s" %
+                      (PLUGIN, instance, ptpinstances[instance].clock_ports))
+    else:
+        # When no base_port is found, it means synce is disabled.
+        # Remove the ptp instance as it does not require monitoring.
+        del ptpinstances[instance]
 
 
 #####################################################################
