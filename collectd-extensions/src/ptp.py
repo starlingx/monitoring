@@ -773,6 +773,37 @@ def read_ptp4l_config():
                                (PLUGIN, instance))
 
 
+def find_interface_from_pciaddr(pciaddr):
+    pattern = "/sys/bus/pci/devices/*" + pciaddr
+    filenames = glob(pattern)
+    if len(filenames) == 0:
+        collectd.info("%s Cannot find interface from pciaddr %s" %
+                      (PLUGIN, pciaddr))
+        return ""
+
+    # If there's more than one filename, complain.
+    if len(filenames) > 1:
+        collectd.warning("%s Pattern %s gave %s matching filenames, using the first." %
+                         (PLUGIN, pattern, len(filenames)))
+
+    filepath = filenames[0] + '/net'
+    if not os.path.exists(filepath):
+        collectd.info("%s Cannot find interface from pciaddr %s, "
+                      "directory not found: %s" %
+                      (PLUGIN, pciaddr, filepath))
+        return ""
+
+    dirs = os.listdir(filepath)
+    if len(dirs) == 0:
+        collectd.info("%s Cannot find directory %s" %
+                      (PLUGIN, filepath))
+        return ""
+    if len(dirs) > 1:
+        collectd.warning("%s More than one directory found under %s, using the first." %
+                         (PLUGIN, dirs))
+    return dirs[0]
+
+
 def read_ts2phc_config():
     """read ts2phc conf files"""
     filenames = glob(PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN)
@@ -787,7 +818,6 @@ def read_ts2phc_config():
 
     filename = filenames[0]
     instance = filename.split('ts2phc-')[1].split('.conf')[0]
-    ptpinstances[instance] = None
     with open(filename, 'r') as infile:
         pci_slot = None
         for line in infile:
@@ -797,25 +827,17 @@ def read_ts2phc_config():
                 function = tty.split('_')[2]
                 pci_slot = '0000:' + bus_device[0:2] + ':' + \
                            bus_device[2:4] + '.' + function
-                continue
-            if line[0] == '[':
-                interface = line.split(']')[0].split('[')[1]
-                if interface and interface != 'global':
-                    if (ptpinstances[instance] and
-                            ptpinstances[instance].interface == interface):
-                        # ignore the duplicate interface in the file
-                        continue
-                    slot = get_pci_slot(instance, interface)
-                    if slot == pci_slot:
-                        create_interface_alarm_objects(interface, instance)
-                        ptpinstances[instance].instance_type = \
-                            PTP_INSTANCE_TYPE_TS2PHC
-                        ptpinstances[instance].pci_slot_name = slot
-                        init_dpll_status(pci_slot)
-                        obj.capabilities['primary_nic'] = interface
-    collectd.info("%s ts2phc instance:%s slot:%s primary_nic:%s" %
-                  (PLUGIN, instance, ptpinstances[instance].pci_slot_name,
-                   obj.capabilities['primary_nic']))
+                interface = find_interface_from_pciaddr(pci_slot)
+                create_interface_alarm_objects(interface, instance)
+                ptpinstances[instance].instance_type = \
+                    PTP_INSTANCE_TYPE_TS2PHC
+                ptpinstances[instance].pci_slot_name = pci_slot
+                init_dpll_status(pci_slot)
+                obj.capabilities['primary_nic'] = interface
+                collectd.info("%s ts2phc instance:%s slot:%s primary_nic:%s" %
+                              (PLUGIN, instance, pci_slot,
+                               obj.capabilities['primary_nic']))
+                break
 
 
 def read_clock_config():
