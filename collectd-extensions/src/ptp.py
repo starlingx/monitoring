@@ -576,7 +576,7 @@ def create_interface_alarm_objects(interface=None, instance=None):
         ptpinstances[PTP_HOST_BASED] = ctrl
 
     else:
-        if instance:
+        if instance and not ptpinstances.get(instance, None):
             ctrl = PTP_ctrl_object()
             ctrl.interface = interface
             o = PTP_alarm_object(instance)
