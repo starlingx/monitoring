@@ -30,6 +30,7 @@
 #
 ############################################################################
 import os
+from collections import OrderedDict
 import collectd
 import subprocess
 import tsconfig.tsconfig as tsc
@@ -38,6 +39,7 @@ import re
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 from glob import glob
+from oslo_utils import timeutils
 
 debug = False
 
@@ -146,8 +148,8 @@ CLOCK_STATE_UNLOCKED = 'unlocked'
 # Synce Clock Generation Unit (CGU) input pin names
 CGU_PIN_SDP22 = 'CVL-SDP22'
 CGU_PIN_SDP20 = 'CVL-SDP20'
-CGU_PIN_RCLKA = 'C827_RCLKA'
-CGU_PIN_RCLKB = 'C827_RCLKB'
+CGU_PIN_RCLKA = 'C827_0-RCLKA'
+CGU_PIN_RCLKB = 'C827_0-RCLKB'
 CGU_PIN_SMA1 = 'SMA1'
 CGU_PIN_SMA2 = 'SMA2/U.FL2'
 CGU_PIN_GNSS_1PPS = 'GNSS-1PPS'
@@ -160,12 +162,22 @@ VALID_CGU_PIN_NAMES = [
     CGU_PIN_SMA2,
     CGU_PIN_GNSS_1PPS]
 
+# PTP Clock Class
+CLOCK_CLASS_6 = '6'       # T-GM connected to PRTC in locked mode
+CLOCK_CLASS_7 = '7'       # T-GM in holdover, within holdover specification
+CLOCK_CLASS_140 = '140'   # T-GM in holdover, out of holdover specification
+CLOCK_CLASS_248 = '248'   # T-GM in free-run mode
+
+# Time interval for holdover within spec (seconds)
+HOLDOVER_THRESHOLD = 3600
+
 # Leap second in nanoseconds
 LEAP_SECOND = float(37000000000)
 
 # regex pattern match
 re_dict = re.compile(r'^(\w+)\s+(\w+)')
 re_blank = re.compile(r'^\s*$')
+re_keyval = re.compile(r'^\s*(\S+)\s+(\w+)')
 
 # Instantiate the common plugin control object
 obj = pc.PluginObject(PLUGIN, "")
@@ -197,6 +209,7 @@ class PTP_ctrl_object:
         self.interface = None
         self.instance_type = PTP_INSTANCE_TYPE_PTP4L
         self.clock_ports = {}
+        self.holdover_timestamp = None
         self.nolock_alarm_object = None
         self.process_alarm_object = None
         self.oot_alarm_object = None
@@ -708,7 +721,7 @@ def read_timestamp_mode(conf_file):
         obj.mode = None
 
 
-def get_pci_slot(instance, interface):
+def get_pci_slot(interface):
     """get pci slot from uevent"""
     slot = None
     filename = '/sys/class/net/' + interface + '/device/uevent'
@@ -876,7 +889,7 @@ def read_clock_config():
                         create_interface_alarm_objects(interface, instance)
                         ptpinstances[instance].instance_type = \
                             PTP_INSTANCE_TYPE_CLOCK
-                        slot = get_pci_slot(instance, interface)
+                        slot = get_pci_slot(interface)
                         ptpinstances[instance].pci_slot_name = slot
                         init_dpll_status(slot)
                         found_port = True
@@ -1026,8 +1039,10 @@ def read_dpll_status(pci_slot):
     return dpll_status
 
 
-def check_gnss_alarm(alarm_object, interface, state):
+def check_gnss_alarm(instance, alarm_object, interface, state):
     """check for GNSS alarm"""
+
+    ctrl = ptpinstances[instance]
     severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
     if not state or state in [CLOCK_STATE_HOLDOVER,
                               CLOCK_STATE_FREERUN,
@@ -1037,6 +1052,12 @@ def check_gnss_alarm(alarm_object, interface, state):
         severity = fm_constants.FM_ALARM_SEVERITY_MINOR
     elif state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK]:
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+
+    if state == CLOCK_STATE_HOLDOVER:
+        if not ctrl.holdover_timestamp:
+            ctrl.holdover_timestamp = timeutils.utcnow()
+    else:
+        ctrl.holdover_timestamp = None
 
     if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
         if alarm_object.raised is True:
@@ -1115,6 +1136,77 @@ def check_time_drift(instance):
                                             offset))
 
 
+def check_clock_class(instance):
+    ctrl = ptpinstances[instance]
+    conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                 '-' + instance + '.conf')
+    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
+                                    conf_file,
+                                    '-u', '-b', '0', 'GET GRANDMASTER_SETTINGS_NP'])
+
+    # Save all parameters in an ordered dict
+    m = OrderedDict()
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if not('GRANDMASTER_SETTINGS_NP' in line):
+            # match key value array pairs
+            match = re_keyval.search(line)
+            if match:
+                k = match.group(1)
+                v = match.group(2)
+                m[k] = v
+    current_clock_class = m['clockClass']
+
+    pci_slot = get_pci_slot(ctrl.interface)
+    state = CLOCK_STATE_INVALID
+    instance_type = PTP_INSTANCE_TYPE_CLOCK
+    if ctrl.interface == obj.capabilities['primary_nic']:
+        state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
+        instance_type = PTP_INSTANCE_TYPE_TS2PHC
+    else:
+        if dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state'] != CLOCK_STATE_INVALID:
+            state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
+        elif dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state'] != CLOCK_STATE_INVALID:
+            state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
+    time_traceable = False
+    new_clock_class = current_clock_class
+    if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK]:
+        new_clock_class = CLOCK_CLASS_6
+        time_traceable = True
+    elif state == CLOCK_STATE_HOLDOVER:
+        new_clock_class = CLOCK_CLASS_7
+        # Get the holdover timestamp of the clock/ts2phc instance
+        holdover_timestamp = None
+        for key, ctrl_obj in ptpinstances.items():
+            if ctrl_obj.instance_type == instance_type:
+                holdover_timestamp = ctrl_obj.holdover_timestamp
+
+        # If it is in holdover more than the holdover spec threshold,
+        # set clock class to 140
+        if holdover_timestamp:
+            delta = timeutils.delta_seconds(holdover_timestamp,
+                                            timeutils.utcnow())
+            if delta > HOLDOVER_THRESHOLD:
+                new_clock_class = CLOCK_CLASS_140
+    else:
+        new_clock_class = CLOCK_CLASS_248
+
+    if current_clock_class != new_clock_class:
+        # Set clockClass and timeTraceable
+        m['clockClass'] = new_clock_class
+        m['timeTraceable'] = int(time_traceable)
+        parameters = ' '.join("{} {}".format(*i) for i in m.items())
+        cmd = 'SET GRANDMASTER_SETTINGS_NP ' + parameters
+        collectd.debug("%s cmd=%s" % (PLUGIN, cmd))
+        try:
+            data = subprocess.check_output(
+                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0', cmd])
+        except subprocess.CalledProcessError as exc:
+            collectd.error("%s Failed to set clockClass for instance %s" % (PLUGIN, instance))
+        collectd.info("%s instance:%s Updated clockClass from %s to %s timeTraceable=%s" %
+                      (PLUGIN, instance, current_clock_class, new_clock_class, time_traceable))
+
+
 def process_ptp_synce():
     """process ptp synce alarms"""
     # Check GNSS signal status on primary NIC
@@ -1133,7 +1225,7 @@ def process_ptp_synce():
                            "pin:%s states:%s " %
                            (PLUGIN, instance, ctrl.interface, CGU_PIN_GNSS_1PPS,
                             dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]))
-            check_gnss_alarm(ctrl.gnss_signal_loss_alarm_object,
+            check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
                              ctrl.interface, state)
             if state != CLOCK_STATE_LOCKED_HO_ACK:
                 if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
@@ -1156,11 +1248,12 @@ def process_ptp_synce():
                                    "pin:%s states:%s " %
                                    (PLUGIN, instance, interface, pin,
                                     dpll_status[pci_slot][pin]))
-                    check_gnss_alarm(ctrl.pps_signal_loss_alarm_object,
+                    check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
                                      interface,
                                      dpll_status[pci_slot][pin]['pps_cgu_state'])
         elif ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L and ctrl.interface:
             check_time_drift(instance)
+            check_clock_class(instance)
 
 
 #####################################################################
