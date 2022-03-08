@@ -1157,13 +1157,15 @@ def check_clock_class(instance):
                 m[k] = v
     current_clock_class = m['clockClass']
 
-    pci_slot = get_pci_slot(ctrl.interface)
+    # Determine the base port of the NIC from the interface
+    base_port = ctrl.interface[:-1] + '0'
+    pci_slot = get_pci_slot(base_port)
     state = CLOCK_STATE_INVALID
     instance_type = PTP_INSTANCE_TYPE_CLOCK
-    if ctrl.interface == obj.capabilities['primary_nic']:
+    if base_port == obj.capabilities['primary_nic']:
         state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
         instance_type = PTP_INSTANCE_TYPE_TS2PHC
-    else:
+    elif dpll_status.get(pci_slot, None):
         if dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state'] != CLOCK_STATE_INVALID:
             state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
         elif dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state'] != CLOCK_STATE_INVALID:
@@ -1175,6 +1177,7 @@ def check_clock_class(instance):
         time_traceable = True
     elif state == CLOCK_STATE_HOLDOVER:
         new_clock_class = CLOCK_CLASS_7
+        time_traceable = True
         # Get the holdover timestamp of the clock/ts2phc instance
         holdover_timestamp = None
         for key, ctrl_obj in ptpinstances.items():
@@ -1188,6 +1191,7 @@ def check_clock_class(instance):
                                             timeutils.utcnow())
             if delta > HOLDOVER_THRESHOLD:
                 new_clock_class = CLOCK_CLASS_140
+                time_traceable = False
     else:
         new_clock_class = CLOCK_CLASS_248
 
