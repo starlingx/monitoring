@@ -1255,6 +1255,21 @@ def process_ptp_synce():
                     check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
                                      interface,
                                      dpll_status[pci_slot][pin]['pps_cgu_state'])
+            else:
+                # No pins are configured for the secondary NIC
+                # It checks for alarm with the state of either SMA1 or SMA2 pin.
+                pci_slot = ctrl.pci_slot_name
+                state = CLOCK_STATE_INVALID
+                if dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state'] != CLOCK_STATE_INVALID:
+                    state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
+                elif dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state'] != CLOCK_STATE_INVALID:
+                    state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
+                collectd.debug("%s Monitoring instance:%s interface: %s "
+                               "state:%s " %
+                               (PLUGIN, instance, ctrl.interface, state))
+                check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
+                                 ctrl.interface, state)
+
         elif ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L and ctrl.interface:
             check_time_drift(instance)
             check_clock_class(instance)
