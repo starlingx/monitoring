@@ -4,11 +4,8 @@
 
 case "$1" in
     configure)
-        grep schedstats /etc/sysctl.conf
-        if [ $? -ne 0 ]; then
-            echo -e "\nkernel.sched_schedstats=1" >> /etc/sysctl.conf
-            sysctl -p &>/dev/null
-        fi
+        echo -e "\nkernel.sched_schedstats=1" > /etc/sysctl.d/100-monitor-tools.conf
+        sysctl -p &>/dev/null
         exit 0
         ;;
     *)
