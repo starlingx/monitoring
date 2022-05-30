@@ -8,8 +8,7 @@ Homepage: https://www.starlingx.io
 
 Package: monitor-tools
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends},
- initscripts
+Depends: ${shlibs:Depends}, ${misc:Depends}, procps
 Description: Monitor tools package
  This package contains data collection tools to monitor host performance.
  Tools are general purpose engineering and debugging related.
