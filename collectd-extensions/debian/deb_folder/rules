@@ -11,6 +11,10 @@ export LOCAL_CONFIG_EXTENSIONS_DIR = $(ROOT)/opt/collectd/extensions/config
 	dh $@
 
 override_dh_install:
+
+	# Adjustments in the configuration files for debian
+	sed -i '/Encoding "utf-8"/D' python_plugins.conf
+
 	install -m 755 -d $(ROOT)/etc
 	install -m 755 -d $(LOCAL_UNIT_DIR)
 	install -m 755 -d $(LOCAL_DEFAULT_PLUGIN_DIR)

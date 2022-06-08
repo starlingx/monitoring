@@ -5,6 +5,7 @@
 import collectd
 
 import os
+import six
 import subprocess
 import plugin_common as pc
 from datetime import datetime
@@ -154,7 +155,17 @@ def init_func():
 def check_service_status(service):
     cmd = service["service_plugin_cmdline"]
     env = service["service_plugin_env"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, shell=True)
+    if six.PY2:
+        # Centos
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=env, shell=True)
+    else:
+        # Debian
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=env, shell=True,
+                                encoding='utf-8')
     proc.wait()
     new_status = (proc.communicate()[0] or "").strip()
 

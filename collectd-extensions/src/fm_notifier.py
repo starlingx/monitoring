@@ -87,6 +87,7 @@ import os
 import re
 import socket
 import collectd
+import six
 from threading import RLock as Lock
 from oslo_utils import encodeutils
 from fm_api import constants as fm_constants
@@ -1570,7 +1571,14 @@ def init_func():
     # The path to where collectd is looking for its plugins is specified
     # at the end of the /etc/collectd.conf file.
     # Because so we search for the 'Include' label in reverse order.
-    for line in reversed(open("/etc/collectd.conf", 'r').readlines()):
+    # collectd.conf will be in different places based on OS family
+    if six.PY2:
+        # Centos
+        conf_dir = "/etc/collectd.conf"
+    else:
+        # Debian
+        conf_dir = "/etc/collectd/collectd.conf"
+    for line in reversed(open(conf_dir, 'r').readlines()):
         if line.startswith('Include'):
             plugin_path = line.split(' ')[1].strip("\n").strip('"') + '/'
             fmAlarmObject.plugin_path = plugin_path

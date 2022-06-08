@@ -36,6 +36,7 @@ import subprocess
 import tsconfig.tsconfig as tsc
 import plugin_common as pc
 import re
+import six
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 from glob import glob
@@ -62,14 +63,27 @@ PLUGIN_TYPE = 'time_offset'
 PLUGIN_TYPE_INSTANCE = 'nsec'
 
 # Primary PTP service name
-PLUGIN_SERVICE = 'ptp4l.service'
+if six.PY2:
+    # Centos
+    PLUGIN_SERVICE = 'ptp4l.service'
+else:
+    # Debian
+    PLUGIN_SERVICE = 'ptp4l@.service'
 
 # Plugin configuration file
 #
 # This plugin looks for the timestamping mode in the ptp4l config file.
 #   time_stamping           hardware
 #
-PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
+
+# ptp4l config file will be in different location based on OS family
+if six.PY2:
+    # Centos
+    PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
+else:
+    # Debian
+    PLUGIN_CONF_FILE = '/etc/linuxptp/ptp4l.conf'
+
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
 
 
@@ -1181,7 +1195,6 @@ def check_clock_class(instance):
     data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
                                     conf_file,
                                     '-u', '-b', '0', 'GET GRANDMASTER_SETTINGS_NP']).decode()
-
     # Save all parameters in an ordered dict
     m = OrderedDict()
     obj.resp = data.split('\n')

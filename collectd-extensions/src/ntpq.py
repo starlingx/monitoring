@@ -63,6 +63,7 @@ import os
 import subprocess
 import uuid
 import collectd
+import six
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 import tsconfig.tsconfig as tsc
@@ -709,7 +710,12 @@ def read_func():
         return 0
 
     # Do NTP Query
-    data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS])
+    if six.PY2:
+        # Centos
+        data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS])
+    else:
+        # Debian
+        data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS], encoding='utf-8')
 
     # Keep this FIT test code but make it commented out for security
     #
