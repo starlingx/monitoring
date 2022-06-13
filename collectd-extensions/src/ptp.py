@@ -1074,7 +1074,19 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
                 alarm_object.raised = True
 
 
-def check_time_drift(instance):
+def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
+    if gm_identity:
+        collectd.info("%s %s instance %s is collecting samples [%f] "
+                      "with Grand Master %s" %
+                      (PLUGIN, hostname, instance,
+                       float(offset), gm_identity))
+    else:
+        collectd.info("%s %s instance %s is collecting samples [%f] "
+                      "with GNSS" %
+                      (PLUGIN, hostname, instance, float(offset)))
+
+
+def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
     data = subprocess.check_output([PHC_CTL, ctrl.interface, '-q', 'cmp'])
@@ -1083,10 +1095,8 @@ def check_time_drift(instance):
         raw_offset = float(data.rsplit(' ', 1)[1].strip('ns\n'))
 
         if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s %s instance %s is collecting samples [%5d] "
-                          "with GNSS" %
-                          (PLUGIN, obj.hostname, instance,
-                           float(raw_offset)))
+            _info_collecting_samples(obj.hostname, instance, raw_offset,
+                                     gm_identity)
         ctrl.log_throttle_count += 1
 
         # Manage the sample OOT alarm severity
@@ -1115,14 +1125,9 @@ def check_time_drift(instance):
             #
             # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
             #
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
-                # Handle raising the Minor OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, instance, offset)
-                if rc is True:
-                    ctrl.oot_alarm_object.raised = True
-
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
-                # Handle raising the Major OOT Alarm.
+            elif (severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
+                  severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
+                # Handle raising the OOT Alarm.
                 rc = raise_alarm(ALARM_CAUSE__OOT, instance, offset)
                 if rc is True:
                     ctrl.oot_alarm_object.raised = True
@@ -1444,12 +1449,13 @@ def read_func():
                     collectd.info("%s PTP service %s enabled and running" %
                                   (PLUGIN, ptp_service))
 
-        # Auto refresh the timestamping mode in case collectd runs
-        # before the ptp manifest or the mode changes on the fly by
-        # an in-service manifest.
-        # Every 4 audits.
-        if not obj.audits % 4 and ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
-            read_timestamp_mode(conf_file)
+            # Auto refresh the timestamping mode in case collectd runs
+            # before the ptp manifest or the mode changes on the fly by
+            # an in-service manifest.
+            # Every 4 audits.
+            if (not obj.audits % 4 and
+                    ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L):
+                read_timestamp_mode(conf_file)
 
         # Manage execution phase
         if ctrl.phase != RUN_PHASE__SAMPLING:
@@ -1558,10 +1564,8 @@ def check_ptp_regular(instance, ctrl, conf_file):
     if got_master_offset is True:
 
         if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s %s instance %s is collecting samples [%5d] "
-                          "with Grand Master %s" %
-                          (PLUGIN, obj.hostname, instance,
-                           float(master_offset), gm_identity))
+            _info_collecting_samples(obj.hostname, instance, master_offset,
+                                     gm_identity)
 
         ctrl.log_throttle_count += 1
 
@@ -1607,14 +1611,9 @@ def check_ptp_regular(instance, ctrl, conf_file):
             #
             # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
             #
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR:
-                # Handle raising the Minor OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
-                if rc is True:
-                    ctrl.oot_alarm_object.raised = True
-
-            elif severity == fm_constants.FM_ALARM_SEVERITY_MAJOR:
-                # Handle raising the Major OOT Alarm.
+            elif (severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
+                  severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
+                # Handle raising the OOT Alarm.
                 rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
                 if rc is True:
                     ctrl.oot_alarm_object.raised = True
@@ -1631,6 +1630,10 @@ def check_ptp_regular(instance, ctrl, conf_file):
                                             instance,
                                             gm_present,
                                             master_offset))
+
+        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+            # Check time drift in PHC clock
+            check_time_drift(instance, gm_identity)
     else:
         collectd.info("%s No Clock Sync" % PLUGIN)
 
