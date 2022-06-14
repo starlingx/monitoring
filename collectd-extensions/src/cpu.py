@@ -198,6 +198,8 @@ def get_cpuacct():
     # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
     dir_list = next(os.walk(CPUACCT))[1]
     for name in dir_list:
+        if any(name.endswith(x) for x in ['.mount', '.scope']):
+            continue
         cg_path = '/'.join([CPUACCT, name])
         acct = get_cgroup_cpuacct(cg_path)
         cpuacct[pc.GROUP_FIRST][name] = acct
