@@ -265,6 +265,8 @@ def get_platform_memory():
     # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
     dir_list = next(os.walk(MEMCONT))[1]
     for name in dir_list:
+        if any(name.endswith(x) for x in ['.mount', '.scope']):
+            continue
         cg_path = '/'.join([MEMCONT, name])
         m = get_cgroup_memory(cg_path)
         memory[pc.GROUP_FIRST][name] = m.get('rss_MiB', 0.0)
