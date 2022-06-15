@@ -71,7 +71,38 @@ PLUGIN_SERVICE = 'ptp4l.service'
 #
 PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
-PTPINSTANCE_PATH = '/etc/ptpinstance/'
+
+
+def _get_os_release():
+    os_release = '/etc/os-release'
+    id = 'unknown'
+
+    try:
+        with open(os_release, 'r') as f:
+            for l in f:
+                if l.startswith('ID='):
+                    id = l.rsplit('=')[1].replace('\n', '')
+                    break
+
+    except Exception as e:
+        collectd.error(
+            '%s failed to open %s (%s)' % (PLUGIN, os_release, str(e)))
+
+    return id
+
+
+def _get_ptpinstance_path():
+    os_type = _get_os_release()
+    if os_type == 'centos':
+        return '/etc/ptpinstance/'
+    elif os_type == 'debian':
+        return '/etc/linuxptp/ptpinstance/'
+    else:
+        collectd.error("%s unsupported OS type '%s'" % (PLUGIN, os_type))
+        return ''
+
+
+PTPINSTANCE_PATH = _get_ptpinstance_path()
 PTPINSTANCE_CLOCK_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'clock-*.conf'
 PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
@@ -80,7 +111,6 @@ PTP_INSTANCE_TYPE_PTP4L = 'ptp4l'
 PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
 PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
 PTP_INSTANCE_TYPE_CLOCK = 'clock'
-
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -319,7 +349,8 @@ def _get_supported_modes(interface):
 
     hw_tx = hw_rx = sw_tx = sw_rx = False
     modes = []
-    data = subprocess.check_output([ETHTOOL, '-T', interface]).split('\n')
+    data = subprocess.check_output(
+        [ETHTOOL, '-T', interface]).decode().split('\n')
     if data:
         collectd.debug("%s 'ethtool -T %s' output:%s\n" %
                        (PLUGIN, interface, data))
@@ -960,7 +991,8 @@ def init_func():
         else:
             collectd.error("%s failed to get Timestamping Mode" % PLUGIN)
     else:
-        collectd.error("%s failed to load ptp4l configuration" % PLUGIN)
+        collectd.warning(
+            "%s could not load legacy ptp4l configuration" % PLUGIN)
         obj.mode = None
 
     if os.path.exists(PTPINSTANCE_PATH):
@@ -1089,7 +1121,8 @@ def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
 def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
-    data = subprocess.check_output([PHC_CTL, ctrl.interface, '-q', 'cmp'])
+    data = subprocess.check_output(
+        [PHC_CTL, ctrl.interface, '-q', 'cmp']).decode()
     offset = 0
     if 'offset from CLOCK_REALTIME is' in data:
         raw_offset = float(data.rsplit(' ', 1)[1].strip('ns\n'))
@@ -1147,7 +1180,7 @@ def check_clock_class(instance):
                  '-' + instance + '.conf')
     data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
                                     conf_file,
-                                    '-u', '-b', '0', 'GET GRANDMASTER_SETTINGS_NP'])
+                                    '-u', '-b', '0', 'GET GRANDMASTER_SETTINGS_NP']).decode()
 
     # Save all parameters in an ordered dict
     m = OrderedDict()
@@ -1209,7 +1242,7 @@ def check_clock_class(instance):
         collectd.debug("%s cmd=%s" % (PLUGIN, cmd))
         try:
             data = subprocess.check_output(
-                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0', cmd])
+                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0', cmd]).decode()
         except subprocess.CalledProcessError as exc:
             collectd.error("%s Failed to set clockClass for instance %s" % (PLUGIN, instance))
         collectd.info("%s instance:%s Updated clockClass from %s to %s timeTraceable=%s" %
@@ -1387,7 +1420,7 @@ def read_func():
             # service state on every audit ; every 5 minutes.
             data = subprocess.check_output([SYSTEMCTL,
                                             SYSTEMCTL_IS_ENABLED_OPTION,
-                                            ptp_service])
+                                            ptp_service]).decode()
             collectd.debug("%s PTP service %s admin state:%s" % (PLUGIN, ptp_service, data.rstrip()))
 
             if data.rstrip() == SYSTEMCTL_IS_DISABLED_RESPONSE:
@@ -1413,7 +1446,7 @@ def read_func():
 
             data = subprocess.check_output([SYSTEMCTL,
                                             SYSTEMCTL_IS_ACTIVE_OPTION,
-                                            ptp_service])
+                                            ptp_service]).decode()
 
             if data.rstrip() == SYSTEMCTL_IS_INACTIVE_RESPONSE:
 
@@ -1481,9 +1514,9 @@ def check_ptp_regular(instance, ctrl, conf_file):
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                    conf_file,
-                                    '-u', '-b', '0', 'GET PORT_DATA_SET'])
+    data = subprocess.check_output(
+        [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+            'GET PORT_DATA_SET']).decode()
 
     port_locked = False
     obj.resp = data.split('\n')
@@ -1498,9 +1531,9 @@ def check_ptp_regular(instance, ctrl, conf_file):
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
     #
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                    conf_file,
-                                    '-u', '-b', '0', 'GET TIME_STATUS_NP'])
+    data = subprocess.check_output(
+        [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+            'GET TIME_STATUS_NP']).decode()
 
     got_master_offset = False
     master_offset = 0
