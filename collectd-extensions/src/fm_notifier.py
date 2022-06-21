@@ -180,7 +180,16 @@ DF_MANGLED_DICT = {
     'opt-platform': '/opt/platform',
     'opt-etcd': '/opt/etcd',
     'opt-extension': '/opt/extension',
-    'opt-backups': '/opt/backups'}
+    'opt-backups': '/opt/backups',
+    'opt-platform-backup': '/opt/platform-backup',
+    'boot-efi': '/boot/efi',
+    'var': '/var',
+    'var-rootdirs-opt-etcd': '/var/rootdirs/opt/etcd',
+    'var-rootdirs-opt-platform': '/var/rootdirs/opt/platform',
+    'var-rootdirs-opt-extension': '/var/rootdirs/opt/extension',
+    'var-rootdirs-opt-backups': '/var/rootdirs/opt/backups',
+    'var-rootdirs-opt-platform-backup': '/var/rootdirs/opt/platform-backup',
+    'var-rootdirs-scratch': '/var/rootdirs/scratch'}
 
 
 # ADD_NEW_PLUGIN: add new alarm id definition
