@@ -107,7 +107,7 @@ def _get_os_release():
 
 def _get_ptpinstance_path():
     os_type = _get_os_release()
-    if os_type == 'centos':
+    if os_type == '"centos"':
         return '/etc/ptpinstance/'
     elif os_type == 'debian':
         return '/etc/linuxptp/ptpinstance/'
