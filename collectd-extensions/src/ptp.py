@@ -36,7 +36,6 @@ import subprocess
 import tsconfig.tsconfig as tsc
 import plugin_common as pc
 import re
-import six
 from fm_api import constants as fm_constants
 from fm_api import fm_api
 from glob import glob
@@ -62,27 +61,11 @@ PLUGIN_AUDIT_INTERVAL = 30
 PLUGIN_TYPE = 'time_offset'
 PLUGIN_TYPE_INSTANCE = 'nsec'
 
-# Primary PTP service name
-if six.PY2:
-    # Centos
-    PLUGIN_SERVICE = 'ptp4l.service'
-else:
-    # Debian
-    PLUGIN_SERVICE = 'ptp4l@.service'
-
 # Plugin configuration file
 #
 # This plugin looks for the timestamping mode in the ptp4l config file.
 #   time_stamping           hardware
 #
-
-# ptp4l config file will be in different location based on OS family
-if six.PY2:
-    # Centos
-    PLUGIN_CONF_FILE = '/etc/ptp4l.conf'
-else:
-    # Debian
-    PLUGIN_CONF_FILE = '/etc/linuxptp/ptp4l.conf'
 
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
 
@@ -230,12 +213,12 @@ obj = pc.PluginObject(PLUGIN, "")
 # Create an alarm management class
 class PTP_alarm_object:
 
-    def __init__(self, interface=None):
+    def __init__(self, source):
 
         self.severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
         self.cause = fm_constants.ALARM_PROBABLE_CAUSE_50
         self.alarm = ALARM_CAUSE__NONE
-        self.interface = interface
+        self.source = source
         self.raised = False
         self.reason = ''
         self.repair = ''
@@ -260,9 +243,6 @@ class PTP_ctrl_object:
         self.gnss_signal_loss_alarm_object = None
         self.pps_signal_loss_alarm_object = None
 
-# For backward compatility, we keep the host-based ptp alarms.
-PTP_HOST_BASED = 'host_based'
-
 # Parameter in sysfs device/uevent file
 PCI_SLOT_NAME = 'PCI_SLOT_NAME'
 
@@ -279,7 +259,7 @@ ALARM_OBJ_LIST = []
 # UT verification utilities
 def assert_all_alarms():
     for o in ALARM_OBJ_LIST:
-        raise_alarm(o.alarm, o.interface, 0)
+        raise_alarm(o.alarm, o.source, 0)
 
 
 def clear_all_alarms():
@@ -293,9 +273,9 @@ def clear_all_alarms():
 
 
 def print_alarm_object(o):
-    collectd.info("%s Interface:%s  Cause: %d  Severity:%s  Raised:%d" %
+    collectd.info("%s Source:%s  Cause: %d  Severity:%s  Raised:%d" %
                   (PLUGIN,
-                   o.interface,
+                   o.source,
                    o.alarm,
                    o.severity,
                    o.raised))
@@ -417,26 +397,22 @@ def _get_supported_modes(interface):
 # Name       : get_alarm_object
 #
 # Description: Search the alarm list based on the alarm cause
-#              code and interface.
+#              code and source.
 #
 # Returns    : Alarm object if found ; otherwise None
 #
 #####################################################################
-def get_alarm_object(alarm, interface=None):
+def get_alarm_object(alarm, source=None):
     """Alarm object lookup"""
 
     for o in ALARM_OBJ_LIST:
         # print_alarm_object(o)
-        if interface is None:
-            if o.alarm == alarm:
+        if o.alarm == alarm:
+            if not source or o.source == source:
                 return o
-        else:
-            if o.interface == interface:
-                if o.alarm == alarm:
-                    return o
 
     collectd.info("%s alarm object lookup failed ; %d:%s" %
-                  (PLUGIN, alarm, interface))
+                  (PLUGIN, alarm, source))
     return None
 
 
@@ -475,7 +451,7 @@ def clear_alarm(eid):
 # Name       : raise_alarm
 #
 # Description: Assert a specific PTP alarm based on the alarm cause
-#              code and interface.
+#              code and source.
 #
 #              Handle special case cause codes
 #              Handle failure to raise fault
@@ -487,12 +463,12 @@ def clear_alarm(eid):
 #               True on Success
 #
 #####################################################################
-def raise_alarm(alarm_cause, interface=None, data=0):
+def raise_alarm(alarm_cause, source=None, data=0):
     """Assert a cause based PTP alarm"""
 
     collectd.debug("%s Raising Alarm %d" % (PLUGIN, alarm_cause))
 
-    alarm = get_alarm_object(alarm_cause, interface)
+    alarm = get_alarm_object(alarm_cause, source)
     if alarm is None:
         # log created for None case in the get_alarm_object util
         return True
@@ -588,151 +564,111 @@ def raise_alarm(alarm_cause, interface=None, data=0):
 # Description: Create alarm objects for specified interface
 #
 #####################################################################
-def create_interface_alarm_objects(interface=None, instance=None):
+def create_interface_alarm_objects(interface, instance=None):
     """Create alarm objects"""
 
     collectd.debug("%s Alarm Object Create: Interface:%s " %
                    (PLUGIN, interface))
 
-    if interface is None:
+    if instance and not ptpinstances.get(instance, None):
         ctrl = PTP_ctrl_object()
-        o = PTP_alarm_object()
+        ctrl.interface = interface
+        o = PTP_alarm_object(instance)
         o.alarm = ALARM_CAUSE__PROCESS
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         o.reason = obj.hostname + ' does not support the provisioned '
         o.reason += PTP + ' mode '
         o.repair = 'Check host hardware reference manual '
         o.repair += 'to verify that the selected PTP mode is supported'
-        o.eid = obj.base_eid + '.ptp'
+        o.eid = obj.base_eid + '.instance=' + instance + '.ptp'
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN  # 'unknown'
         ALARM_OBJ_LIST.append(o)
         ctrl.process_alarm_object = o
 
-        o = PTP_alarm_object()
+        o = PTP_alarm_object(instance)
         o.alarm = ALARM_CAUSE__OOT
         o.severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
         o.reason = obj.hostname + ' '
         o.reason += PTP + " clocking is out of tolerance by "
         o.repair = "Check quality of the clocking network"
-        o.eid = obj.base_eid + '.ptp=out-of-tolerance'
+        o.eid = obj.base_eid + '.instance=' + instance + '.ptp=out-of-tolerance'
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
         ALARM_OBJ_LIST.append(o)
         ctrl.oot_alarm_object = o
 
-        o = PTP_alarm_object()
+        o = PTP_alarm_object(instance)
         # Only applies to storage and worker nodes
         o.alarm = ALARM_CAUSE__NO_LOCK
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         o.reason = obj.hostname
         o.reason += ' is not locked to remote PTP Grand Master'
         o.repair = 'Check network'
-        o.eid = obj.base_eid + '.ptp=no-lock'
+        o.eid = obj.base_eid + '.instance=' + instance + '.ptp=no-lock'
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
         ALARM_OBJ_LIST.append(o)
         ctrl.nolock_alarm_object = o
 
-        ptpinstances[PTP_HOST_BASED] = ctrl
-
-    else:
-        if instance and not ptpinstances.get(instance, None):
-            ctrl = PTP_ctrl_object()
-            ctrl.interface = interface
-            o = PTP_alarm_object(instance)
-            o.alarm = ALARM_CAUSE__PROCESS
-            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-            o.reason = obj.hostname + ' does not support the provisioned '
-            o.reason += PTP + ' mode '
-            o.repair = 'Check host hardware reference manual '
-            o.repair += 'to verify that the selected PTP mode is supported'
-            o.eid = obj.base_eid + '.instance=' + instance + '.ptp'
-            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN  # 'unknown'
-            ALARM_OBJ_LIST.append(o)
-            ctrl.process_alarm_object = o
-
-            o = PTP_alarm_object(instance)
-            o.alarm = ALARM_CAUSE__OOT
-            o.severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-            o.reason = obj.hostname + ' '
-            o.reason += PTP + " clocking is out of tolerance by "
-            o.repair = "Check quality of the clocking network"
-            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=out-of-tolerance'
-            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
-            ALARM_OBJ_LIST.append(o)
-            ctrl.oot_alarm_object = o
-
-            o = PTP_alarm_object(instance)
-            # Only applies to storage and worker nodes
-            o.alarm = ALARM_CAUSE__NO_LOCK
-            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-            o.reason = obj.hostname
-            o.reason += ' is not locked to remote PTP Grand Master'
-            o.repair = 'Check network'
-            o.eid = obj.base_eid + '.instance=' + instance + '.ptp=no-lock'
-            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
-            ALARM_OBJ_LIST.append(o)
-            ctrl.nolock_alarm_object = o
-
-            o = PTP_alarm_object(interface)
-            # Only applies to storage and worker nodes
-            o.alarm = ALARM_CAUSE__GNSS_SIGNAL_LOSS
-            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-            o.reason = obj.hostname
-            o.reason += ' GNSS signal loss'
-            o.repair = 'Check network'
-            o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
-            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-            ALARM_OBJ_LIST.append(o)
-            ctrl.gnss_signal_loss_alarm_object = o
-
-            o = PTP_alarm_object(interface)
-            # Only applies to storage and worker nodes
-            o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
-            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-            o.reason = obj.hostname
-            o.reason += ' 1PPS signal loss'
-            o.repair = 'Check network'
-            o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
-            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-            ALARM_OBJ_LIST.append(o)
-            ctrl.pps_signal_loss_alarm_object = o
-
-            ptpinstances[instance] = ctrl
+        o = PTP_alarm_object(interface)
+        # Only applies to storage and worker nodes
+        o.alarm = ALARM_CAUSE__GNSS_SIGNAL_LOSS
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname
+        o.reason += ' GNSS signal loss'
+        o.repair = 'Check network'
+        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+        ALARM_OBJ_LIST.append(o)
+        ctrl.gnss_signal_loss_alarm_object = o
 
         o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
+        # Only applies to storage and worker nodes
+        o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + ' Hardware timestamping'
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Hardware timestamping is supported by this interface'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=hardware-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+        o.reason = obj.hostname
+        o.reason += ' 1PPS signal loss'
+        o.repair = 'Check network'
+        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
         ALARM_OBJ_LIST.append(o)
+        ctrl.pps_signal_loss_alarm_object = o
 
-        o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + ' Software timestamping'
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Software timestamping is supported by this interface'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=software-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-        ALARM_OBJ_LIST.append(o)
+        ptpinstances[instance] = ctrl
 
-        o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + " Legacy timestamping"
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Legacy or Raw Clock is supported by this host'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=legacy-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-        ALARM_OBJ_LIST.append(o)
+    o = PTP_alarm_object(interface)
+    o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
+    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+    o.reason = obj.hostname + " '" + interface + "' does not support "
+    o.reason += PTP + ' Hardware timestamping'
+    o.repair = 'Check host hardware reference manual to verify PTP '
+    o.repair += 'Hardware timestamping is supported by this interface'
+    o.eid = obj.base_eid + '.ptp=' + interface
+    o.eid += '.unsupported=hardware-timestamping'
+    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+    ALARM_OBJ_LIST.append(o)
+
+    o = PTP_alarm_object(interface)
+    o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
+    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+    o.reason = obj.hostname + " '" + interface + "' does not support "
+    o.reason += PTP + ' Software timestamping'
+    o.repair = 'Check host hardware reference manual to verify PTP '
+    o.repair += 'Software timestamping is supported by this interface'
+    o.eid = obj.base_eid + '.ptp=' + interface
+    o.eid += '.unsupported=software-timestamping'
+    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+    ALARM_OBJ_LIST.append(o)
+
+    o = PTP_alarm_object(interface)
+    o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
+    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+    o.reason = obj.hostname + " '" + interface + "' does not support "
+    o.reason += PTP + " Legacy timestamping"
+    o.repair = 'Check host hardware reference manual to verify PTP '
+    o.repair += 'Legacy or Raw Clock is supported by this host'
+    o.eid = obj.base_eid + '.ptp=' + interface
+    o.eid += '.unsupported=legacy-timestamping'
+    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+    ALARM_OBJ_LIST.append(o)
 
 
 #####################################################################
@@ -978,36 +914,6 @@ def init_func():
     obj.hostname = obj.gethostname()
     obj.base_eid = 'host=' + obj.hostname
     obj.capabilities = {'primary_nic': None}
-
-    # Create the interface independent alarm objects.
-    create_interface_alarm_objects()
-
-    # load monitored interfaces and supported modes
-    if os.path.exists(PLUGIN_CONF_FILE):
-        with open(PLUGIN_CONF_FILE, 'r') as infile:
-            for line in infile:
-                # The PTP interfaces used are specified in the ptp4l.conf
-                #  file as [interface]. There may be more than one.
-                # Presently there is no need to track the function of the
-                # interface ; namely mgmnt or oam.
-                if line[0] == '[':
-                    interface = line.split(']')[0].split('[')[1]
-                    if interface and interface != 'global':
-                        interfaces[interface] = _get_supported_modes(interface)
-                        create_interface_alarm_objects(interface)
-
-                if PLUGIN_CONF_TIMESTAMPING in line:
-                    obj.mode = line.split()[1].strip('\n')
-
-        if obj.mode:
-            collectd.info("%s Timestamping Mode: %s" %
-                          (PLUGIN, obj.mode))
-        else:
-            collectd.error("%s failed to get Timestamping Mode" % PLUGIN)
-    else:
-        collectd.warning(
-            "%s could not load legacy ptp4l configuration" % PLUGIN)
-        obj.mode = None
 
     if os.path.exists(PTPINSTANCE_PATH):
         read_ptp4l_config()
@@ -1417,15 +1323,10 @@ def read_func():
 
     obj.audits += 1
     for instance_name, ctrl in ptpinstances.items():
-        if instance_name == PTP_HOST_BASED:
-            ptp_service = PLUGIN_SERVICE
-            conf_file = PLUGIN_CONF_FILE
-            instance = None
-        else:
-            instance = instance_name
-            ptp_service = ctrl.instance_type + '@' + instance_name + '.service'
-            conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
-                         '-' + instance_name + '.conf')
+        instance = instance_name
+        ptp_service = ctrl.instance_type + '@' + instance_name + '.service'
+        conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                     '-' + instance_name + '.conf')
 
         # Clock instance does not have a service, thus check non-clock instance type
         if ctrl.instance_type != PTP_INSTANCE_TYPE_CLOCK:
@@ -1508,9 +1409,8 @@ def read_func():
             ctrl.phase = RUN_PHASE__SAMPLING
             ctrl.log_throttle_count = 0
 
-        if (instance_name == PTP_HOST_BASED or 
-                obj.capabilities['primary_nic'] is None):
-            # Host-based PTP or non-synce PTP
+        if not obj.capabilities['primary_nic']:
+            # Non-synce PTP
             check_ptp_regular(instance, ctrl, conf_file)
         elif (ptpinstances[instance].instance_type in
                 [PTP_INSTANCE_TYPE_CLOCK, PTP_INSTANCE_TYPE_TS2PHC]):
