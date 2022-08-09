@@ -65,12 +65,20 @@ GROUP_PLATFORM = 'platform'
 GROUP_BASE = 'base'
 GROUP_K8S_SYSTEM = 'kube-system'
 GROUP_K8S_ADDON = 'kube-addon'
+GROUP_CONTAINERS = 'containers'
+GROUP_OVERHEAD = 'overhead'
+
+# Overall memory goupings
 GROUP_PROCESSES = 'cgroup-processes'
 
 # Groups included in platform - this excludes apps
-PLATFORM_GROUPS = [GROUP_BASE, GROUP_K8S_SYSTEM]
-OVERALL_GROUPS = [GROUP_PLATFORM, GROUP_K8S_ADDON]
+PLATFORM_GROUPS = [GROUP_OVERHEAD, GROUP_BASE, GROUP_K8S_SYSTEM]
+OVERALL_GROUPS = [GROUP_PLATFORM, GROUP_K8S_ADDON, GROUP_CONTAINERS]
 OVERALL_GROUPS.extend(PLATFORM_GROUPS)
+
+# Groups with cpuacct aggregated from multiple groups
+GROUPS_AGGREGATED = [GROUP_PLATFORM, GROUP_BASE, GROUP_K8S_SYSTEM,
+                     GROUP_K8S_ADDON, GROUP_CONTAINERS]
 
 # First level cgroups -- these are the groups we know about
 CGROUP_SYSTEM = 'system.slice'
@@ -78,6 +86,14 @@ CGROUP_USER = 'user.slice'
 CGROUP_MACHINE = 'machine.slice'
 CGROUP_DOCKER = 'docker'
 CGROUP_K8S = K8S_ROOT
+
+# Second level cgroups of system.slice for containerization
+CGROUP_SYSTEM_CONTAINERD = 'containerd.service'
+CGROUP_SYSTEM_DOCKER = 'docker.service'
+CGROUP_SYSTEM_KUBELET = 'kubelet.service'
+CGROUP_SYSTEM_ETCD = 'etcd.service'
+CONTAINERS_CGROUPS = [CGROUP_SYSTEM_CONTAINERD, CGROUP_SYSTEM_DOCKER,
+                      CGROUP_SYSTEM_KUBELET, CGROUP_SYSTEM_ETCD]
 
 # Groupings by first level cgroup
 BASE_GROUPS = [CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER]

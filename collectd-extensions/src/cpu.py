@@ -41,6 +41,7 @@ SCHEDSTAT = '/proc/schedstat'
 # cpuacct cgroup controller
 CPUACCT = pc.CGROUP_ROOT + '/cpuacct'
 CPUACCT_USAGE = 'cpuacct.usage'
+CPUACCT_USAGE_PERCPU = 'cpuacct.usage_percpu'
 
 # Common regex pattern match groups
 re_uid = re.compile(r'^pod(\S+)')
@@ -48,6 +49,9 @@ re_processor = re.compile(r'^[Pp]rocessor\s+:\s+(\d+)')
 re_schedstat = re.compile(r'^cpu(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+')
 re_schedstat_version = re.compile(r'^version\s+(\d+)')
 re_keyquoteval = re.compile(r'^\s*(\S+)\s*[=:]\s*\"(\S+)\"\s*')
+
+# hirunner minimum cpu occupancy threshold
+HIRUNNER_MINIMUM_CPU_PERCENT = 0.1
 
 
 # Plugin specific control class and object.
@@ -160,24 +164,40 @@ def get_platform_cpulist():
     return cpulist
 
 
-def get_cgroup_cpuacct(path):
+def get_cgroup_cpuacct(path, cpulist=None):
     """Get cgroup cpuacct usage for a specific cgroup path.
 
     This represents the aggregate usage for child cgroups.
+    Scope of the cpuacct spans all cpus, or a subset of cpus
+    when cpulist is specified.
 
     Returns cumulative usage in nanoseconds.
     """
 
     acct = 0
 
-    fstat = '/'.join([path, CPUACCT_USAGE])
-    try:
-        with open(fstat, 'r') as f:
-            line = f.readline().rstrip()
-            acct = int(line)
-    except IOError:
-        # Silently ignore IO errors. It is likely the cgroup disappeared.
-        pass
+    if not cpulist:
+        # Get the aggregate value for all cpus
+        fstat = '/'.join([path, CPUACCT_USAGE])
+        try:
+            with open(fstat, 'r') as f:
+                line = f.readline().rstrip()
+                acct = int(line)
+        except IOError:
+            # Silently ignore IO errors. It is likely the cgroup disappeared.
+            pass
+    else:
+        # Get the aggregate value for specified cpus
+        fstat = '/'.join([path, CPUACCT_USAGE_PERCPU])
+        try:
+            with open(fstat, 'r') as f:
+                line = f.readline().rstrip()
+                acct_percpu = list(map(int, line.split()))
+                for cpu in cpulist:
+                    acct += acct_percpu[cpu]
+        except IOError:
+            # Silently ignore IO errors. It is likely the cgroup disappeared.
+            pass
 
     return acct
 
@@ -189,10 +209,16 @@ def get_cpuacct():
     cpuacct[pc.GROUP_OVERALL] = {}
     cpuacct[pc.GROUP_FIRST] = {}
     cpuacct[pc.GROUP_PODS] = {}
+    cpuacct[pc.CGROUP_SYSTEM] = {}
+    cpuacct[pc.CGROUP_USER] = {}
 
     # Overall cpuacct usage
-    acct = get_cgroup_cpuacct(CPUACCT)
+    acct = get_cgroup_cpuacct(CPUACCT, cpulist=obj.cpu_list)
     cpuacct[pc.GROUP_OVERALL][pc.GROUP_TOTAL] = acct
+
+    # Initialize 'overhead' time (derived measurement). This will contain
+    # the remaining cputime not specifically tracked by first-level cgroups.
+    cpuacct[pc.GROUP_OVERALL][pc.GROUP_OVERHEAD] = acct
 
     # Walk the first level cgroups and get cpuacct usage
     # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
@@ -201,8 +227,32 @@ def get_cpuacct():
         if any(name.endswith(x) for x in ['.mount', '.scope']):
             continue
         cg_path = '/'.join([CPUACCT, name])
-        acct = get_cgroup_cpuacct(cg_path)
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
         cpuacct[pc.GROUP_FIRST][name] = acct
+
+        # Subtract out first-level cgroups. The remaining cputime represents
+        # systemd 'init' pid and kthreads on Platform cpus.
+        cpuacct[pc.GROUP_OVERALL][pc.GROUP_OVERHEAD] -= acct
+
+    # Walk the system.slice cgroups and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.CGROUP_SYSTEM])
+    dir_list = next(os.walk(path))[1]
+    for name in dir_list:
+        if any(name.endswith(x) for x in ['.mount', '.scope']):
+            continue
+        cg_path = '/'.join([path, name])
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
+        cpuacct[pc.CGROUP_SYSTEM][name] = acct
+
+    # Walk the user.slice cgroups and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.CGROUP_USER])
+    dir_list = next(os.walk(path))[1]
+    for name in dir_list:
+        if any(name.endswith(x) for x in ['.mount', '.scope']):
+            continue
+        cg_path = '/'.join([path, name])
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
+        cpuacct[pc.CGROUP_USER][name] = acct
 
     # Walk the kubepods hierarchy to the pod level and get cpuacct usage.
     # We can safely ignore reading this if the path does not exist.
@@ -344,8 +394,8 @@ def update_cpu_data(init=False):
             else:
                 cpuacct[i][k] = v
 
-    # Summarize cpuacct usage for various groupings
-    for g in pc.OVERALL_GROUPS:
+    # Summarize cpuacct usage for various groupings we aggregate
+    for g in pc.GROUPS_AGGREGATED:
         cpuacct[pc.GROUP_OVERALL][g] = 0.0
 
     # Aggregate cpuacct usage by K8S pod
@@ -374,6 +424,12 @@ def update_cpu_data(init=False):
         elif name not in pc.BASE_GROUPS_EXCLUDE:
             collectd.warning('%s could not find cgroup: %s' % (PLUGIN, name))
 
+    # Calculate system.slice container cpuacct usage
+    for g in pc.CONTAINERS_CGROUPS:
+        if g in cpuacct[pc.CGROUP_SYSTEM]:
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuacct[pc.CGROUP_SYSTEM][g]
+
     # Calculate platform cpuacct usage (this excludes apps)
     for g in pc.PLATFORM_GROUPS:
         cpuacct[pc.GROUP_OVERALL][pc.GROUP_PLATFORM] += \
@@ -395,6 +451,45 @@ def update_cpu_data(init=False):
                              cputime_ms,
                              obj.number_platform_cpus,
                              occupancy))
+
+    # Calculate cgroup based occupancy for first-level groupings
+    for g in cpuacct[pc.GROUP_FIRST]:
+        cputime_ms = \
+            float(cpuacct[pc.GROUP_FIRST][g]) / float(pc.ONE_MILLION)
+        occupancy = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+            / float(obj.elapsed_ms) / obj.number_platform_cpus
+        obj._data[g] = occupancy
+
+    # Calculate cgroup based occupancy for cgroups within
+    # system.slice and user.slice, keeping the hirunners
+    # exceeding minimum threshold.
+    occ = {}
+    for g in cpuacct[pc.CGROUP_SYSTEM]:
+        cputime_ms = \
+            float(cpuacct[pc.CGROUP_SYSTEM][g]) / float(pc.ONE_MILLION)
+        occupancy = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+            / float(obj.elapsed_ms) / obj.number_platform_cpus
+        obj._data[g] = occupancy
+        if occupancy >= HIRUNNER_MINIMUM_CPU_PERCENT:
+            occ[g] = occupancy
+    for g in cpuacct[pc.CGROUP_USER]:
+        cputime_ms = \
+            float(cpuacct[pc.CGROUP_USER][g]) / float(pc.ONE_MILLION)
+        occupancy = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+            / float(obj.elapsed_ms) / obj.number_platform_cpus
+        obj._data[g] = occupancy
+        if occupancy >= HIRUNNER_MINIMUM_CPU_PERCENT:
+            occ[g] = occupancy
+    occs = ', '.join(
+        '{}: {:.1f}'.format(k.split('.', 1)[0], v) for k, v in sorted(
+            occ.items(), key=lambda t: -float(t[1]))
+    )
+    collectd.info('%s %s: %.1f%%; cpus: %d, (%s)'
+                  % (PLUGIN,
+                     'Base usage',
+                     obj._data[pc.GROUP_BASE],
+                     obj.number_platform_cpus,
+                     occs))
 
     # Update t0 state for the next sample collection
     obj._t0 = copy.deepcopy(t1)
@@ -510,13 +605,18 @@ def read_func():
     if obj.verbose:
         collectd.info('%s Usage: %.1f%% (avg per cpu); '
                       'cpus: %d, Platform: %.1f%% '
-                      '(Base: %.1f, k8s-system: %.1f), k8s-addon: %.1f'
+                      '(Base: %.1f, k8s-system: %.1f), k8s-addon: %.1f, '
+                      '%s: %.1f, %s: %.1f'
                       % (PLUGIN, obj._data[PLATFORM_CPU_PERCENT],
                          obj.number_platform_cpus,
                          obj._data[pc.GROUP_PLATFORM],
                          obj._data[pc.GROUP_BASE],
                          obj._data[pc.GROUP_K8S_SYSTEM],
-                         obj._data[pc.GROUP_K8S_ADDON]))
+                         obj._data[pc.GROUP_K8S_ADDON],
+                         pc.GROUP_CONTAINERS,
+                         obj._data[pc.GROUP_CONTAINERS],
+                         pc.GROUP_OVERHEAD,
+                         obj._data[pc.GROUP_OVERHEAD]))
 
     # Fault insertion code to assis in regression UT
     #
