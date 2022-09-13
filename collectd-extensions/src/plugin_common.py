@@ -39,7 +39,7 @@ K8S_MODULE_MAJOR_VERSION = int(K8S_MODULE_VERSION.split('.')[0])
 KUBELET_CONF = '/etc/kubernetes/kubelet.conf'
 SSL_TLS_SUPPRESS = True
 
-# Standard units conversion parameters (mebi, kibi)
+# Standard units' conversion parameters (mebi, kibi)
 # Reference: https://en.wikipedia.org/wiki/Binary_prefix
 Mi = 1048576
 Ki = 1024
@@ -65,6 +65,7 @@ GROUP_PLATFORM = 'platform'
 GROUP_BASE = 'base'
 GROUP_K8S_SYSTEM = 'kube-system'
 GROUP_K8S_ADDON = 'kube-addon'
+GROUP_PROCESSES = 'cgroup-processes'
 
 # Groups included in platform - this excludes apps
 PLATFORM_GROUPS = [GROUP_BASE, GROUP_K8S_SYSTEM]
@@ -220,7 +221,7 @@ class PluginObject(object):
     # Name       : node_ready
     #
     # Description: Test for node ready condition.
-    #              Currently that's just a thresholded count
+    #              Currently, that's just a threshold count
     #
     # Parameters : plugin name
     #
@@ -586,7 +587,7 @@ class PluginObject(object):
     #
     # Name       : make_http_request
     #
-    # Description: Issue an http request to the specified URL.
+    # Description: Issue a http request to the specified URL.
     #              Load and return the response
     #              Handling execution errors
     #
