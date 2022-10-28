@@ -196,7 +196,9 @@ CLOCK_CLASS_140 = '140'   # T-GM in holdover, out of holdover specification
 CLOCK_CLASS_248 = '248'   # T-GM in free-run mode
 
 # Time interval for holdover within spec (seconds)
-HOLDOVER_THRESHOLD = 3600
+# Holdover threshold is set to 4 hours to match the supported holdover time
+# for Columbiaville NICs
+HOLDOVER_THRESHOLD = 14400
 
 # Leap second in nanoseconds
 LEAP_SECOND = float(37000000000)
