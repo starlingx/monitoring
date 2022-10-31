@@ -169,6 +169,7 @@ CLOCK_STATE_INVALID = 'invalid'
 CLOCK_STATE_FREERUN = 'freerun'
 CLOCK_STATE_LOCKED = 'locked'
 CLOCK_STATE_LOCKED_HO_ACK = 'locked_ho_ack'
+CLOCK_STATE_LOCKED_HO_ACQ = 'locked_ho_acq'
 CLOCK_STATE_HOLDOVER = 'holdover'
 CLOCK_STATE_UNLOCKED = 'unlocked'
 
@@ -1002,7 +1003,8 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
         severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
     elif state == CLOCK_STATE_UNLOCKED:
         severity = fm_constants.FM_ALARM_SEVERITY_MINOR
-    elif state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK]:
+    elif state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK,
+                   CLOCK_STATE_LOCKED_HO_ACQ]:
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
 
     if state == CLOCK_STATE_HOLDOVER:
@@ -1129,7 +1131,8 @@ def check_clock_class(instance):
             state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
     time_traceable = False
     new_clock_class = current_clock_class
-    if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK]:
+    if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK,
+                 CLOCK_STATE_LOCKED_HO_ACQ]:
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
     elif state == CLOCK_STATE_HOLDOVER:
@@ -1188,7 +1191,7 @@ def process_ptp_synce():
                             dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]))
             check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
                              ctrl.interface, state)
-            if state != CLOCK_STATE_LOCKED_HO_ACK:
+            if state not in [CLOCK_STATE_LOCKED_HO_ACK, CLOCK_STATE_LOCKED_HO_ACQ]:
                 if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
                     collectd.info("%s %s not locked to remote GNSS"
                                   % (PLUGIN, obj.hostname))
