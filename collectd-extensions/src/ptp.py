@@ -1414,7 +1414,7 @@ def read_func():
             ctrl.phase = RUN_PHASE__SAMPLING
             ctrl.log_throttle_count = 0
 
-        if not obj.capabilities['primary_nic']:
+        if not obj.capabilities['primary_nic'] and ctrl.instance_type != PTP_INSTANCE_TYPE_CLOCK:
             # Non-synce PTP
             check_ptp_regular(instance, ctrl, conf_file)
         elif (ptpinstances[instance].instance_type in
