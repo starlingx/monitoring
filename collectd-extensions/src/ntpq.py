@@ -78,6 +78,7 @@ PLUGIN = 'NTP query plugin'
 PLUGIN_INTERVAL = 300          # audit interval in secs
 PLUGIN_CONF = '/etc/ntp.conf'
 PLUGIN_EXEC = '/usr/sbin/ntpq'
+PLUGIN_EXEC_DEBIAN = '/usr/bin/ntpq'
 PLUGIN_EXEC_OPTIONS = '-pn'
 PLUGIN_ALARMID = "100.114"
 
@@ -715,7 +716,7 @@ def read_func():
         data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS])
     else:
         # Debian
-        data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS], encoding='utf-8')
+        data = subprocess.check_output([PLUGIN_EXEC_DEBIAN, PLUGIN_EXEC_OPTIONS], encoding='utf-8')
 
     # Keep this FIT test code but make it commented out for security
     #
