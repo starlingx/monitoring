@@ -14,7 +14,9 @@ import itertools as it
 import json
 import uuid
 import httplib2
+import six
 import socket
+import subprocess
 import time
 import os
 from oslo_concurrency import processutils
@@ -672,6 +674,41 @@ class K8sClient(object):
         self._host = socket.gethostname()
         self._kube_client_core = None
 
+    def _as_kube_metadata(self, metadata):
+        # metadata (json) dictionary has the following keys:
+        #'annotations', 'creationTimestamp', 'labels', 'name', 'namespace',
+        # 'ownerReferences', 'resourceVersion', 'uid'
+        return client.models.v1_object_meta.V1ObjectMeta(
+            name=metadata.get('name'),
+            namespace=metadata.get('namespace'),
+            annotations=metadata.get('annotations'),
+            uid=metadata.get('uid'))
+
+    def _as_kube_pod(self, pod):
+        # pod (json) dictionary has the following keys:
+        # 'apiVersion', 'kind', 'metadata', 'spec', 'status'
+        return client.V1Pod(
+            api_version=pod.get('apiVersion'),
+            kind=pod.get('kind'),
+            metadata=self._as_kube_metadata(pod.get('metadata')),
+            spec=pod.get('spec'),
+            status=self._as_kube_status(pod.get('status')))
+
+    def _as_kube_status(self, status):
+        # status (json) dictionary has the following keys:
+        # 'conditions', 'containerStatuses', 'hostIP', 'phase',
+        # 'podIP', 'podIPs', 'qosClass', 'startTime'
+        return client.models.v1_pod_status.V1PodStatus(
+            conditions=status.get('conditions'),
+            container_statuses=status.get('containerStatuses'),
+            host_ip=status.get('hostIP'),
+            phase=status.get('phase'),
+            pod_ip=status.get('podIP'),
+            pod_i_ps=status.get('podIPs'),
+            qos_class=status.get('qosClass'),
+            start_time=status.get('startTime')
+        )
+
     def _load_kube_config(self):
 
         config.load_kube_config(KUBELET_CONF)
@@ -695,13 +732,31 @@ class K8sClient(object):
         return self._kube_client_core
 
     def kube_get_local_pods(self):
+        # The Debian collectd leaks file descriptors calling the kube API
+        # the workaround is to use subprocess
         field_selector = 'spec.nodeName=' + self._host
         try:
-            api_response = self._get_k8sclient_core().\
-                list_pod_for_all_namespaces(
-                    watch=False,
-                    field_selector=field_selector)
-            return api_response.items
+            if six.PY2:
+                # Centos
+                api_response = self._get_k8sclient_core().\
+                    list_pod_for_all_namespaces(
+                        watch=False,
+                        field_selector=field_selector)
+                return api_response.items
+            else:
+                # Debian
+                # kubectl --kubeconfig KUBELET_CONF get pods --all-namespaces \
+                # --selector spec.nodeName=the_host -o json
+                kube_results = subprocess.check_output(
+                    ['kubectl', '--kubeconfig', KUBELET_CONF,
+                     '--field-selector', field_selector,
+                     'get', 'pods', '--all-namespaces',
+                     '-o', 'json'
+                     ]).decode()
+                json_results = json.loads(kube_results)
+                # convert the items to: kubernetes.client.V1Pod
+                api_items = [self._as_kube_pod(x) for x in json_results['items']]
+                return api_items
         except Exception as err:
             collectd.error("kube_get_local_pods: %s" % (err))
             raise
