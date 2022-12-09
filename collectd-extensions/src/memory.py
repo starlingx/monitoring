@@ -493,7 +493,35 @@ def get_platform_memory_per_process():
 
     Returns:
         memory: dict
-    """
+    {
+    "cgroup-processes": {
+    "pods": {
+      "3481f8f5-8c86-4c24-a1a5-48f5259d88af": {
+        "62939": {
+          "rss": 4.0,
+          "name": "dumb-init"
+        }
+      }
+    },
+    "platform": {
+      "57934": {
+        "rss": 5528.0,
+        "name": "guestServer"
+      },
+    },
+    "kube-system": {},
+    "kube-addon": {},
+    "overall": {
+      "3481f8f5-8c86-4c24-a1a5-48f5259d88af": {
+        "62939": {
+          "rss": 4.0,
+          "name": "dumb-init"
+           }
+         }
+       }
+     }
+   }
+"""
 
     platform_pids = []
     k8s_system_pids = []
@@ -507,7 +535,7 @@ def get_platform_memory_per_process():
             pc.GROUP_OVERALL: {}
         }
     }
-
+    pods_mem = {}
     platform = memory[pc.GROUP_PROCESSES][pc.GROUP_PLATFORM]
     k8s_system = memory[pc.GROUP_PROCESSES][pc.GROUP_K8S_SYSTEM]
     pod_group = memory[pc.GROUP_PROCESSES][pc.GROUP_PODS]
@@ -517,7 +545,7 @@ def get_platform_memory_per_process():
     for pid in pids:
         name = str(get_pid_name(pid))
         rss = get_pid_rss(pid)
-        if rss > 0 and not None:
+        if rss is not None and rss > 0:
             platform[int(pid)] = {'rss': float(rss),
                                   'name': str(name)}
 
@@ -551,7 +579,10 @@ def get_platform_memory_per_process():
                         for pid in pod_pids:
                             name = str(get_pid_name(pid))
                             rss = get_pid_rss(pid)
-                            if rss > 0 and not None:
+                            if rss is not None and rss > 0:
+                                pods_mem[int(pid)] = {
+                                    'rss': float(rss),
+                                    'name': str(name)}
                                 if uid not in pod_group:
                                     pod_group[uid] = {}
                                 if pid not in pod_group[uid]:
@@ -565,24 +596,20 @@ def get_platform_memory_per_process():
     for pid in platform_pids:
         name = str(get_pid_name(pid))
         rss = get_pid_rss(pid)
-        if rss > 0 and not None:
-            if name not in platform:
-                platform[int(pid)] = {}
+        if rss is not None and rss > 0:
             platform[int(pid)] = {'rss': float(rss),
                                   'name': str(name)}
 
     for pid in k8s_system_pids:
         name = str(get_pid_name(pid))
         rss = get_pid_rss(pid)
-        if rss > 0 and not None:
-            if pid not in k8s_system:
-                k8s_system[int(pid)] = {}
-                k8s_system[int(pid)] = {'rss': float(rss),
-                                        'name': str(name)}
+        if rss is not None and rss > 0:
+            k8s_system[int(pid)] = {'rss': float(rss),
+                                    'name': str(name)}
 
     # This returns the system overall process and stores it into a dict.
     memory[pc.GROUP_PROCESSES][pc.GROUP_OVERALL] = dict(itertools.chain(
-        platform.items(), k8s_system.items(), pod_group[uid].items()))
+        platform.items(), k8s_system.items(), pods_mem.items()))
 
     return memory
 
