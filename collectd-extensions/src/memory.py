@@ -875,7 +875,7 @@ def read_func():
     val.dispatch(values=[obj.normal['total_MiB']])
 
     val = collectd.Values(host=obj.hostname)
-    val.type = 'percent'
+    val.type = 'memory'
     val.type_instance = 'used'
     val.plugin = 'memory'
     val.plugin_instance = 'total'
@@ -884,7 +884,7 @@ def read_func():
     # Dispatch per-numa normal memory usage values derived from meminfo
     for node in sorted(obj.normal_nodes.keys()):
         val = collectd.Values(host=obj.hostname)
-        val.type = 'percent'
+        val.type = 'memory'
         val.type_instance = 'used'
         val.plugin = 'memory'
         val.plugin_instance = node
