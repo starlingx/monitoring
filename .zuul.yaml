@@ -27,14 +27,6 @@
     post:
       jobs:
         - stx-monitoring-upload-git-mirror
-        - kube-cpusets-tox-py27
-        - kube-cpusets-tox-py39
-        - kube-cpusets-tox-flake8
-        - kube-cpusets-tox-pylint
-        - kube-memory-tox-py27
-        - kube-memory-tox-py39
-        - kube-memory-tox-flake8
-        - kube-memory-tox-pylint
 
 - job:
     name: stx-monitoring-upload-git-mirror
@@ -56,7 +48,7 @@
       Run pylint test for kube-cpusets
     required-projects:
       - starlingx/config
-    nodeset: ubuntu-bionic
+    nodeset: debian-bullseye
     files:
       - kube-cpusets/*
     vars:
