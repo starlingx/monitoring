@@ -181,7 +181,7 @@ def pipe_command(*cmds, **kwargs):
             cmd_list[i + 1], stdin=last_popen[i].stdout,
             stdout=subprocess.PIPE))
         last_popen[i].stdout.close()
-    return last_popen[-1].communicate()[0]
+    return last_popen[-1].communicate()[0].decode()
 
 
 def gather_groups_memory(output_mem):
