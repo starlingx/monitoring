@@ -1121,6 +1121,12 @@ def check_clock_class(instance):
     # Determine the base port of the NIC from the interface
     base_port = ctrl.interface[:-1] + '0'
     pci_slot = get_pci_slot(base_port)
+
+    # Determine the value of the primary NIC PCI slot
+    primary_nic_pci_slot = None
+    if obj.capabilities['primary_nic']:
+        primary_nic_pci_slot = get_pci_slot(obj.capabilities['primary_nic'])
+
     state = CLOCK_STATE_INVALID
     instance_type = PTP_INSTANCE_TYPE_CLOCK
     if base_port == obj.capabilities['primary_nic']:
@@ -1131,6 +1137,11 @@ def check_clock_class(instance):
             state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
         elif dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state'] != CLOCK_STATE_INVALID:
             state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
+        if state != CLOCK_STATE_INVALID and state != CLOCK_STATE_HOLDOVER and primary_nic_pci_slot:
+            # If the base NIC cgu shows a valid lock state, check the status of the primary_nic
+            # GNSS connection
+            state = dpll_status[primary_nic_pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
+            instance_type = PTP_INSTANCE_TYPE_TS2PHC
     time_traceable = False
     new_clock_class = current_clock_class
     if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK,
