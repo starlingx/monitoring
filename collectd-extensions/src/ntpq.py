@@ -1,5 +1,5 @@
 ############################################################################
-# Copyright (c) 2018-2021 Wind River Systems, Inc.
+# Copyright (c) 2018-2023 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -80,7 +80,10 @@ PLUGIN_CONF = '/etc/ntp.conf'
 PLUGIN_EXEC = '/usr/sbin/ntpq'
 PLUGIN_EXEC_DEBIAN = '/usr/bin/ntpq'
 PLUGIN_EXEC_OPTIONS = '-pn'
+PLUGIN_EXEC_OPTIONS_ASSOC = '-pnc'
+PLUGIN_EXEC_OPTIONS_ASSOC_RV = 'rv &'
 PLUGIN_ALARMID = "100.114"
+NTPQ_SRCADR_PARAM = "srcadr"
 
 
 # define a class here that will persist over read calls
@@ -674,6 +677,86 @@ def _get_one_line_data(ntpq_lines):
 
 ###############################################################################
 #
+# Name       : _get_assoc_srcadr
+#
+# Description: Retrieves the IP value from association.
+# This function is useful for IPv6 cases, where the output of the ntp -np
+# command shows it truncated, so when the alarm is triggered it also shows
+# truncated.
+# Through this function it will be possible to obtain the IPv6 without
+# truncating, because the value is taken from srcadr param of association data.
+#
+# Example:
+#
+#     remote           refid      st t when poll reach   delay   offset  jitter
+#==============================================================================
+# 64:ff9b::7819:9 .XFAC.          16 u    - 1024    0    0.000   +0.000   0.000
+#*fd01:11::3      94.52.184.17     2 s  846 1024  376    0.114   -1.600   1.610
+#
+# IPv6 64:ff9b::7819:9 is truncated. The function looks for the srcadr
+# parameter to return the full IPv6 (64:ff9b::7819:9afd)
+#
+#     remote           refid      st t when poll reach   delay   offset  jitter
+#==============================================================================
+# 64:ff9b::7819:9 .XFAC.          16 u    - 1024    0    0.000   +0.000   0.000
+#*fd01:11::3      94.52.184.17     2 s  899 1024  376    0.114   -1.600   1.610
+#
+#associd=2703 status=8011 conf, sel_reject, 1 event, mobilize,
+#srcadr=64:ff9b::7819:9afd, srcport=123, dstadr=2620:10a:a001:a103::1065,
+#dstport=123, leap=11, stratum=16, precision=-24, rootdelay=0.000,
+#rootdisp=0.000, refid=XFAC, reftime=(no time), rec=(no time), reach=000,
+#unreach=73, hmode=3, pmode=0, hpoll=10, ppoll=10, headway=0,
+#flash=1600 peer_stratum, peer_dist, peer_unreach, keyid=0, offset=+0.000,
+#delay=0.000, dispersion=15937.500, jitter=0.000, xleave=0.046,
+#filtdelay=     0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00,
+#filtoffset=   +0.00   +0.00   +0.00   +0.00   +0.00   +0.00   +0.00   +0.00,
+#filtdisp=   16000.0 16000.0 16000.0 16000.0 16000.0 16000.0 16000.0 16000.0
+#
+# Parameters : index of association, current truncated ip value
+#
+# Returns    : if input IP value is a IPv4 format, returns same IPv4
+#              if input IP value is a IPv6 format, returns full IPv6 value
+#
+###############################################################################
+
+def _get_assoc_srcadr(assoc_id, ip):
+
+    srcadr = ''
+
+    # IPv4 no further processing required, returns same IP value
+    if assoc_id < 1 or socket.AF_INET6 != _is_ip_address(ip):
+        return ip
+
+    # Do NTP Query to retrieve assoc information
+    ntpq_assoc_param = PLUGIN_EXEC_OPTIONS_ASSOC_RV + str(assoc_id)
+    if six.PY2:
+        # Centos
+        data = subprocess.check_output([PLUGIN_EXEC, PLUGIN_EXEC_OPTIONS_ASSOC, ntpq_assoc_param])
+    else:
+        # Debian
+        data = subprocess.check_output([PLUGIN_EXEC_DEBIAN, PLUGIN_EXEC_OPTIONS_ASSOC, ntpq_assoc_param],
+                                       encoding='utf-8')
+
+    if not data:
+        return srcadr
+
+    ntpq = _get_one_line_data(data.split('\n'))
+
+    #Iterate through the association information to filter the srcadr.
+    for i in range(2, len(ntpq)):
+        if NTPQ_SRCADR_PARAM in ntpq[i] and ip in ntpq[i]:
+            src_ip_port = ntpq[i].split(",")
+            for param in src_ip_port:
+                if NTPQ_SRCADR_PARAM in param:
+                    srcadr = param.split("=")[1]
+                    break
+            break
+
+    return srcadr
+
+
+###############################################################################
+#
 # Name       : read_func
 #
 # Description: The sample read interface this plugin publishes to collectd.
@@ -769,6 +852,8 @@ def read_func():
             # example format of line:['', '132.163.4.102', '', '', '.INIT.',
             # get ip from index [1] of the list
             unreachable = obj.ntpq[i].split(' ')[1]
+            # find the ip and adjust the index of assoc information
+            unreachable = _get_assoc_srcadr(i - 1, unreachable)
             if unreachable:
                 # check to see if its a controller ip
                 # we skip over controller ips
@@ -786,11 +871,13 @@ def read_func():
         elif obj.ntpq[i][0] == '+':
             # remove the '+' and get the ip
             ip = obj.ntpq[i].split(' ')[0][1:]
+            ip = _get_assoc_srcadr(i - 1, ip)
 
         elif obj.ntpq[i][0] == '*':
             # remove the '*' and get the ip
             cols = obj.ntpq[i].split(' ')
             ip = cols[0][1:]
+            ip = _get_assoc_srcadr(i - 1, ip)
             if ip:
                 ip_family = _is_ip_address(ip)
                 obj.peer_selected = _is_controller(ip)
@@ -831,6 +918,8 @@ def read_func():
         # anything else is unreachable
         else:
             unreachable = obj.ntpq[i][1:].split(' ')[0]
+            # find the ip and adjust the index of assoc information
+            unreachable = _get_assoc_srcadr(i - 1, unreachable)
             if _is_controller(unreachable) is False:
                 _add_ip_to_ntpq_server_list(unreachable)
                 if unreachable not in obj.unreachable_servers:
