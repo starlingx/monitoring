@@ -5,3 +5,5 @@ src_path: kube-cpusets
 revision:
   dist: $STX_DIST
   PKG_GITREVCOUNT: true
+  SRC_GITREVCOUNT:
+    SRC_BASE_SRCREV: 1a5e6c4c3da90156262940d94bf8c67846bda991
