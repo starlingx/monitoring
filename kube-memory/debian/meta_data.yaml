@@ -5,3 +5,5 @@ src_path: kube-memory
 revision:
   dist: $STX_DIST
   PKG_GITREVCOUNT: true
+  SRC_GITREVCOUNT:
+    SRC_BASE_SRCREV: 36c8ae8395097326bc5b949af8301be61a3f6525
