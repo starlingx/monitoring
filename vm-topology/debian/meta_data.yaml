@@ -5,3 +5,5 @@ src_path: vm-topology
 revision:
   dist: $STX_DIST
   PKG_GITREVCOUNT: true
+  SRC_GITREVCOUNT:
+    SRC_BASE_SRCREV: 7ca5359f3ed53238f203288ba467a91edd938e43
