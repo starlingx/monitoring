@@ -575,8 +575,7 @@ def get_platform_memory_per_process():
                     match = re_path_uid.search(path)
                     if match:
                         uid = match.group(1)
-                        pod_pids.extend(get_cgroup_pid(path))
-                        for pid in pod_pids:
+                        for pid in get_cgroup_pid(path):
                             name = str(get_pid_name(pid))
                             rss = get_pid_rss(pid)
                             if rss is not None and rss > 0:
