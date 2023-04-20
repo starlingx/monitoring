@@ -724,7 +724,7 @@ def _get_assoc_srcadr(assoc_id, ip):
     srcadr = ''
 
     # IPv4 no further processing required, returns same IP value
-    if assoc_id < 1 or socket.AF_INET6 != _is_ip_address(ip):
+    if assoc_id < 1 or socket.AF_INET == _is_ip_address(ip):
         return ip
 
     # Do NTP Query to retrieve assoc information
