@@ -5,22 +5,18 @@
     check:
       jobs:
         - openstack-tox-linters
-        - kube-cpusets-tox-py27
         - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
-        - kube-memory-tox-py27
         - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
     gate:
       jobs:
         - openstack-tox-linters
-        - kube-cpusets-tox-py27
         - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
-        - kube-memory-tox-py27
         - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
@@ -85,20 +81,6 @@
       tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
 
 - job:
-    name: kube-cpusets-tox-py27
-    parent: tox
-    description: |
-      Run py27 test for kube-cpusets
-    nodeset: ubuntu-bionic
-    required-projects:
-      - starlingx/config
-    files:
-      - kube-cpusets/kube-cpusets/*
-    vars:
-      tox_envlist: py27
-      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
-
-- job:
     name: kube-memory-tox-pylint
     parent: tox
     required-projects:
@@ -139,20 +121,6 @@
     vars:
       python_version: 3.9
       tox_envlist: py39
-      tox_extra_args: -c kube-memory/kube-memory/tox.ini
-
-- job:
-    name: kube-memory-tox-py27
-    parent: tox
-    description: |
-      Run py27 test for kube-memory
-    nodeset: ubuntu-bionic
-    required-projects:
-      - starlingx/config
-    files:
-      - kube-memory/kube-memory/*
-    vars:
-      tox_envlist: py27
       tox_extra_args: -c kube-memory/kube-memory/tox.ini
 
 - secret:
