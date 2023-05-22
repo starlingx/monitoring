@@ -300,7 +300,7 @@ def calc_normal_memory():
     """Calculate normal memory usage totals.
 
     Returns dictionary containing derived fields:
-    'anon_MiB', 'avail_MiB', 'total_MiB', 'anon_percent'.
+    'anon_MiB', 'avail_MiB', 'total_MiB', 'anon_percent', 'slab_MiB'.
     i.e., normal[field]
     """
 
@@ -308,7 +308,7 @@ def calc_normal_memory():
                      obj.meminfo['Inactive(anon)']) / float(pc.Ki)
     avail_MiB = float(obj.meminfo['MemAvailable']) / float(pc.Ki)
     total_MiB = float(anon_MiB + avail_MiB)
-
+    slab_MiB = float(obj.meminfo['Slab']) / float(pc.Ki)
     if obj.strict_memory_accounting:
         anon_percent = float(pc.ONE_HUNDRED) \
             * float(obj.meminfo['Committed_AS']) \
@@ -324,7 +324,7 @@ def calc_normal_memory():
     normal['avail_MiB'] = avail_MiB
     normal['total_MiB'] = total_MiB
     normal['anon_percent'] = anon_percent
-
+    normal['slab_MiB'] = slab_MiB
     return normal
 
 
@@ -332,7 +332,7 @@ def calc_normal_memory_nodes():
     """Calculate normal memory usage totals per-numa node.
 
     Returns dictionary containing derived fields:
-    'anon_MiB', 'avail_MiB', 'total_MiB', 'anon_percent'.
+    'anon_MiB', 'avail_MiB', 'total_MiB', 'anon_percent', 'slab_MiB'.
     i.e., normal['nodeX'][field]
     """
 
@@ -345,12 +345,13 @@ def calc_normal_memory_nodes():
                           meminfo['FilePages'] +
                           meminfo['SReclaimable']) / float(pc.Ki)
         total_MiB = float(anon_MiB + avail_MiB)
+        slab_MiB = float(meminfo['Slab']) / float(pc.Ki)
 
         if total_MiB > 0:
             anon_percent = float(pc.ONE_HUNDRED) * anon_MiB / total_MiB
         else:
             anon_percent = 0.0
-
+        normal_nodes[node]['slab_MiB'] = slab
         normal_nodes[node]['anon_MiB'] = anon_MiB
         normal_nodes[node]['avail_MiB'] = avail_MiB
         normal_nodes[node]['total_MiB'] = total_MiB
@@ -789,11 +790,14 @@ def read_func():
         for uid in group_pods:
             if uid in obj._cache:
                 pod = obj._cache[uid]
-
+                # Ensure pods outside of Kube-System and Kube-Addon are only logged every 30 min
+                if datetime.datetime.now().minute % 30 == 0 and datetime.datetime.now().second > 29:
+                    collectd.info(f'The pod:{pod.name} running in namespace:{pod.namespace} '
+                                  f'has the following processes{group_pods[uid]}')
             else:
-                collectd.warning('%s: uid %s not found' % (PLUGIN, uid))
+                collectd.warning('%s: uid %s for pod %s not found in namespace %s' % (
+                    PLUGIN, uid, pod.name, pod.namespace))
                 continue
-
             # K8S platform system usage  i.e.,kube-system, armada, etc.
             if pod.namespace in pc.K8S_NAMESPACE_SYSTEM:
                 for key in group_pods[uid]:
@@ -924,21 +928,25 @@ def read_func():
 
         collectd.info('%s: Anon: %.1f%%, Anon: %.1f MiB, '
                       'cgroup-rss: %.1f MiB, '
-                      'Avail: %.1f MiB, Total: %.1f MiB'
+                      'Avail: %.1f MiB, Total: %.1f MiB, '
+                      'Slab: %.1f MiB'
                       % (PLUGIN_NORM,
                          obj.normal['anon_percent'],
                          obj.normal['anon_MiB'],
                          memory[pc.GROUP_OVERALL][pc.GROUP_TOTAL],
                          obj.normal['avail_MiB'],
-                         obj.normal['total_MiB']))
+                         obj.normal['total_MiB'],
+                         obj.normal['slab_MiB']))
         for node in sorted(obj.normal_nodes.keys()):
             collectd.info('%s: %s, Anon: %.2f%%, Anon: %.1f MiB, '
-                          'Avail: %.1f MiB, Total: %.1f MiB'
+                          'Avail: %.1f MiB, Total: %.1f MiB, '
+                          'Slab: %.1f MiB'
                           % (PLUGIN_NUMA, node,
                              obj.normal_nodes[node]['anon_percent'],
                              obj.normal_nodes[node]['anon_MiB'],
                              obj.normal_nodes[node]['avail_MiB'],
-                             obj.normal_nodes[node]['total_MiB']))
+                             obj.normal_nodes[node]['total_MiB'],
+                             obj.normal_nodes[node]['slab_MiB']))
 
     # Calculate overhead cost of gathering metrics
     if obj.debug:
