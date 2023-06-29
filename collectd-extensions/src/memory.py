@@ -351,7 +351,7 @@ def calc_normal_memory_nodes():
             anon_percent = float(pc.ONE_HUNDRED) * anon_MiB / total_MiB
         else:
             anon_percent = 0.0
-        normal_nodes[node]['slab_MiB'] = slab
+        normal_nodes[node]['slab_MiB'] = slab_MiB
         normal_nodes[node]['anon_MiB'] = anon_MiB
         normal_nodes[node]['avail_MiB'] = avail_MiB
         normal_nodes[node]['total_MiB'] = total_MiB
