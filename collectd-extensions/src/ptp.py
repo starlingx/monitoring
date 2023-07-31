@@ -512,6 +512,8 @@ class TimingInstance:
                 client_socket.send(query.encode())
                 response = client_socket.recv(1024)
                 response = response.decode()
+                if response == "None":
+                    response = None
                 return response
             except ConnectionRefusedError as err:
                 collectd.info("%s Error connecting to phc2sys socket for instance %s: %s" % (
