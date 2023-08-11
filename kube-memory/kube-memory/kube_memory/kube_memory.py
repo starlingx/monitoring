@@ -42,7 +42,7 @@ RESERVED_CONF = '/etc/platform/worker_reserved.conf'
 BASE_GROUPS = ['docker', 'system.slice', 'user.slice']
 K8S_NAMESPACE_SYSTEM = ['kube-system', 'armada', 'cert-manager', 'portieris',
                         'vault', 'notification', 'platform-deployment-manager',
-                        'flux-helm', 'metrics-server']
+                        'flux-helm', 'metrics-server', 'node-feature-discovery']
 K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
 
 # Used commands
