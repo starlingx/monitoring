@@ -727,13 +727,16 @@ def read_func():
                         if obj.debug:
                             collectd.info('%s: POD_ANNOTATION_KEY: '
                                           'hash=%s, uid=%s, '
-                                          'name=%s, namespace=%s, qos_class=%s'
+                                          'name=%s, namespace=%s, qos_class=%s, '
+                                          'is_platform_label=%s'
                                           % (PLUGIN_DEBUG,
                                              hash_uid,
                                              i.metadata.uid,
                                              i.metadata.name,
                                              i.metadata.namespace,
-                                             i.status.qos_class))
+                                             i.status.qos_class,
+                                             i.metadata.labels.get(pc.PLATFORM_LABEL_KEY) ==
+                                             pc.GROUP_PLATFORM))
                         uid = hash_uid
 
                 obj.k8s_pods.add(uid)
@@ -741,7 +744,8 @@ def read_func():
                     obj._cache[uid] = pc.POD_object(i.metadata.uid,
                                                     i.metadata.name,
                                                     i.metadata.namespace,
-                                                    i.status.qos_class)
+                                                    i.status.qos_class,
+                                                    i.metadata.labels)
 
             # Remove stale _cache entries
             remove_uids = set(obj._cache.keys()) - obj.k8s_pods
@@ -766,7 +770,8 @@ def read_func():
             continue
 
         # K8S platform system usage, i.e., essential: kube-system
-        if pod.namespace in pc.K8S_NAMESPACE_SYSTEM:
+        # check for component label app.starlingx.io/component=platform
+        if pod.is_platform_resource():
             memory[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += MiB
 
         # K8S platform addons usage, i.e., non-essential: monitor, openstack
@@ -798,8 +803,10 @@ def read_func():
                 collectd.warning('%s: uid %s for pod %s not found in namespace %s' % (
                     PLUGIN, uid, pod.name, pod.namespace))
                 continue
-            # K8S platform system usage  i.e.,kube-system, armada, etc.
-            if pod.namespace in pc.K8S_NAMESPACE_SYSTEM:
+
+            # K8S platform system usage, i.e., essential: kube-system
+            # check for component label app.starlingx.io/component=platform
+            if pod.is_platform_resource():
                 for key in group_pods[uid]:
                     k8s_system[key] = group_pods[uid][key]
 

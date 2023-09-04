@@ -107,6 +107,7 @@ K8S_NAMESPACE_SYSTEM = ['kube-system', 'armada', 'cert-manager', 'portieris',
                         'flux-helm', 'metrics-server', 'node-feature-discovery',
                         'intel-power', 'power-metrics', 'sriov-fec-system']
 K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
+PLATFORM_LABEL_KEY = "app.starlingx.io/component"
 
 # Pod parent cgroup name based on annotation.
 # e.g., used by: kube-controller-manager, kube-scheduler, kube-apiserver
@@ -683,7 +684,8 @@ class K8sClient(object):
             name=metadata.get('name'),
             namespace=metadata.get('namespace'),
             annotations=metadata.get('annotations'),
-            uid=metadata.get('uid'))
+            uid=metadata.get('uid'),
+            labels=metadata.get('labels'))
 
     def _as_kube_pod(self, pod):
         # pod (json) dictionary has the following keys:
@@ -764,17 +766,26 @@ class K8sClient(object):
 
 
 class POD_object:
-    def __init__(self, uid, name, namespace, qos_class):
+    def __init__(self, uid, name, namespace, qos_class, labels=None):
         self.uid = uid
         self.name = name
         self.namespace = namespace
         self.qos_class = qos_class
+        self.labels = labels
 
     def __str__(self):
         return str(self.__class__) + ": " + str(self.__dict__)
 
     def __repr__(self):
         return str(self.__class__) + ": " + str(self.__dict__)
+
+    def is_platform_resource(self):
+        """Check whether pod contains platform namespace or platform label"""
+
+        if (self.namespace in K8S_NAMESPACE_SYSTEM
+                or self.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM):
+            return True
+        return False
 
 
 def is_uuid_like(val):

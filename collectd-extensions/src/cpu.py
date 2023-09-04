@@ -325,13 +325,16 @@ def update_cpu_data(init=False):
                         if obj.debug:
                             collectd.info('%s POD_ANNOTATION_KEY: '
                                           'hash=%s, uid=%s, '
-                                          'name=%s, namespace=%s, qos_class=%s'
+                                          'name=%s, namespace=%s, qos_class=%s,'
+                                          'is_platform_label=%s'
                                           % (PLUGIN_DEBUG,
                                              hash_uid,
                                              i.metadata.uid,
                                              i.metadata.name,
                                              i.metadata.namespace,
-                                             i.status.qos_class))
+                                             i.status.qos_class,
+                                             i.metadata.labels.get(pc.PLATFORM_LABEL_KEY) ==
+                                             pc.GROUP_PLATFORM))
                         uid = hash_uid
 
                 obj.k8s_pods.add(uid)
@@ -339,8 +342,8 @@ def update_cpu_data(init=False):
                     obj._cache[uid] = pc.POD_object(i.metadata.uid,
                                                     i.metadata.name,
                                                     i.metadata.namespace,
-                                                    i.status.qos_class)
-
+                                                    i.status.qos_class,
+                                                    i.metadata.labels)
             # Remove stale _cache entries
             remove_uids = set(obj._cache.keys()) - obj.k8s_pods
             for uid in remove_uids:
@@ -408,7 +411,8 @@ def update_cpu_data(init=False):
             continue
 
         # K8S platform system usage, i.e., essential: kube-system
-        if pod.namespace in pc.K8S_NAMESPACE_SYSTEM:
+        # check for component label app.starlingx.io/component=platform        
+        if pod.is_platform_resource():
             cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += acct
 
         # K8S platform addons usage, i.e., non-essential: monitor, openstack
