@@ -210,13 +210,80 @@ CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
 # for Columbiaville NICs
 HOLDOVER_THRESHOLD = 14400
 
-# Leap second in nanoseconds
-LEAP_SECOND = float(37000000000)
+PTP4L_SOURCE_EPRTC = 'ePRTC'
+PTP4L_SOURCE_PRTC = 'PRTC'
+
+# G.8275 values are obtained from
+# https://www.itu.int/rec/T-REC-G.8275.1-202211-I/en
+# See Table V.2 and Table V.3
+G8275_CLOCK_ACCURACY_DEFAULT = '0xfe'
+G8275_CLOCK_ACCURACY_PRTC = '0x20'
+G8275_CLOCK_ACCURACY_EPRTC = '0x21'
+
+G8275_OFFSET_SCALED_LOG_VARIANCE_DEFAULT = '0xffff'
+G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC = '0x4e5d'
+G8275_OFFSET_SCALED_LOG_VARIANCE_EPRTC = '0x4b32'
+
+G8275_TIME_SOURCE_DEFAULT = '0xa0'
+G8275_TIME_SOURCE_GPS = '0x20'
+G8275_TIME_SOURCE_PTP = '0x40'
+
+G8275_PRC_LOCKED = {
+    'ePRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_EPRTC,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_EPRTC,
+        'timeSource': G8275_TIME_SOURCE_GPS,
+        'timeTraceable': True,
+        'frequencyTraceable': True
+    },
+    'PRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_PRTC,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC,
+        'timeSource': G8275_TIME_SOURCE_GPS,
+        'timeTraceable': True,
+        'frequencyTraceable': True
+    }
+}
+
+G8275_PRC_HOLDOVER = {
+    'ePRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_DEFAULT,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_DEFAULT,
+        'timeSource': G8275_TIME_SOURCE_DEFAULT,
+        'timeTraceable': True,
+        'frequencyTraceable': True
+    },
+    'PRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_DEFAULT,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_DEFAULT,
+        'timeSource': G8275_TIME_SOURCE_DEFAULT,
+        'timeTraceable': True,
+        'frequencyTraceable': True
+    }
+}
+
+G8275_PRC_FREERUN = {
+    'ePRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_DEFAULT,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_DEFAULT,
+        'timeSource': G8275_TIME_SOURCE_DEFAULT,
+        'timeTraceable': False,
+        'frequencyTraceable': False
+    },
+    'PRTC': {
+        'clockAccuracy': G8275_CLOCK_ACCURACY_DEFAULT,
+        'offsetScaledLogVariance': G8275_OFFSET_SCALED_LOG_VARIANCE_DEFAULT,
+        'timeSource': G8275_TIME_SOURCE_DEFAULT,
+        'timeTraceable': False,
+        'frequencyTraceable': False
+    }
+}
+
 
 # regex pattern match
 re_dict = re.compile(r'^(\w+)\s+(\w+)')
 re_blank = re.compile(r'^\s*$')
-re_keyval = re.compile(r'^\s*(\S+)\s+(\w+)')
+re_keyval = re.compile(r'^\s*(\S+)\s+(\S+)')
 
 # Instantiate the common plugin control object
 obj = pc.PluginObject(PLUGIN, "")
@@ -240,16 +307,34 @@ class PTP_alarm_object:
 class PTP_ctrl_object:
 
     def __init__(self, instance_type=PTP_INSTANCE_TYPE_PTP4L):
+        self.instance_type = instance_type
         self.log_throttle_count = 0
         self.phase = 0
-        self.pci_slot_name = None
+        self.config_data = None
+        self.holdover_timestamp = None
         self.interface = None
-        self.interface_list = []
-        self.instance_type = instance_type
-        self.clock_ports = {}
+        self.pci_slot_name = None
         self.timing_instance = None
         self.phc2sys_ha_enabled = False
-        self.holdover_timestamp = None
+        self.prtc_present = False
+        self.interface_list = []
+        self.clock_ports = {}
+
+        # Ptp4l G.8275 variables
+        self.ptp4l_prtc_type = PTP4L_SOURCE_PRTC
+        self.ptp4l_current_utc_offset = 37
+        self.ptp4l_current_utc_offset_valid = '0'
+        self.ptp4l_clock_accuracy = None
+        self.ptp4l_clock_class = None
+        self.ptp4l_clock_identity = None
+        self.ptp4l_grandmaster_identity = None
+        self.ptp4l_offset_scaled_log_variance = None
+        self.ptp4l_prc_state = None
+        self.ptp4l_time_source = None
+        self.ptp4l_utc_offset_nanoseconds = None
+        self.ptp4l_announce_settings = {}
+
+        # Alarm objects
         self.nolock_alarm_object = None
         self.process_alarm_object = None
         self.oot_alarm_object = None
@@ -318,6 +403,7 @@ interfaces = {}
 #
 # source_interface:primary_interface
 ts2phc_source_interfaces = {}
+ts2phc_instance_map = {}
 
 # List of timing instances
 timing_instance_list = []
@@ -1057,6 +1143,41 @@ def init_dpll_status(pci_slot):
     dpll_status[pci_slot] = pins
 
 
+def query_pmc(instance, query_string, uds_address=None, query_action='GET') -> dict:
+    ctrl = ptpinstances[instance]
+    data = {}
+    query = query_action + ' ' + query_string
+    if uds_address:
+        try:
+            data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-s', uds_address,
+                                            '-u', '-b', '0', query]).decode()
+        except subprocess.CalledProcessError as err:
+            collectd.warning("%s Failed to query pmc: %s" % (PLUGIN, err))
+            return data
+    else:
+        conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                     '-' + instance + '.conf')
+        try:
+            data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file,
+                                            '-u', '-b', '0', query]).decode()
+        except subprocess.CalledProcessError as err:
+            collectd.warning("%s Failed to query pmc: %s" % (PLUGIN, err))
+            return data
+
+    # Save all parameters in an ordered dict
+    query_results_dict = OrderedDict()
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if not (query_string in line):
+            # match key value array pairs
+            match = re_keyval.search(line)
+            if match:
+                k = match.group(1)
+                v = match.group(2)
+                query_results_dict[k] = v
+    return query_results_dict
+
+
 def read_ptp4l_config():
     """read ptp4l conf files"""
     filenames = glob(PTPINSTANCE_PTP4L_CONF_FILE_PATTERN)
@@ -1092,6 +1213,71 @@ def read_ptp4l_config():
             else:
                 collectd.error("%s instance %s failed to get Timestamping Mode" %
                                (PLUGIN, instance))
+
+            ptpinstances[instance].config_data = configparser.ConfigParser(
+                delimiters=' ')
+            ptpinstances[instance].config_data.read(filename)
+
+
+def initialize_ptp4l_state_fields(instance):
+    ctrl = ptpinstances[instance]
+
+    # Determine if there is a ts2phc instance disciplining this NIC
+    base_port = ctrl.interface[:-1] + '0'
+    pci_slot = get_pci_slot(base_port)
+    mapped_ts2phc_instance = None
+
+    if pci_slot in ts2phc_instance_map.keys():
+        mapped_ts2phc_instance = ts2phc_instance_map[pci_slot]
+        collectd.info("%s ptp4l instance %s is mapped to ts2phc instance %s"
+                      % (PLUGIN, instance, mapped_ts2phc_instance))
+        ctrl.prtc_present = True
+        collectd.info("%s Instance %s PRTC present" % (PLUGIN, instance))
+    else:
+        ctrl.prtc_present = False
+        collectd.info("%s Instance %s PRTC not present" % (PLUGIN, instance))
+
+    # Read any configured G.8275.x field values, set to default if not present
+    if ctrl.config_data.has_section('global'):
+        ctrl.ptp4l_clock_accuracy = \
+            ctrl.config_data['global'].get(
+                'clockAccuracy', G8275_CLOCK_ACCURACY_PRTC).lower()
+        ctrl.ptp4l_offset_scaled_log_variance = \
+            ctrl.config_data['global'].get('offsetScaledLogVariance',
+                                           G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC).lower()
+        ctrl.ptp4l_time_source = \
+            ctrl.config_data['global'].get(
+                'timeSource', G8275_TIME_SOURCE_GPS).lower()
+
+    # Determine utcOffsetValid
+    data = query_pmc(instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
+    if 'currentUtcOffsetValid' in data.keys():
+        ctrl.ptp4l_current_utc_offset_valid = data['currentUtcOffsetValid']
+    else:
+        ctrl.ptp4l_current_utc_offset_valid = 0
+    collectd.info("%s Instance %s currentUtcOffsetValid is initialized to %s"
+                  % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset_valid)))
+
+    # Determine clockIdentity
+    default_data_set = query_pmc(
+        instance, 'DEFAULT_DATA_SET', query_action='GET')
+    if 'clockIdentity' in default_data_set.keys():
+        ctrl.ptp4l_clock_identity = default_data_set['clockIdentity']
+    else:
+        ctrl.ptp4l_clock_identity = None
+    collectd.info("%s Instance %s clockIdentity is %s"
+                  % (PLUGIN, instance, ctrl.ptp4l_clock_identity))
+
+    # Determine currentUtcOffset
+    if ctrl.config_data.has_section('global') and 'utc_offset' in ctrl.config_data['global'].keys():
+        ctrl.ptp4l_current_utc_offset = ctrl.config_data['global']['utc_offset']
+        collectd.info("%s Instance %s currentUtcOffset is initialized to %s"
+                      % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
+    else:
+        # currentUtcOffset is not configured, use existing default
+        ctrl.ptp4l_current_utc_offset = data['currentUtcOffset']
+        collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
+                      % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
 
 
 def find_interface_from_pciaddr(pciaddr):
@@ -1151,6 +1337,7 @@ def read_ts2phc_config():
                         ptpinstances[instance].pci_slot_name = pci_slot
                         init_dpll_status(pci_slot)
                         ts2phc_source_interfaces[pci_slot] = pci_slot
+                        ts2phc_instance_map[pci_slot] = instance
                         obj.capabilities['primary_nic'] = interface
 
                         collectd.info("%s ts2phc instance:%s slot:%s primary_nic:%s" %
@@ -1166,6 +1353,7 @@ def read_ts2phc_config():
                                 base_port)
                             if secondary_ts2phc_interface != pci_slot:
                                 ts2phc_source_interfaces[secondary_ts2phc_interface] = pci_slot
+                                ts2phc_instance_map[secondary_ts2phc_interface] = instance
     collectd.debug("%s ts2phc_source_interfaces pci slots %s" %
                    (PLUGIN, ts2phc_source_interfaces))
 
@@ -1276,6 +1464,10 @@ def init_func():
     # remove '# to dump alarm object data
     # print_alarm_objects()
 
+    for instance in ptpinstances:
+        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            initialize_ptp4l_state_fields(instance)
+
     if tsc.nodetype == 'controller':
         obj.controller = True
 
@@ -1283,6 +1475,110 @@ def init_func():
 
     obj.init_completed()
     return 0
+
+
+def handle_ptp4l_g8275_fields(instance):
+    """set the required parameters for g8275 conformance"""
+    ctrl = ptpinstances[instance]
+    previous_grandmaster_identity = ctrl.ptp4l_grandmaster_identity
+    previous_clock_class = ctrl.ptp4l_clock_class
+
+    if ctrl.config_data.has_section('global') \
+            and 'dataset_comparison' not in ctrl.config_data['global'].keys():
+        collectd.info(
+            "%s G.8275.x profile is not enabled for instance %s" % (PLUGIN, instance))
+        return
+
+    data_grandmaster_settings = query_pmc(
+        instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
+
+    parent_data_set = query_pmc(
+        instance, 'PARENT_DATA_SET', query_action='GET')
+    if 'grandmasterIdentity' in parent_data_set.keys():
+        ctrl.ptp4l_grandmaster_identity = parent_data_set['grandmasterIdentity']
+
+    default_data_set = query_pmc(
+        instance, 'DEFAULT_DATA_SET', query_action='GET')
+    number_ports = default_data_set.get('numberPorts', '0')
+    if ctrl.ptp4l_clock_identity is None:
+        if 'clockIdentity' in default_data_set.keys():
+            ctrl.ptp4l_clock_identity = default_data_set['clockIdentity']
+
+    if 'gm.ClockClass' in parent_data_set.keys():
+        ctrl.ptp4l_clock_class = parent_data_set['gm.ClockClass']
+
+    if ctrl.ptp4l_prc_state in [CLOCK_STATE_LOCKED,
+                                CLOCK_STATE_LOCKED_HO_ACK,
+                                CLOCK_STATE_LOCKED_HO_ACQ]:
+        # PRC is locked
+        # Use the values configured by initialize_ptp4l_state_fields()
+        ctrl.ptp4l_announce_settings['clockAccuracy'] = ctrl.ptp4l_clock_accuracy
+        ctrl.ptp4l_announce_settings['offsetScaledLogVariance'] = \
+            ctrl.ptp4l_offset_scaled_log_variance
+        ctrl.ptp4l_announce_settings['timeSource'] = ctrl.ptp4l_time_source
+
+    elif ctrl.ptp4l_prc_state == CLOCK_STATE_HOLDOVER:
+        # PRC is holdover
+        ctrl.ptp4l_announce_settings['clockAccuracy'] =  \
+            G8275_PRC_HOLDOVER[ctrl.ptp4l_prtc_type]['clockAccuracy']
+        ctrl.ptp4l_announce_settings['offsetScaledLogVariance'] = \
+            G8275_PRC_HOLDOVER[ctrl.ptp4l_prtc_type]['offsetScaledLogVariance']
+        ctrl.ptp4l_announce_settings['timeSource'] = \
+            G8275_PRC_HOLDOVER[ctrl.ptp4l_prtc_type]['timeSource']
+
+    elif ctrl.ptp4l_prc_state == CLOCK_STATE_INVALID:
+        # PRC is freerun
+        ctrl.ptp4l_announce_settings['clockAccuracy'] =  \
+            G8275_PRC_FREERUN[ctrl.ptp4l_prtc_type]['clockAccuracy']
+        ctrl.ptp4l_announce_settings['offsetScaledLogVariance'] = \
+            G8275_PRC_FREERUN[ctrl.ptp4l_prtc_type]['offsetScaledLogVariance']
+        ctrl.ptp4l_announce_settings['timeSource'] = \
+            G8275_PRC_FREERUN[ctrl.ptp4l_prtc_type]['timeSource']
+
+    new_clock_class = previous_clock_class
+    if previous_grandmaster_identity != ctrl.ptp4l_grandmaster_identity \
+            and ctrl.prtc_present is False:
+        # GM for this node just changed
+        if ctrl.ptp4l_grandmaster_identity == ctrl.ptp4l_clock_identity:
+            # We became a GM
+            if int(number_ports) > 1:
+                new_clock_class = '165'
+            else:
+                new_clock_class = '248'
+            ctrl.ptp4l_announce_settings['timeTraceable'] = '0'
+            ctrl.ptp4l_clock_class = new_clock_class
+            ctrl.ptp4l_announce_settings['clockClass'] = new_clock_class
+            collectd.info("%s Local clock is GM for instance %s: %s"
+                          % (PLUGIN, instance, ctrl.ptp4l_grandmaster_identity))
+        else:
+            # Fields will be set according to new GM announcements
+            collectd.info("%s New GM selected for instance %s: %s"
+                          % (PLUGIN, instance, ctrl.ptp4l_grandmaster_identity))
+
+    gm_settings_to_write = OrderedDict(data_grandmaster_settings)
+    gm_settings_to_write.update(ctrl.ptp4l_announce_settings)
+    if data_grandmaster_settings != gm_settings_to_write:
+        collectd.info("%s Updating announce fields for instance %s" %
+                      (PLUGIN, instance))
+        write_ptp4l_gm_fields(instance, gm_settings_to_write)
+
+
+def write_ptp4l_gm_fields(instance, gm_fields_dict):
+    """update the pmc GRANDMASTER_SETTINGS_NP values"""
+    ctrl = ptpinstances[instance]
+    conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                 '-' + instance + '.conf')
+    parameters = ' '.join("{} {}".format(*i) for i in gm_fields_dict.items())
+    cmd = 'SET GRANDMASTER_SETTINGS_NP ' + parameters
+    collectd.debug("%s cmd=%s" % (PLUGIN, cmd))
+    try:
+        data = subprocess.check_output(
+            [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0', cmd]).decode()
+    except subprocess.CalledProcessError as exc:
+        collectd.error(
+            "%s Failed to write GM settings for instance %s: %s" % (PLUGIN, instance, exc))
+    collectd.info("%s instance: %s wrote gm settings %s" %
+                  (PLUGIN, instance, gm_fields_dict))
 
 
 def read_dpll_status(pci_slot):
@@ -1328,6 +1624,81 @@ def read_dpll_status(pci_slot):
             collectd.debug("%s pci_slot %s DPLL: %s" %
                            (PLUGIN, pci_slot, dpll_status[pci_slot]))
     return dpll_status
+
+
+def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
+    pidfile = pidfile_path + "phc2sys-" + instance + ".pid"
+    try:
+        with open(pidfile, 'r') as f:
+            pid = f.readline().strip()
+        # Get command line params
+        cmdline_file = "/host/proc/" + pid + "/cmdline"
+        with open(cmdline_file, 'r') as f:
+            cmdline_args = f.readline().strip()
+        cmdline_args = cmdline_args.split("\x00")
+    except OSError as ex:
+        collectd.warning("%s Cannot open file. %s" % (PLUGIN, ex))
+        return None
+    # The option value will be at the index after the flag
+    try:
+        index = cmdline_args.index(flag)
+    except ValueError as ex:
+        collectd.debug("%s Flag not found in cmdline args. %s" % (PLUGIN, ex))
+        return None
+    value = cmdline_args[index + 1]
+    collectd.debug("%s %s value is %s" % (PLUGIN, flag, value))
+    return value
+
+
+def set_utc_offset(instance):
+    """Determine the currentUtcOffset value from either the configured value or via the pmc.
+
+    set_utc_offset() should run on each iteration.
+    It is possible for the value to be updated by an upstream node at any time.
+    """
+
+    collectd.debug("%s Setting UTC offset for instance %s" %
+                   (PLUGIN, instance))
+    ctrl = ptpinstances[instance]
+    conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                 '-' + instance + '.conf')
+    pidfile_path = '/var/run/'
+    utc_offset = None
+
+    # Check command line options for offset
+    if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS:
+        utc_offset = _get_phc2sys_command_line_option(
+            instance, pidfile_path, '-O')
+    # If not, check config file for uds_address and domainNumber
+    # If uds_address, get utc_offset from TIME_PROPERTIES_DATA_SET using the phc2sys config
+    if not utc_offset:
+        utc_offset = ctrl.ptp4l_current_utc_offset
+        utc_offset_valid = False
+        if ctrl.config_data.has_section('global') \
+                and 'domainNumber' in ctrl.config_data['global'].keys() \
+                and 'uds_address' in ctrl.config_data['global'].keys():
+            #
+            # sudo /usr/sbin/pmc -u -b 0 'GET TIME_PROPERTIES_DATA_SET'
+            #
+            data = subprocess.check_output(
+                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+                 'GET TIME_PROPERTIES_DATA_SET']).decode()
+            for line in data.split('\n'):
+                if 'currentUtcOffset ' in line:
+                    utc_offset = line.split()[1]
+                if 'currentUtcOffsetValid ' in line:
+                    utc_offset_valid = bool(int(line.split()[1]))
+            if not utc_offset_valid:
+                utc_offset = ctrl.ptp4l_current_utc_offset
+                collectd.warning("%s currentUtcOffsetValid is %s, "
+                                 "using the default currentUtcOffset %s"
+                                 % (PLUGIN, utc_offset_valid, utc_offset))
+
+    if ctrl.ptp4l_current_utc_offset != int(utc_offset):
+        ctrl.ptp4l_current_utc_offset = int(utc_offset)
+        ctrl.ptp4l_utc_offset_nanoseconds = abs(int(utc_offset)) * 1000000000
+        collectd.info("%s Instance %s utcOffset updated to %s" %
+                      (PLUGIN, instance, utc_offset))
 
 
 def check_gnss_alarm(instance, alarm_object, interface, state):
@@ -1382,6 +1753,7 @@ def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
 def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
+    set_utc_offset(instance)
     data = subprocess.check_output(
         [PHC_CTL, ctrl.interface, '-q', 'cmp']).decode()
     offset = 0
@@ -1395,7 +1767,7 @@ def check_time_drift(instance, gm_identity=None):
 
         # Manage the sample OOT alarm severity
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-        offset = float(abs(raw_offset) - LEAP_SECOND)
+        offset = float(abs(raw_offset) - ctrl.ptp4l_utc_offset_nanoseconds)
         if abs(offset) > OOT_MAJOR_THRESHOLD:
             severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         elif abs(offset) > OOT_MINOR_THRESHOLD:
@@ -1437,23 +1809,12 @@ def check_time_drift(instance, gm_identity=None):
 
 def check_clock_class(instance):
     ctrl = ptpinstances[instance]
+    data = {}
     conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
                  '-' + instance + '.conf')
-    data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f',
-                                    conf_file,
-                                    '-u', '-b', '0', 'GET GRANDMASTER_SETTINGS_NP']).decode()
-    # Save all parameters in an ordered dict
-    m = OrderedDict()
-    obj.resp = data.split('\n')
-    for line in obj.resp:
-        if not ('GRANDMASTER_SETTINGS_NP' in line):
-            # match key value array pairs
-            match = re_keyval.search(line)
-            if match:
-                k = match.group(1)
-                v = match.group(2)
-                m[k] = v
-    current_clock_class = m['clockClass']
+
+    data = query_pmc(instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
+    current_clock_class = data['clockClass']
 
     # Determine the base port of the NIC from the interface
     base_port = ctrl.interface[:-1] + '0'
@@ -1488,14 +1849,18 @@ def check_clock_class(instance):
             instance_type = PTP_INSTANCE_TYPE_TS2PHC
 
     time_traceable = False
+    frequency_traceable = False
     new_clock_class = current_clock_class
+    ctrl.ptp4l_prc_state = state
     if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK,
                  CLOCK_STATE_LOCKED_HO_ACQ]:
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
+        frequency_traceable = True
     elif state == CLOCK_STATE_HOLDOVER:
         new_clock_class = CLOCK_CLASS_7
         time_traceable = True
+        frequency_traceable = True
         # Get the holdover timestamp of the clock/ts2phc instance
         holdover_timestamp = None
         for key, ctrl_obj in ptpinstances.items():
@@ -1510,14 +1875,16 @@ def check_clock_class(instance):
             if delta > HOLDOVER_THRESHOLD:
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
+                frequency_traceable = False
     else:
         new_clock_class = CLOCK_CLASS_248
 
     if current_clock_class != new_clock_class:
         # Set clockClass and timeTraceable
-        m['clockClass'] = new_clock_class
-        m['timeTraceable'] = int(time_traceable)
-        parameters = ' '.join("{} {}".format(*i) for i in m.items())
+        data['clockClass'] = new_clock_class
+        data['timeTraceable'] = int(time_traceable)
+        data['frequencyTraceable'] = int(frequency_traceable)
+        parameters = ' '.join("{} {}".format(*i) for i in data.items())
         cmd = 'SET GRANDMASTER_SETTINGS_NP ' + parameters
         collectd.debug("%s cmd=%s" % (PLUGIN, cmd))
         try:
@@ -1526,8 +1893,10 @@ def check_clock_class(instance):
         except subprocess.CalledProcessError as exc:
             collectd.error(
                 "%s Failed to set clockClass for instance %s" % (PLUGIN, instance))
-        collectd.info("%s instance:%s Updated clockClass from %s to %s timeTraceable=%s" %
-                      (PLUGIN, instance, current_clock_class, new_clock_class, time_traceable))
+        collectd.info("%s instance:%s Updated clockClass from %s to %s timeTraceable=%s,"
+                      "frequencyTraceable=%s"
+                      % (PLUGIN, instance, current_clock_class, new_clock_class, time_traceable,
+                         frequency_traceable))
 
 
 def process_ptp_synce(instance):
@@ -1802,6 +2171,9 @@ def read_func():
 
         if obj.capabilities['primary_nic']:
             process_ptp_synce(instance)
+
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            handle_ptp4l_g8275_fields(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
             process_phc2sys_ha(ctrl)
