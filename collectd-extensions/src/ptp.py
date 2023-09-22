@@ -42,6 +42,7 @@ from fm_api import constants as fm_constants
 from fm_api import fm_api
 from glob import glob
 from oslo_utils import timeutils
+from functools import lru_cache
 
 debug = False
 
@@ -1626,19 +1627,29 @@ def read_dpll_status(pci_slot):
     return dpll_status
 
 
-def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
+@lru_cache()
+def _get_proc_cmdline(instance, pidfile_path):
     pidfile = pidfile_path + "phc2sys-" + instance + ".pid"
+    with open(pidfile, 'r') as f:
+        pid = f.readline().strip()
+    # Get command line params
+    cmdline_file = "/proc/" + pid + "/cmdline"
+    with open(cmdline_file, 'r') as f:
+        cmdline_args = f.readline().strip()
+    cmdline_args = cmdline_args.split("\x00")
+
+    return cmdline_args
+
+
+def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
     try:
-        with open(pidfile, 'r') as f:
-            pid = f.readline().strip()
-        # Get command line params
-        cmdline_file = "/host/proc/" + pid + "/cmdline"
-        with open(cmdline_file, 'r') as f:
-            cmdline_args = f.readline().strip()
-        cmdline_args = cmdline_args.split("\x00")
+        cmdline_args = _get_proc_cmdline(instance, pidfile_path)
     except OSError as ex:
-        collectd.warning("%s Cannot open file. %s" % (PLUGIN, ex))
+        collectd.debug("%s Cannot get cmdline for instance %s. %s" % (PLUGIN, instance, ex))
         return None
+    if cmdline_args is None:
+        return None
+
     # The option value will be at the index after the flag
     try:
         index = cmdline_args.index(flag)
@@ -1648,6 +1659,39 @@ def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
     value = cmdline_args[index + 1]
     collectd.debug("%s %s value is %s" % (PLUGIN, flag, value))
     return value
+
+
+def check_phc2sys_offset():
+    """check if phc2sys offset is set"""
+    phc2sysinstances = set()
+    filenames = glob(PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.info("%s No phc2sys conf file configured" % PLUGIN)
+        return
+    else:
+        for filename in filenames:
+            pattern = PTP_INSTANCE_TYPE_PHC2SYS + '-(.*?)' + '.conf'
+            instance = re.search(pattern, filename).group(1)
+            phc2sysinstances.add(instance)
+
+    pidfile_path = '/var/run/'
+    offset = None
+    # Verify that a phc2sys instance is disciplining the system clock.
+    # If -c flag is absent or -c is CLOCK_REALTIME (default) we can assume the
+    # system clock is being disciplined
+    found_disciplined = 0
+    for phc2sysinstance in phc2sysinstances:
+        slave_clock = _get_phc2sys_command_line_option(
+            phc2sysinstance, pidfile_path, '-c')
+        if slave_clock is None or slave_clock == 'CLOCK_REALTIME':
+            offset = _get_phc2sys_command_line_option(
+                phc2sysinstance, pidfile_path, '-O')
+            if offset is not None:
+                offset = abs(int(offset)) * 1000000000
+            found_disciplined += 1
+    if found_disciplined > 1:
+        collectd.error("%s Found more then one phc2sys instance disciplining the clock" % PLUGIN)
+    return offset
 
 
 def set_utc_offset(instance):
@@ -1662,37 +1706,28 @@ def set_utc_offset(instance):
     ctrl = ptpinstances[instance]
     conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
                  '-' + instance + '.conf')
-    pidfile_path = '/var/run/'
-    utc_offset = None
 
-    # Check command line options for offset
-    if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS:
-        utc_offset = _get_phc2sys_command_line_option(
-            instance, pidfile_path, '-O')
-    # If not, check config file for uds_address and domainNumber
-    # If uds_address, get utc_offset from TIME_PROPERTIES_DATA_SET using the phc2sys config
-    if not utc_offset:
-        utc_offset = ctrl.ptp4l_current_utc_offset
-        utc_offset_valid = False
-        if ctrl.config_data.has_section('global') \
-                and 'domainNumber' in ctrl.config_data['global'].keys() \
-                and 'uds_address' in ctrl.config_data['global'].keys():
-            #
-            # sudo /usr/sbin/pmc -u -b 0 'GET TIME_PROPERTIES_DATA_SET'
-            #
-            data = subprocess.check_output(
-                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
-                 'GET TIME_PROPERTIES_DATA_SET']).decode()
-            for line in data.split('\n'):
-                if 'currentUtcOffset ' in line:
-                    utc_offset = line.split()[1]
-                if 'currentUtcOffsetValid ' in line:
-                    utc_offset_valid = bool(int(line.split()[1]))
-            if not utc_offset_valid:
-                utc_offset = ctrl.ptp4l_current_utc_offset
-                collectd.warning("%s currentUtcOffsetValid is %s, "
-                                 "using the default currentUtcOffset %s"
-                                 % (PLUGIN, utc_offset_valid, utc_offset))
+    utc_offset = ctrl.ptp4l_current_utc_offset
+    utc_offset_valid = False
+    if ctrl.config_data.has_section('global') \
+            and 'domainNumber' in ctrl.config_data['global'].keys() \
+            and 'uds_address' in ctrl.config_data['global'].keys():
+        #
+        # sudo /usr/sbin/pmc -u -b 0 'GET TIME_PROPERTIES_DATA_SET'
+        #
+        data = subprocess.check_output(
+            [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+                'GET TIME_PROPERTIES_DATA_SET']).decode()
+        for line in data.split('\n'):
+            if 'currentUtcOffset ' in line:
+                utc_offset = line.split()[1]
+            if 'currentUtcOffsetValid ' in line:
+                utc_offset_valid = bool(int(line.split()[1]))
+        if not utc_offset_valid:
+            utc_offset = ctrl.ptp4l_current_utc_offset
+            collectd.warning("%s currentUtcOffsetValid is %s, "
+                             "using the default currentUtcOffset %s"
+                             % (PLUGIN, utc_offset_valid, utc_offset))
 
     if ctrl.ptp4l_current_utc_offset != int(utc_offset):
         ctrl.ptp4l_current_utc_offset = int(utc_offset)
@@ -1753,7 +1788,22 @@ def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
 def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
+    phc2sys_clock_offset_ns = check_phc2sys_offset()
+    collectd.info("%s found phc2sys offset %s" % (PLUGIN, phc2sys_clock_offset_ns))
+
     set_utc_offset(instance)
+    # If phc2sys offset is 0 or matches the ptp4l offset use it, if not it's a configuration error
+    utc_offset_ns = ctrl.ptp4l_utc_offset_nanoseconds
+    if phc2sys_clock_offset_ns is not None:
+        if phc2sys_clock_offset_ns == 0 \
+                or phc2sys_clock_offset_ns == ctrl.ptp4l_utc_offset_nanoseconds:
+            utc_offset_ns = phc2sys_clock_offset_ns
+        else:
+            collectd.error("%s phc2sys offset (%s) does not match ptp4l offset (%s)" %
+                           (PLUGIN, phc2sys_clock_offset_ns, ctrl.ptp4l_utc_offset_nanoseconds))
+
+    collectd.info("%s using utc offset %s" % (PLUGIN, utc_offset_ns))
+
     data = subprocess.check_output(
         [PHC_CTL, ctrl.interface, '-q', 'cmp']).decode()
     offset = 0
@@ -1767,7 +1817,7 @@ def check_time_drift(instance, gm_identity=None):
 
         # Manage the sample OOT alarm severity
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-        offset = float(abs(raw_offset) - ctrl.ptp4l_utc_offset_nanoseconds)
+        offset = float(abs(raw_offset) - utc_offset_ns)
         if abs(offset) > OOT_MAJOR_THRESHOLD:
             severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         elif abs(offset) > OOT_MINOR_THRESHOLD:
