@@ -530,7 +530,7 @@ class TimingInstance:
                         {line.split()[0]: line.split()[1]})
         return config
 
-    def parse_ptp4l_config(self) -> configparser:
+    def parse_ptp4l_config(self):
         # Not currently used
         # https://docs.python.org/3/library/configparser.html
         # You can access the parameters like so:
@@ -540,7 +540,9 @@ class TimingInstance:
         config = configparser.ConfigParser(delimiters=' ')
         config.read(self.config_file_path)
         for item in config.sections():
-            if item != "global":
+            # unicast_master_table is a special section in ptp4l configs
+            # It is only used by ptp4l itself and can be ignored by collectd
+            if item != "global" and item != "unicast_master_table":
                 self.interfaces.add(item)
         return config
 
@@ -595,6 +597,8 @@ class TimingInstance:
                                                                            self.phc2sys_com_socket)
         self.state['phc2sys_forced_lock'] = self.query_phc2sys_socket('forced lock',
                                                                       self.phc2sys_com_socket)
+        self.state['phc2sys_valid_sources'] = self.query_phc2sys_socket('valid sources',
+                                                                        self.phc2sys_com_socket)
 
     def query_phc2sys_socket(self, query, unix_socket=None):
         if unix_socket:
@@ -1194,7 +1198,10 @@ def read_ptp4l_config():
                 for line in infile:
                     if line[0] == '[':
                         interface = line.split(']')[0].split('[')[1]
-                        if interface and interface != 'global':
+                        if interface and interface != 'global' \
+                                and interface != 'unicast_master_table':
+                            # unicast_master_table is a special section in some ptp4l configs
+                            # It can be ignored by collectd
                             if (ptpinstances[instance] and
                                     ptpinstances[instance].interface == interface):
                                 # ignore the duplicate interface in the file
@@ -1645,7 +1652,8 @@ def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
     try:
         cmdline_args = _get_proc_cmdline(instance, pidfile_path)
     except OSError as ex:
-        collectd.debug("%s Cannot get cmdline for instance %s. %s" % (PLUGIN, instance, ex))
+        collectd.debug("%s Cannot get cmdline for instance %s. %s" %
+                       (PLUGIN, instance, ex))
         return None
     if cmdline_args is None:
         return None
@@ -1690,7 +1698,8 @@ def check_phc2sys_offset():
                 offset = abs(int(offset)) * 1000000000
             found_disciplined += 1
     if found_disciplined > 1:
-        collectd.error("%s Found more then one phc2sys instance disciplining the clock" % PLUGIN)
+        collectd.error(
+            "%s Found more then one phc2sys instance disciplining the clock" % PLUGIN)
     return offset
 
 
@@ -1789,7 +1798,8 @@ def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
     phc2sys_clock_offset_ns = check_phc2sys_offset()
-    collectd.info("%s found phc2sys offset %s" % (PLUGIN, phc2sys_clock_offset_ns))
+    collectd.info("%s found phc2sys offset %s" %
+                  (PLUGIN, phc2sys_clock_offset_ns))
 
     set_utc_offset(instance)
     # If phc2sys offset is 0 or matches the ptp4l offset use it, if not it's a configuration error
@@ -2237,8 +2247,8 @@ def process_phc2sys_ha(ctrl):
     previous_state = ctrl.timing_instance.state['phc2sys_source_interface']
     ctrl.timing_instance.set_instance_state_data()
     phc2sys_source_interface = ctrl.timing_instance.state['phc2sys_source_interface']
-    phc2sys_instance_domain_num = ctrl.timing_instance.config['global']['domainNumber']
     phc2sys_lock_state_forced = ctrl.timing_instance.state['phc2sys_forced_lock']
+    phc2sys_valid_sources = ctrl.timing_instance.state['phc2sys_valid_sources']
 
     if phc2sys_source_interface is not None:
         active_source_priority = ctrl.timing_instance.config[phc2sys_source_interface][
@@ -2248,14 +2258,15 @@ def process_phc2sys_ha(ctrl):
         PLUGIN, phc2sys_source_interface, ctrl.timing_instance.instance_name))
 
     # phc2sys_clock_source_loss
-    if phc2sys_source_interface is None:
+    if phc2sys_valid_sources is None:
         # Raise source loss alarm
-        rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS, ctrl.timing_instance.instance_name,
+        rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS,
+                         ctrl.timing_instance.instance_name,
                          0)
         if rc is True:
             ctrl.phc2sys_clock_source_loss.raised = True
         if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            collectd.info("%s No clock source detected for phc2sys instance %s" % (
+            collectd.info("%s No clock sources meet selection threshold for instance %s" % (
                 PLUGIN, ctrl.timing_instance.instance_name))
         ctrl.log_throttle_count += 1
 
@@ -2325,14 +2336,30 @@ def process_phc2sys_ha(ctrl):
         # phc2sys_clock_source_no_lock
         for interface in ctrl.timing_instance.interfaces:
             phc2sys_ha_source_prc = False
+            domain_number = None
+            max_gm_clockClass = \
+                ctrl.timing_instance.config['global'].get(
+                    'ha_max_gm_clockClass', '6')
             interface_uds_addr = ctrl.timing_instance.config[interface].get(
                 'ha_uds_address', None)
+
+            # Get the domain number for the interface ptp instance, check global domain if not
+            # configured
+            # If both interface and global domain number are not present, default to 0
+            if ctrl.timing_instance.config.has_section(phc2sys_source_interface):
+                domain_number = \
+                    ctrl.timing_instance.config[phc2sys_source_interface].get(
+                        'ha_domainNumber', None)
+            if domain_number is None:
+                domain_number = ctrl.timing_instance.config['global'].get(
+                    'domainNumber', '0')
+
             alarm_obj = get_alarm_object(
                 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK, interface)
             if interface_uds_addr:
                 data = subprocess.check_output(
                     [PLUGIN_STATUS_QUERY_EXEC, '-s', interface_uds_addr, '-d',
-                     phc2sys_instance_domain_num, '-u', '-b', '0',
+                     domain_number, '-u', '-b', '0',
                      'GET PARENT_DATA_SET']).decode()
                 # Save all parameters in an ordered dict
                 m = OrderedDict()
@@ -2347,7 +2374,7 @@ def process_phc2sys_ha(ctrl):
                             m[k] = v
                 try:
                     current_clock_class = m['gm.ClockClass']
-                    if current_clock_class == CLOCK_CLASS_6:
+                    if int(current_clock_class) <= int(max_gm_clockClass):
                         phc2sys_ha_source_prc = True
                 except KeyError:
                     collectd.info("%s Phc2sy instance %s source clock %s: unable to read clockClass"
