@@ -796,7 +796,11 @@ def clear_alarm(eid):
 #               True on Success
 #
 #####################################################################
-def raise_alarm(alarm_cause, source=None, data=0, alarm_object=None):
+def raise_alarm(alarm_cause,
+                source=None,
+                data=0,
+                alarm_object=None,
+                alarm_state=fm_constants.FM_ALARM_STATE_SET):
     """Assert a cause based PTP alarm"""
 
     collectd.debug("%s Raising Alarm %d" % (PLUGIN, alarm_cause))
@@ -864,7 +868,7 @@ def raise_alarm(alarm_cause, source=None, data=0, alarm_object=None):
     try:
         fault = fm_api.Fault(
             alarm_id=PLUGIN_ALARMID,
-            alarm_state=fm_constants.FM_ALARM_STATE_SET,
+            alarm_state=alarm_state,
             entity_type_id=fm_constants.FM_ENTITY_TYPE_HOST,
             entity_instance_id=alarm.eid,
             severity=alarm.severity,
@@ -2280,20 +2284,19 @@ def process_phc2sys_ha(ctrl):
 
         # phc2sys_clock_source_selection_change
         if phc2sys_source_interface != previous_state and previous_state is not None:
-            # Raise source change alarm
+            # Log an fm msg event for source selection change
+            # Use the 'msg' alarm state to generate an event log
+            # It is not necessary to persist an alarm for this change
             alarm_obj = get_alarm_object(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
                                          phc2sys_source_interface)
             rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
-                             phc2sys_source_interface, ctrl.timing_instance.instance_name)
+                             phc2sys_source_interface, ctrl.timing_instance.instance_name,
+                             alarm_state=fm_constants.FM_ALARM_STATE_MSG)
             if rc is True:
                 alarm_obj.raised = True
                 collectd.info("%s phc2sys instance %s clock source changed from %s to %s" % (
                     PLUGIN, ctrl.timing_instance.instance_name, previous_state,
                     phc2sys_source_interface))
-            # Clear immediately, we just want to log an event for source changes
-            if alarm_obj.raised is True:
-                if clear_alarm(alarm_obj.eid) is True:
-                    alarm_obj.raised = False
 
         # Check if phc2sys is force locked to a specific interface
         if active_source_priority == "254" or phc2sys_lock_state_forced == 'True':
