@@ -2349,9 +2349,9 @@ def process_phc2sys_ha(ctrl):
             # Get the domain number for the interface ptp instance, check global domain if not
             # configured
             # If both interface and global domain number are not present, default to 0
-            if ctrl.timing_instance.config.has_section(phc2sys_source_interface):
+            if ctrl.timing_instance.config.has_section(interface):
                 domain_number = \
-                    ctrl.timing_instance.config[phc2sys_source_interface].get(
+                    ctrl.timing_instance.config[interface].get(
                         'ha_domainNumber', None)
             if domain_number is None:
                 domain_number = ctrl.timing_instance.config['global'].get(
