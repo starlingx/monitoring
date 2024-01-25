@@ -191,6 +191,8 @@ CGU_PIN_RCLKB = 'C827_0-RCLKB'
 CGU_PIN_SMA1 = 'SMA1'
 CGU_PIN_SMA2 = 'SMA2/U.FL2'
 CGU_PIN_GNSS_1PPS = 'GNSS-1PPS'
+CGU_PIN_SMA_OUTPUT = 'output'
+
 VALID_CGU_PIN_NAMES = [
     CGU_PIN_SDP22,
     CGU_PIN_SDP20,
@@ -318,6 +320,7 @@ class PTP_ctrl_object:
         self.timing_instance = None
         self.phc2sys_ha_enabled = False
         self.prtc_present = False
+        self.dpll_pci_slots = []
         self.interface_list = []
         self.clock_ports = {}
 
@@ -353,6 +356,9 @@ PCI_SLOT_NAME = 'PCI_SLOT_NAME'
 
 # PTP crtl objects for each PTP instances
 ptpinstances = {}
+
+# Mapping of ptp interfaces to instances
+ptpinterfaces = {}
 
 # dpll status of each CGU input for GNSS
 dpll_status = {}
@@ -390,6 +396,8 @@ def print_alarm_object(o):
 
 
 def print_alarm_objects():
+    collectd.info("%s PTP Instances: %s" % (PLUGIN, ptpinstances))
+    collectd.info("%s PTP Interfaces: %s" % (PLUGIN, ptpinterfaces))
     for o in ALARM_OBJ_LIST:
         print_alarm_object(o)
 
@@ -944,7 +952,6 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
         ctrl.oot_alarm_object = o
 
         o = PTP_alarm_object(instance)
-        # Only applies to storage and worker nodes
         o.alarm = ALARM_CAUSE__NO_LOCK
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         o.reason = obj.hostname
@@ -956,28 +963,16 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
         ctrl.nolock_alarm_object = o
 
         o = PTP_alarm_object(interface)
-        # Only applies to storage and worker nodes
+        # Ts2phc allows only a single GNSS source, create a single alarm obj for it
         o.alarm = ALARM_CAUSE__GNSS_SIGNAL_LOSS
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
         o.reason = obj.hostname
         o.reason += ' GNSS signal loss'
         o.repair = 'Check network'
-        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
+        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=GNSS-signal-loss'
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
         ALARM_OBJ_LIST.append(o)
         ctrl.gnss_signal_loss_alarm_object = o
-
-        o = PTP_alarm_object(interface)
-        # Only applies to storage and worker nodes
-        o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname
-        o.reason += ' 1PPS signal loss'
-        o.repair = 'Check network'
-        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=signal-loss'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-        ALARM_OBJ_LIST.append(o)
-        ctrl.pps_signal_loss_alarm_object = o
 
         o = PTP_alarm_object(instance)
         # Clock source selection change
@@ -1031,65 +1026,84 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
 
         ptpinstances[instance] = ctrl
 
-    o = PTP_alarm_object(interface)
-    # Clock source selection change
-    o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE
-    o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
-    o.reason = obj.hostname
-    o.reason += ' phc2sys HA source selection algorithm selected new active source'
-    o.repair += 'Check network'
-    o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface\
-        + '.phc2sys=source-failover'
-    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
-    ALARM_OBJ_LIST.append(o)
+    if interface and not ptpinterfaces.get(interface, None):
+        # Create required interface based alarm objects for supplied interface
+        o = PTP_alarm_object(interface)
+        # 1-PPS signal loss
+        o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname
+        o.reason += ' 1PPS signal loss'
+        o.repair = 'Check network'
+        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=1PPS-signal-loss'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+        ALARM_OBJ_LIST.append(o)
 
-    o = PTP_alarm_object(interface)
-    # Source clock no lock
-    o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK
-    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-    o.reason = obj.hostname
-    o.reason += ' phc2sys HA source clock is not locked to a PRC'
-    o.repair += 'Check network and ptp4l configuration'
-    o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface + \
-        '.phc2sys=source-clock-no-prc-lock'
-    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-    ALARM_OBJ_LIST.append(o)
+        o = PTP_alarm_object(interface)
+        # Clock source selection change
+        o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE
+        o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
+        o.reason = obj.hostname
+        o.reason += ' phc2sys HA source selection algorithm selected new active source'
+        o.repair += 'Check network'
+        o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface\
+            + '.phc2sys=source-failover'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
+        ALARM_OBJ_LIST.append(o)
 
-    o = PTP_alarm_object(interface)
-    o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
-    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-    o.reason = obj.hostname + " '" + interface + "' does not support "
-    o.reason += PTP + ' Hardware timestamping'
-    o.repair = 'Check host hardware reference manual to verify PTP '
-    o.repair += 'Hardware timestamping is supported by this interface'
-    o.eid = obj.base_eid + '.ptp=' + interface
-    o.eid += '.unsupported=hardware-timestamping'
-    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-    ALARM_OBJ_LIST.append(o)
+        o = PTP_alarm_object(interface)
+        # Source clock no lock
+        o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname
+        o.reason += ' phc2sys HA source clock is not locked to a PRC'
+        o.repair += 'Check network and ptp4l configuration'
+        o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface + \
+            '.phc2sys=source-clock-no-prc-lock'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+        ALARM_OBJ_LIST.append(o)
 
-    o = PTP_alarm_object(interface)
-    o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
-    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-    o.reason = obj.hostname + " '" + interface + "' does not support "
-    o.reason += PTP + ' Software timestamping'
-    o.repair = 'Check host hardware reference manual to verify PTP '
-    o.repair += 'Software timestamping is supported by this interface'
-    o.eid = obj.base_eid + '.ptp=' + interface
-    o.eid += '.unsupported=software-timestamping'
-    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-    ALARM_OBJ_LIST.append(o)
+        o = PTP_alarm_object(interface)
+        o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname + " '" + interface + "' does not support "
+        o.reason += PTP + ' Hardware timestamping'
+        o.repair = 'Check host hardware reference manual to verify PTP '
+        o.repair += 'Hardware timestamping is supported by this interface'
+        o.eid = obj.base_eid + '.ptp=' + interface
+        o.eid += '.unsupported=hardware-timestamping'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+        ALARM_OBJ_LIST.append(o)
 
-    o = PTP_alarm_object(interface)
-    o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
-    o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-    o.reason = obj.hostname + " '" + interface + "' does not support "
-    o.reason += PTP + " Legacy timestamping"
-    o.repair = 'Check host hardware reference manual to verify PTP '
-    o.repair += 'Legacy or Raw Clock is supported by this host'
-    o.eid = obj.base_eid + '.ptp=' + interface
-    o.eid += '.unsupported=legacy-timestamping'
-    o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-    ALARM_OBJ_LIST.append(o)
+        o = PTP_alarm_object(interface)
+        o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname + " '" + interface + "' does not support "
+        o.reason += PTP + ' Software timestamping'
+        o.repair = 'Check host hardware reference manual to verify PTP '
+        o.repair += 'Software timestamping is supported by this interface'
+        o.eid = obj.base_eid + '.ptp=' + interface
+        o.eid += '.unsupported=software-timestamping'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+        ALARM_OBJ_LIST.append(o)
+
+        o = PTP_alarm_object(interface)
+        o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
+        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        o.reason = obj.hostname + " '" + interface + "' does not support "
+        o.reason += PTP + " Legacy timestamping"
+        o.repair = 'Check host hardware reference manual to verify PTP '
+        o.repair += 'Legacy or Raw Clock is supported by this host'
+        o.eid = obj.base_eid + '.ptp=' + interface
+        o.eid += '.unsupported=legacy-timestamping'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+        ALARM_OBJ_LIST.append(o)
+
+        # Add interface to ptpinterfaces dict if not present
+        ptpinterfaces[interface] = []
+
+    # Map instance to ptp interface
+    ptpinterfaces[interface].append(instance)
 
 
 #####################################################################
@@ -1346,7 +1360,11 @@ def read_ts2phc_config():
                         create_interface_alarm_objects(interface, instance)
                         ptpinstances[instance].instance_type = \
                             PTP_INSTANCE_TYPE_TS2PHC
+                        # Save the PCI slot for the ttyGNSS device
                         ptpinstances[instance].pci_slot_name = pci_slot
+                        # Add the PCI slot to list of dplls this instance owns
+                        ptpinstances[instance].dpll_pci_slots.append(pci_slot)
+                        # Initialize dpll fields
                         init_dpll_status(pci_slot)
                         ts2phc_source_interfaces[pci_slot] = pci_slot
                         ts2phc_instance_map[pci_slot] = instance
@@ -1361,13 +1379,18 @@ def read_ts2phc_config():
                         interface = line.split(']')[0].split('[')[1]
                         if interface and interface != 'global':
                             base_port = interface[:-1] + '0'
-                            secondary_ts2phc_interface = get_pci_slot(
+                            secondary_ts2phc_pci = get_pci_slot(
                                 base_port)
-                            if secondary_ts2phc_interface != pci_slot:
-                                ts2phc_source_interfaces[secondary_ts2phc_interface] = pci_slot
-                                ts2phc_instance_map[secondary_ts2phc_interface] = instance
-    collectd.debug("%s ts2phc_source_interfaces pci slots %s" %
-                   (PLUGIN, ts2phc_source_interfaces))
+                            if secondary_ts2phc_pci != pci_slot:
+                                ts2phc_source_interfaces[secondary_ts2phc_pci] = pci_slot
+                                ts2phc_instance_map[secondary_ts2phc_pci] = instance
+                                # Add the secondary PCI slot to list of owned dplls
+                                ptpinstances[instance].dpll_pci_slots.append(
+                                    secondary_ts2phc_pci)
+                                # Initialize dpll fields
+                                init_dpll_status(secondary_ts2phc_pci)
+            collectd.info("%s Instance: %s DPLL PCI Slots: %s" % (
+                PLUGIN, instance, ptpinstances[instance].dpll_pci_slots))
 
 
 def read_clock_config():
@@ -1402,16 +1425,17 @@ def read_clock_config():
                             ptpinstances[instance].interface == interface):
                         # ignore the duplicate interface in the file
                         continue
-                    if interface != obj.capabilities['primary_nic']:
-                        create_interface_alarm_objects(interface, instance)
-                        ptpinstances[instance].instance_type = \
-                            PTP_INSTANCE_TYPE_CLOCK
-                        slot = get_pci_slot(interface)
-                        ptpinstances[instance].pci_slot_name = slot
-                        init_dpll_status(slot)
-                        found_port = True
-                        m = {}
-                        ptpinstances[instance].clock_ports[interface] = {}
+                    create_interface_alarm_objects(interface, instance)
+                    ptpinstances[instance].instance_type = \
+                        PTP_INSTANCE_TYPE_CLOCK
+                    slot = get_pci_slot(interface)
+                    ptpinstances[instance].pci_slot_name = slot
+                    # Add PCI slot to list of owned dplls
+                    ptpinstances[instance].dpll_pci_slots.append(slot)
+                    # Initialize dpll fields
+                    init_dpll_status(slot)
+                    found_port = True
+                    ptpinstances[instance].clock_ports[interface] = {}
             elif found_port:
                 match = re_dict.search(line)
                 if match:
@@ -1419,9 +1443,11 @@ def read_clock_config():
                     v = match.group(2)
                     m[k] = v
                     ptpinstances[instance].clock_ports[interface] = m
+                m = {}
     if found_port:
-        collectd.info("%s instance:%s ports:%s" %
-                      (PLUGIN, instance, ptpinstances[instance].clock_ports))
+        collectd.info("%s instance: %s ports: %s dpll slots: %s" %
+                      (PLUGIN, instance, ptpinstances[instance].clock_ports,
+                       ptpinstances[instance].dpll_pci_slots))
     else:
         # When no base_port is found, it means synce is disabled.
         # Remove the ptp instance as it does not require monitoring.
@@ -1977,9 +2003,9 @@ def process_ptp_synce(instance):
     if ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC:
         pci_slot = ctrl.pci_slot_name
         state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
-        collectd.info("%s Monitoring instance:%s interface: %s "
-                      "pin:%s states:%s " %
-                      (PLUGIN, instance, ctrl.interface, CGU_PIN_GNSS_1PPS,
+        collectd.info("%s Monitoring instance: %s interface: %s pci_slot: %s "
+                      "pin: %s states: %s " %
+                      (PLUGIN, instance, ctrl.interface, pci_slot, CGU_PIN_GNSS_1PPS,
                        dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]))
         check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
                          ctrl.interface, state)
@@ -1990,51 +2016,52 @@ def process_ptp_synce(instance):
             ctrl.log_throttle_count += 1
     elif ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
         for interface, pin_function in ctrl.clock_ports.items():
+            alarm_obj = get_alarm_object(ALARM_CAUSE__1PPS_SIGNAL_LOSS, interface)
             if len(pin_function) == 0:
                 # No pins are configured for the secondary NIC
                 # It checks for alarm with the state of SMA1, SMA2 or GNSS-1PPS pins.
-                pci_slot = ctrl.pci_slot_name
+                pci_slot = get_pci_slot(interface)
                 state = CLOCK_STATE_INVALID
-                if dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state'] != CLOCK_STATE_INVALID:
+                if dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['pps_cgu_state'] \
+                        != CLOCK_STATE_INVALID:
+                    state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['pps_cgu_state']
+                elif dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state'] != CLOCK_STATE_INVALID:
                     state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
                 elif dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state'] != CLOCK_STATE_INVALID:
                     state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
-                elif dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['pps_cgu_state'] \
-                        != CLOCK_STATE_INVALID:
-                    state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['pps_cgu_state']
-                collectd.info("%s Monitoring instance:%s interface: %s state:%s "
-                              % (PLUGIN, instance, ctrl.interface, state))
-                check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
+                collectd.info("%s Monitoring instance: %s interface: %s pci_slot: %s state: %s "
+                              % (PLUGIN, instance, ctrl.interface, pci_slot, state))
+                check_gnss_alarm(instance, alarm_obj,
                                  ctrl.interface, state)
             else:
                 # Pins are configured, check GNSS then SMA
-                pci_slot = ctrl.pci_slot_name
-                if interface == obj.capabilities['primary_nic']:
-                    # no need to check pins on the primary NIC, handled by ts2phc instance
-                    continue
+                pci_slot = get_pci_slot(interface)
                 if dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['pps_cgu_state'] != CLOCK_STATE_INVALID:
                     # NIC has a GNSS connection and it takes priority over SMA1/SMA2
                     pin = CGU_PIN_GNSS_1PPS
-                    collectd.info("%s Monitoring instance:%s interface: %s "
-                                  "pin:%s states:%s " %
-                                  (PLUGIN, instance, interface, pin,
+                    collectd.info("%s Monitoring instance: %s interface: %s pci_slot: %s "
+                                  "pin: %s states: %s " %
+                                  (PLUGIN, instance, interface, pci_slot, pin,
                                    dpll_status[pci_slot][pin]))
-                    check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
+                    check_gnss_alarm(instance,
+                                     alarm_obj,
                                      interface,
                                      dpll_status[pci_slot][pin]['pps_cgu_state'])
                 else:
                     # Check the SMA pins if they are configured
                     for key, function in pin_function.items():
-                        if key in pin_lookup.keys():
+                        # Do not care about pins configured for 'output' functionality
+                        if key in pin_lookup.keys() and function.lower() != CGU_PIN_SMA_OUTPUT:
                             pin = pin_lookup[key]
                         else:
                             # Do not care about the other pins
                             continue
-                        collectd.info("%s Monitoring instance:%s interface: %s "
-                                      "pin:%s states:%s " %
-                                      (PLUGIN, instance, interface, pin,
+                        collectd.info("%s Monitoring instance: %s interface: %s pci_slot: %s "
+                                      "pin: %s states: %s " %
+                                      (PLUGIN, instance, interface, pci_slot, pin,
                                        dpll_status[pci_slot][pin]))
-                        check_gnss_alarm(instance, ctrl.pps_signal_loss_alarm_object,
+                        check_gnss_alarm(instance,
+                                         alarm_obj,
                                          interface,
                                          dpll_status[pci_slot][pin]['pps_cgu_state'])
 
@@ -2231,7 +2258,9 @@ def read_func():
             check_ptp_regular(instance, ctrl, conf_file)
         elif (ptpinstances[instance].instance_type in
               [PTP_INSTANCE_TYPE_CLOCK, PTP_INSTANCE_TYPE_TS2PHC]):
-            read_dpll_status(ptpinstances[instance].pci_slot_name)
+            # Update the dpll state for each dpll owned by the instance
+            for dpll in ptpinstances[instance].dpll_pci_slots:
+                read_dpll_status(dpll)
 
         if obj.capabilities['primary_nic']:
             process_ptp_synce(instance)
