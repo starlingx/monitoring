@@ -2016,7 +2016,8 @@ def process_ptp_synce(instance):
             ctrl.log_throttle_count += 1
     elif ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
         for interface, pin_function in ctrl.clock_ports.items():
-            alarm_obj = get_alarm_object(ALARM_CAUSE__1PPS_SIGNAL_LOSS, interface)
+            alarm_obj = get_alarm_object(
+                ALARM_CAUSE__1PPS_SIGNAL_LOSS, interface)
             if len(pin_function) == 0:
                 # No pins are configured for the secondary NIC
                 # It checks for alarm with the state of SMA1, SMA2 or GNSS-1PPS pins.
@@ -2292,7 +2293,7 @@ def process_phc2sys_ha(ctrl):
 
     # phc2sys_clock_source_loss
     if phc2sys_valid_sources is None:
-        # Raise source loss alarm
+        # Raise source loss alarm, no sources meet selection threshold
         rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS,
                          ctrl.timing_instance.instance_name,
                          0)
@@ -2302,7 +2303,6 @@ def process_phc2sys_ha(ctrl):
             collectd.info("%s No clock sources meet selection threshold for instance %s" % (
                 PLUGIN, ctrl.timing_instance.instance_name))
         ctrl.log_throttle_count += 1
-
     else:
         # Handle clearing no source clock alarm
         if ctrl.phc2sys_clock_source_loss.raised is True:
@@ -2311,61 +2311,8 @@ def process_phc2sys_ha(ctrl):
                 collectd.info("%s Phc2sys instance %s source clock detected: %s" % (
                     PLUGIN, ctrl.timing_instance.instance_name, phc2sys_source_interface))
 
-        # phc2sys_clock_source_selection_change
-        if phc2sys_source_interface != previous_state and previous_state is not None:
-            # Log an fm msg event for source selection change
-            # Use the 'msg' alarm state to generate an event log
-            # It is not necessary to persist an alarm for this change
-            alarm_obj = get_alarm_object(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
-                                         phc2sys_source_interface)
-            rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
-                             phc2sys_source_interface, ctrl.timing_instance.instance_name,
-                             alarm_state=fm_constants.FM_ALARM_STATE_MSG)
-            if rc is True:
-                alarm_obj.raised = True
-                collectd.info("%s phc2sys instance %s clock source changed from %s to %s" % (
-                    PLUGIN, ctrl.timing_instance.instance_name, previous_state,
-                    phc2sys_source_interface))
-
-        # Check if phc2sys is force locked to a specific interface
-        if active_source_priority == "254" or phc2sys_lock_state_forced == 'True':
-            # raise clock source forced alarm
-            rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION,
-                             ctrl.timing_instance.instance_name, 0)
-            if rc is True:
-                ctrl.phc2sys_clock_source_forced_selection.raised = True
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s Phc2sys instance %s clock source slection has been overridden. "
-                              "Only interface %s will be used as source clock." %
-                              (PLUGIN, ctrl.timing_instance.instance_name,
-                               phc2sys_source_interface))
-            ctrl.log_throttle_count += 1
-        elif ctrl.phc2sys_clock_source_forced_selection.raised is True:
-            if clear_alarm(ctrl.phc2sys_clock_source_forced_selection.eid) is True:
-                ctrl.phc2sys_clock_source_forced_selection.raised = False
-                collectd.info("%s Phc2sys instance %s automatic clock source selection enabled." % (
-                    PLUGIN, ctrl.timing_instance.instance_name))
-
-        # phc2sys_clock_source_low_priority
-        if int(active_source_priority) < ctrl.timing_instance.state['highest_source_priority']:
-            rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOW_PRIORITY,
-                             ctrl.timing_instance.instance_name, phc2sys_source_interface)
-            if rc is True:
-                ctrl.phc2sys_clock_source_low_priority.raised = True
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s Phc2sys instance %s operating with lower priority source: %s"
-                              % (PLUGIN, ctrl.timing_instance.instance_name,
-                                 phc2sys_source_interface))
-            ctrl.log_throttle_count += 1
-        elif ctrl.phc2sys_clock_source_low_priority.raised is True:
-            if clear_alarm(ctrl.phc2sys_clock_source_low_priority.eid) is True:
-                ctrl.phc2sys_clock_source_low_priority.raised = False
-                collectd.info("%s Phc2sys instance %s is using the highest priority clock source %s"
-                              % (
-                                  PLUGIN, ctrl.timing_instance.instance_name,
-                                  phc2sys_source_interface))
-
         # phc2sys_clock_source_no_lock
+        # Check the configured interfaces for their lock state
         for interface in ctrl.timing_instance.interfaces:
             phc2sys_ha_source_prc = False
             domain_number = None
@@ -2434,6 +2381,63 @@ def process_phc2sys_ha(ctrl):
                         collectd.info(
                             "%s Phc2sys instance %s source clock %s is now locked to a PRC" %
                             (PLUGIN, ctrl.timing_instance.instance_name,
+                             phc2sys_source_interface))
+
+    # phc2sys_clock_source_selection_change
+    if phc2sys_source_interface != previous_state and previous_state is not None:
+        # Log an fm msg event for source selection change
+        # Use the 'msg' alarm state to generate an event log
+        # It is not necessary to persist an alarm for this change
+        alarm_obj = get_alarm_object(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
+                                     phc2sys_source_interface)
+        rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE,
+                         phc2sys_source_interface, ctrl.timing_instance.instance_name,
+                         alarm_state=fm_constants.FM_ALARM_STATE_MSG)
+        if rc is True:
+            alarm_obj.raised = True
+            collectd.info("%s phc2sys instance %s clock source changed from %s to %s" % (
+                PLUGIN, ctrl.timing_instance.instance_name, previous_state,
+                phc2sys_source_interface))
+        # Clear low priority alarm in order to re-evaluate the new source
+        if ctrl.phc2sys_clock_source_low_priority.raised is True:
+            if clear_alarm(ctrl.phc2sys_clock_source_low_priority.eid) is True:
+                ctrl.phc2sys_clock_source_low_priority.raised = False
+
+    # Check if phc2sys is force locked to a specific interface
+    if active_source_priority == "254" or phc2sys_lock_state_forced == 'True':
+        # raise clock source forced alarm
+        rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION,
+                         ctrl.timing_instance.instance_name, 0)
+        if rc is True:
+            ctrl.phc2sys_clock_source_forced_selection.raised = True
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info("%s Phc2sys instance %s clock source selection has been overridden. "
+                          "Only interface %s will be used as source clock." %
+                          (PLUGIN, ctrl.timing_instance.instance_name,
+                           phc2sys_source_interface))
+        ctrl.log_throttle_count += 1
+    elif ctrl.phc2sys_clock_source_forced_selection.raised is True:
+        if clear_alarm(ctrl.phc2sys_clock_source_forced_selection.eid) is True:
+            ctrl.phc2sys_clock_source_forced_selection.raised = False
+            collectd.info("%s Phc2sys instance %s automatic clock source selection enabled." % (
+                PLUGIN, ctrl.timing_instance.instance_name))
+
+    # phc2sys_clock_source_low_priority
+    if int(active_source_priority) < ctrl.timing_instance.state['highest_source_priority']:
+        rc = raise_alarm(ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOW_PRIORITY,
+                         ctrl.timing_instance.instance_name, phc2sys_source_interface)
+        if rc is True:
+            ctrl.phc2sys_clock_source_low_priority.raised = True
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info("%s Phc2sys instance %s operating with lower priority source: %s"
+                          % (PLUGIN, ctrl.timing_instance.instance_name,
+                             phc2sys_source_interface))
+        ctrl.log_throttle_count += 1
+    elif ctrl.phc2sys_clock_source_low_priority.raised is True:
+        if clear_alarm(ctrl.phc2sys_clock_source_low_priority.eid) is True:
+            ctrl.phc2sys_clock_source_low_priority.raised = False
+            collectd.info("%s Phc2sys instance %s is using the highest priority clock source %s"
+                          % (PLUGIN, ctrl.timing_instance.instance_name,
                              phc2sys_source_interface))
 
 
