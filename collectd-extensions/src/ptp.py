@@ -1904,7 +1904,7 @@ def check_clock_class(instance):
                  '-' + instance + '.conf')
 
     data = query_pmc(instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
-    current_clock_class = data['clockClass']
+    current_clock_class = data.get('clockClass', CLOCK_CLASS_248)
 
     # Determine the base port of the NIC from the interface
     base_port = ctrl.interface[:-1] + '0'
