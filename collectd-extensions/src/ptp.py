@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2023 Wind River Systems, Inc.
+# Copyright (c) 2019-2024 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -2254,7 +2254,7 @@ def read_func():
             ctrl.log_throttle_count = 0
 
         # Handle other instance types
-        if not obj.capabilities['primary_nic'] and ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
             # Non-synce PTP
             check_ptp_regular(instance, ctrl, conf_file)
         elif (ptpinstances[instance].instance_type in
@@ -2489,9 +2489,25 @@ def check_ptp_regular(instance, ctrl, conf_file):
             collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
             gm_identity = line.split()[1]
 
+    # Let's read the clock state, GNSS 1PPS and SMA1
+    #
+    # Determine the base port of the NIC from the interface, and
+    # get state for primary or secondary NIC.
+    base_port = ctrl.interface[:-1] + '0'
+    pci_slot = get_pci_slot(base_port)
+    gnss_state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
+    sma1_state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
+    gnss_locked = gnss_state in [CLOCK_STATE_LOCKED,
+                                 CLOCK_STATE_LOCKED_HO_ACK,
+                                 CLOCK_STATE_LOCKED_HO_ACQ]
+    sma1_locked = sma1_state in [CLOCK_STATE_LOCKED,
+                                 CLOCK_STATE_LOCKED_HO_ACK,
+                                 CLOCK_STATE_LOCKED_HO_ACQ]
+    clock_locked = gnss_locked or sma1_locked
+
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
-    if my_identity == gm_identity or port_locked is False:
+    if (my_identity == gm_identity or port_locked is False) and not clock_locked:
         if ctrl.nolock_alarm_object.raised is False:
             if raise_alarm(ALARM_CAUSE__NO_LOCK, instance, 0) is True:
                 ctrl.nolock_alarm_object.raised = True
@@ -2549,7 +2565,7 @@ def check_ptp_regular(instance, ctrl, conf_file):
             severity = fm_constants.FM_ALARM_SEVERITY_MINOR
 
         # Handle clearing of Out-Of-Tolerance alarm
-        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR or clock_locked:
             if ctrl.oot_alarm_object.raised is True:
                 if clear_alarm(ctrl.oot_alarm_object.eid) is True:
                     ctrl.oot_alarm_object.severity = \
