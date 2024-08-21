@@ -1337,6 +1337,25 @@ def find_interface_from_pciaddr(pciaddr):
     return dirs[0]
 
 
+def convert_nmea_serialport_to_pci_addr(nmea_serialport):
+    # Remove the /dev portion of the path
+    pci_addr = None
+    serialport = nmea_serialport.split('/')[2]
+    uevent_file = '/sys/class/gnss/' + serialport + '/device/uevent'
+
+    try:
+        with open(uevent_file, 'r') as file:
+            for line in file:
+                if 'PCI_SLOT_NAME' in line:
+                    # Regex split in '=' sign
+                    pci_addr = re.split('=', line)[1].strip('\n')
+                    break
+    except (FileNotFoundError, PermissionError) as err:
+        collectd.warning("%s Invalid NMEA serial port: %s" %
+                         (PLUGIN, err))
+    return pci_addr
+
+
 def read_ts2phc_config():
     """read ts2phc conf files"""
     filenames = glob(PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN)
@@ -1352,10 +1371,7 @@ def read_ts2phc_config():
                 for line in infile:
                     if 'ts2phc.nmea_serialport' in line:
                         tty = line.split(' ')[1].strip('\n')
-                        bus_device = tty.split('_')[1]
-                        function = tty.split('_')[2]
-                        pci_slot = '0000:' + bus_device[0:2] + ':' + \
-                                   bus_device[2:4] + '.' + function
+                        pci_slot = convert_nmea_serialport_to_pci_addr(tty)
                         interface = find_interface_from_pciaddr(pci_slot)
                         create_interface_alarm_objects(interface, instance)
                         ptpinstances[instance].instance_type = \
