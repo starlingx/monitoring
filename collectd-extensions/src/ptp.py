@@ -1844,8 +1844,6 @@ def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
     ctrl = ptpinstances[instance]
     phc2sys_clock_offset_ns = check_phc2sys_offset()
-    collectd.info("%s found phc2sys offset %s" %
-                  (PLUGIN, phc2sys_clock_offset_ns))
 
     set_utc_offset(instance)
     # If phc2sys offset is 0 or matches the ptp4l offset use it, if not it's a configuration error
@@ -1858,7 +1856,10 @@ def check_time_drift(instance, gm_identity=None):
             collectd.error("%s phc2sys offset (%s) does not match ptp4l offset (%s)" %
                            (PLUGIN, phc2sys_clock_offset_ns, ctrl.ptp4l_utc_offset_nanoseconds))
 
-    collectd.info("%s using utc offset %s" % (PLUGIN, utc_offset_ns))
+    if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+        collectd.info("%s found phc2sys offset %s" % (PLUGIN, phc2sys_clock_offset_ns))
+        collectd.info("%s using utc offset %s" % (PLUGIN, utc_offset_ns))
+    ctrl.log_throttle_count += 1
 
     data = subprocess.check_output(
         [PHC_CTL, ctrl.interface, '-q', 'cmp']).decode()
@@ -2511,15 +2512,36 @@ def check_ptp_regular(instance, ctrl, conf_file):
     # get state for primary or secondary NIC.
     base_port = ctrl.interface[:-1] + '0'
     pci_slot = get_pci_slot(base_port)
-    gnss_state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
-    sma1_state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
-    gnss_locked = gnss_state in [CLOCK_STATE_LOCKED,
-                                 CLOCK_STATE_LOCKED_HO_ACK,
-                                 CLOCK_STATE_LOCKED_HO_ACQ]
-    sma1_locked = sma1_state in [CLOCK_STATE_LOCKED,
-                                 CLOCK_STATE_LOCKED_HO_ACK,
-                                 CLOCK_STATE_LOCKED_HO_ACQ]
-    clock_locked = gnss_locked or sma1_locked
+    clock_locked = False
+    if dpll_status.get(pci_slot):
+        try:
+            gnss_state = dpll_status[pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
+        except KeyError as err:
+            collectd.debug(
+                "%s KeyError in dpll_status, %s not found" % (PLUGIN, err))
+            gnss_state = None
+        try:
+            sma1_state = dpll_status[pci_slot][CGU_PIN_SMA1]['pps_cgu_state']
+        except KeyError as err:
+            collectd.debug(
+                "%s KeyError in dpll_status %s, not found" % (PLUGIN, err))
+            sma1_state = None
+        try:
+            sma2_state = dpll_status[pci_slot][CGU_PIN_SMA2]['pps_cgu_state']
+        except KeyError as err:
+            collectd.debug(
+                "%s KeyError in dpll_status, %s not found" % (PLUGIN, err))
+            sma2_state = None
+        gnss_locked = gnss_state in [CLOCK_STATE_LOCKED,
+                                     CLOCK_STATE_LOCKED_HO_ACK,
+                                     CLOCK_STATE_LOCKED_HO_ACQ]
+        sma1_locked = sma1_state in [CLOCK_STATE_LOCKED,
+                                     CLOCK_STATE_LOCKED_HO_ACK,
+                                     CLOCK_STATE_LOCKED_HO_ACQ]
+        sma2_locked = sma2_state in [CLOCK_STATE_LOCKED,
+                                     CLOCK_STATE_LOCKED_HO_ACK,
+                                     CLOCK_STATE_LOCKED_HO_ACQ]
+        clock_locked = gnss_locked or sma1_locked or sma2_locked
 
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
