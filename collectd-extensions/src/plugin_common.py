@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2022 Wind River Systems, Inc.
+# Copyright (c) 2019-2024 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -40,6 +40,7 @@ MIN_AUDITS_B4_FIRST_QUERY = 2
 K8S_MODULE_MAJOR_VERSION = int(K8S_MODULE_VERSION.split('.')[0])
 KUBELET_CONF = '/etc/kubernetes/kubelet.conf'
 SSL_TLS_SUPPRESS = True
+K8S_TIMEOUT = 2
 
 # Standard units' conversion parameters (mebi, kibi)
 # Reference: https://en.wikipedia.org/wiki/Binary_prefix
@@ -83,9 +84,11 @@ GROUPS_AGGREGATED = [GROUP_PLATFORM, GROUP_BASE, GROUP_K8S_SYSTEM,
                      GROUP_K8S_ADDON, GROUP_CONTAINERS]
 
 # First level cgroups -- these are the groups we know about
+CGROUP_INIT = 'init.scope'
 CGROUP_SYSTEM = 'system.slice'
 CGROUP_USER = 'user.slice'
 CGROUP_MACHINE = 'machine.slice'
+CGROUP_K8SPLATFORM = 'k8splatform.slice'
 CGROUP_DOCKER = 'docker'
 CGROUP_K8S = K8S_ROOT
 
@@ -98,7 +101,8 @@ CONTAINERS_CGROUPS = [CGROUP_SYSTEM_CONTAINERD, CGROUP_SYSTEM_DOCKER,
                       CGROUP_SYSTEM_KUBELET, CGROUP_SYSTEM_ETCD]
 
 # Groupings by first level cgroup
-BASE_GROUPS = [CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER]
+BASE_GROUPS = [CGROUP_INIT, CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER,
+               CGROUP_K8SPLATFORM]
 BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
 
 # Groupings of pods by kubernetes namespace
@@ -750,18 +754,28 @@ class K8sClient(object):
                 # Debian
                 # kubectl --kubeconfig KUBELET_CONF get pods --all-namespaces \
                 # --selector spec.nodeName=the_host -o json
-                kube_results = subprocess.check_output(
-                    ['kubectl', '--kubeconfig', KUBELET_CONF,
-                     '--field-selector', field_selector,
-                     'get', 'pods', '--all-namespaces',
-                     '-o', 'json'
-                     ]).decode()
-                json_results = json.loads(kube_results)
+                try:
+                    kube_results = subprocess.check_output(
+                        ['kubectl', '--kubeconfig', KUBELET_CONF,
+                         '--field-selector', field_selector,
+                         'get', 'pods', '--all-namespaces',
+                         '-o', 'json',
+                         ], timeout=K8S_TIMEOUT).decode()
+                    json_results = json.loads(kube_results)
+                except subprocess.TimeoutExpired:
+                    collectd.error('kube_get_local_pods: Timeout')
+                    return []
+                except json.JSONDecodeError as e:
+                    collectd.error('kube_get_local_pods: Could not parse json output, error=%s' % (str(e)))
+                    return []
+                except subprocess.CalledProcessError as e:
+                    collectd.error('kube_get_local_pods: Could not get pods, error=%s' % (str(e)))
+                    return []
                 # convert the items to: kubernetes.client.V1Pod
                 api_items = [self._as_kube_pod(x) for x in json_results['items']]
                 return api_items
         except Exception as err:
-            collectd.error("kube_get_local_pods: %s" % (err))
+            collectd.error("kube_get_local_pods: error=%s" % (str(err)))
             raise
 
 
@@ -783,7 +797,8 @@ class POD_object:
         """Check whether pod contains platform namespace or platform label"""
 
         if (self.namespace in K8S_NAMESPACE_SYSTEM
-                or self.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM):
+                or (self.labels is not None and
+                    self.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM)):
             return True
         return False
 

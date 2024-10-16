@@ -1,3 +1,10 @@
+monitor-tools (1.0-2) unstable; urgency=medium
+
+  * Update schedtop to display cgroups from systemd services and Kubernetes pods
+  * Add watchpids to find created processes, typically short-lived
+
+ -- Jim Gauld <James.Gauld@windriver.com>  Thu, 12 Sep 2024 09:54:55 -0400
+
 monitor-tools (1.0-1) unstable; urgency=medium
 
   * Initial release.

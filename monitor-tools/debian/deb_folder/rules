@@ -10,5 +10,8 @@ override_dh_install:
 	install -p memtop $(ROOT)/usr/bin
 	install -p schedtop $(ROOT)/usr/bin
 	install -p occtop $(ROOT)/usr/bin
+	install -p k8smetrics $(ROOT)/usr/bin
+	install -p portscanner $(ROOT)/usr/bin
+	install -p watchpids $(ROOT)/usr/bin
 
 	dh_install

@@ -1,6 +1,6 @@
 ---
 debname: monitor-tools
-debver: 1.0-1
+debver: 1.0-2
 src_path: scripts
 revision:
   dist: $STX_DIST

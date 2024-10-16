@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+########################################################################
+#
+# Copyright (c) 2024 Wind River Systems, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+########################################################################
+
+import argparse
+import psutil
+from psutil._common import addr
+from datetime import datetime, timedelta
+import logging
+import logging.handlers
+import time
+import os
+import sys
+import time
+
+LOG = logging.getLogger(__name__)
+
+# Global variables
+seen_connections = dict()
+seen_local_ports = dict()
+
+def connections_summary():
+    # Print overall connections summary
+    sorted_dict = sorted(seen_connections.items(), key=lambda item: item[1])
+    sorted_dict = reversed(sorted_dict)
+    print('\nSUMMARY: Total connections')
+    for key, value in sorted_dict:
+        print("%7d %s" % (value, key))
+
+def portscan(args=None):
+
+    match_status = ['ESTABLISHED']
+
+    LOG.info("Scanning for connections on port:%s, matching status:%s, for %d minutes.",
+        match_status, args.port, args.duration_min)
+
+    now = datetime.now()
+    start_time = now
+    while now - start_time < timedelta(minutes=args.duration_min):
+        now = datetime.now()
+
+        try:
+            connections = psutil.net_connections(kind='tcp')
+        except psutil.Error as error:
+            LOG.error("Error: %s", str(error))
+            connections = []
+            time.sleep(1)
+
+        matches = []
+        for conn in connections:
+            if (isinstance(conn.raddr, addr) and
+                (conn.raddr.port == args.port) and
+                (any(s == conn.status for s in match_status)) and
+                str(conn.laddr.port) + str(conn.pid) not in seen_local_ports):
+                local_port_pid = str(conn.laddr.port) + str(conn.pid)
+                seen_local_ports[local_port_pid] = seen_local_ports.get(local_port_pid, 0) + 1
+                matches.append(conn)
+
+        if matches:
+            tstamp = now.strftime("%Y-%m-%d %H:%M:%S")
+            for conn in matches:
+                try:
+                    p = psutil.Process(pid=conn.pid)
+                except psutil.Error as error:
+                    LOG.debug("Error: %s", str(error))
+                    continue
+
+                d = p.as_dict()
+                pid = conn.pid
+                r_ip = conn.raddr.ip
+
+                new_match = False
+                summary_key = '{} {} {} {}'.format(
+                    r_ip, pid, d['name'],' '.join(d['cmdline']))
+                if summary_key not in seen_connections:
+                    new_match = True
+
+                # Increment connection counts based on unique key
+                seen_connections[summary_key] = seen_connections.get(summary_key, 0) + 1
+
+                # d['environ'] -- too verbose
+                if new_match:
+                    print("{} Local:{}:{} Remote: {}:{} status:{} ppid:{}, pid:{}, threads:{}, user:{}, name:{}, cmdline:{}".format(
+                        tstamp,
+                        conn.laddr.ip, conn.laddr.port,
+                        conn.raddr.ip, conn.raddr.port,
+                        conn.status,
+                        d['ppid'], d['pid'], d['num_threads'],
+                        d['username'], d['name'],' '.join(d['cmdline'])))
+
+        time.sleep(args.delay)
+
+def main():
+    """Main program."""
+
+    # Instantiate the parser
+    parser = argparse.ArgumentParser(
+        description='Scan processes matching net_connection port')
+
+    # Optional argument
+    parser.add_argument('--duration_min', type=int, default=5,
+                        help='duration to collect in minutes')
+    parser.add_argument('--port', type=int, default=5000,
+                        help='specific port to scan')
+    parser.add_argument('--delay', type=float, default=0.2,
+                        help='scanning delay in seconds')
+    parser.add_argument('--debug', action='store_true',
+                        help='enable tool debug')
+
+    args = parser.parse_args()
+
+    # Configure logging
+    if args.debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    out_hdlr = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter(
+        '%(asctime)s %(process)s %(levelname)s %(module)s: %(message)s')
+    out_hdlr.setFormatter(formatter)
+    out_hdlr.setLevel(level)
+    LOG.addHandler(out_hdlr)
+    LOG.setLevel(level)
+
+    # Limit access of this tool.
+    if os.geteuid() != 0:
+        LOG.error('Require sudo/root.')
+        sys.exit(1)
+
+    try:
+        ret = portscan(args=args)
+        connections_summary()
+        sys.exit(ret)
+
+    except KeyboardInterrupt as e:
+        LOG.info('caught: %r, shutting down', e)
+        connections_summary()
+        sys.exit(0)
+
+    except IOError:
+        sys.exit(0)
+
+    except Exception as e:
+        LOG.error('exception: %r', e, exc_info=1)
+        sys.exit(-4)
+
+if __name__ == '__main__':
+    main()

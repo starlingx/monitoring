@@ -1,0 +1,861 @@
+#!/usr/bin/perl
+########################################################################
+#
+# Copyright (c) 2015-2024 Wind River Systems, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+########################################################################
+#
+# Description:
+#  This displays process calling tree information for newly created
+#  processess.
+#
+# Usage: watchpids OPTIONS
+#  [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]
+#  [--help]
+
+## TODO: JGAULD
+# --tids
+# --tree | --forest
+# --simple
+# --exclude=name
+# --filter=affinity mask  (TBD.. eg, 0x1000001 )
+
+use strict;
+use warnings;
+use Data::Dumper;
+use POSIX qw(uname strftime);
+use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC CLOCK_REALTIME);
+use Benchmark ':hireswallclock';
+use Carp qw(croak carp);
+use Math::BigInt;
+use File::Find ();
+
+# Define toolname
+our $TOOLNAME = "watchpids";
+our $VERSION  = "0.1";
+
+# Constants
+use constant SI_k => 1.0E3;
+use constant SI_M => 1.0E6;
+use constant SI_G => 1.0E9;
+use constant Ki => 1024.0;
+use constant Mi => 1024.0*1024.0;
+use constant Gi => 1024.0*1024.0*1024.0;
+
+# Globals
+our %opt_V = ();
+our %opt_P = ();
+our %percpu_0 = ();
+our %percpu_1 = ();
+our %task_0 = ();
+our %task_1 = ();
+our %task_n = ();
+our %tids_0 = ();
+our %tids_1 = ();
+our %tids_w = ();
+our %loadavg = ();
+our $tm_0 = ();
+our $tm_1 = ();
+our $tr_0 = ();
+our $tr_1 = ();
+our $tm_elapsed = ();
+our $tr_elapsed = ();
+our $tm_final = ();
+our $uptime = ();
+our $num_cpus = 1;
+our $affinity_mask = Math::BigInt->new('0');
+our $w_aff = 10;
+our $num_tasks = 0;
+our $num_blk = 0;
+our $num_state_D = 0;
+our $USER_HZ = 100; # no easy way to get this
+our $CLOCK_NS = SI_G / $USER_HZ;
+our $print_host = 1;
+
+our @cgroup_procs_paths = ();
+our @cgroup_procs_match = ();
+our @cgroup_tids = ();
+
+
+# Argument list parameters
+our ($arg_debug,
+     $arg_delay,
+     $arg_repeat,
+     $arg_period,
+     $arg_tids,
+     ) = ();
+
+#-------------------------------------------------------------------------------
+# MAIN Program
+#-------------------------------------------------------------------------------
+my $ONE_BILLION = 1.0E9;
+my $MIN_DELAY = 0.001;
+my $MAX_DELAY = 0.001;
+
+# benchmark variables
+my ($bd, $b0, $b1);
+my @policies = ('OT', 'FF', 'RR', 'BA', 'ID', 'UN', 'UN');
+
+my @state_list = (
+  'pid', 'ppid', 'state', 'cgroup', 'comm', 'cmdline', 'affinity',
+  'VmSize', 'VmRSS', 'start_time',
+  'nice', 'policy', 'priority', 'rt_priority', 'task_cpu'
+);
+
+# Autoflush output
+select(STDERR);
+$| = 1;
+select(STDOUT); # default
+$| = 1;
+
+# Parse input arguments and print tool usage if necessary
+&parse_watchpids_args(
+  \$::arg_debug,
+  \$::arg_delay,
+  \$::arg_repeat,
+  \$::arg_period,
+  \$::arg_tids,
+);
+
+# Check for root user
+if ($>) {
+  warn "$::TOOLNAME: requires root/sudo.\n";
+  exit 1;
+}
+
+# Print out some debugging information
+if (defined $::arg_debug) {
+  $Data::Dumper::Indent = 1;
+}
+
+# Print out selected options
+printf "selected options: delay = %.3fs, repeat = %d, tids = %s\n",
+  $::arg_delay, $::arg_repeat, $::arg_tids ? 'true' : 'false';
+
+# Capture timestamp
+$b0 = new Benchmark;
+
+# Get number of logical cpus
+&get_num_logical_cpus(\$::num_cpus);
+$::affinity_mask = Math::BigInt->new('0');
+for (my $i=0; $i < $::num_cpus; $i++) {
+  my $y = Math::BigInt->new('1');
+  $y->blsft($i);
+  $::affinity_mask->bior($y);
+}
+$w_aff = &max(length 'AFF', length $::affinity_mask->as_hex());
+
+# Find cgroup.proc paths matching specified cgroup patterns
+&find_matching_cgroup_procs(\@::cgroup_procs_match, \@::arg_watch_cgroup);
+for my $file (@::cgroup_procs_match) {
+  print "matched cgroup:", $file, "\n";
+}
+
+# Get current hires epoc timestamp
+$::tm_1 = clock_gettime(CLOCK_MONOTONIC);
+$::tr_1 = clock_gettime(CLOCK_REALTIME);
+$::tm_final = $::tm_1 + $::arg_delay*$::arg_repeat;
+
+# Set initial delay
+$::tm_elapsed = $::arg_delay;
+$MAX_DELAY = $::arg_delay + $MIN_DELAY;
+
+
+# Get list of pids and tids
+&get_tids(\%::tids_1, \$::arg_tids);
+
+# Get current scheduling info for all tids if new or requiring refresh
+&read_sched(\%::tids_1, \%::task_0, \%::task_1, \%::task_n);
+
+# Get current uptime
+&get_uptime(\$::uptime);
+
+# determine column sort order
+my ($s_key1, $s_key2, $s_key3) = ();
+($s_key1, $s_key2, $s_key3) = ('ppid', 'pid', 'tid');
+
+
+# Main loop
+REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
+
+  # copy all state variables
+  $::tm_0 = (); $::tr_0 = (); %::tids_0 = (); %::task_0 = ();
+  $::tm_0 = $::tm_1; $::tr_0 = $::tr_1;
+  foreach my $tid (keys %::tids_1)   { $::tids_0{$tid} = $::tids_1{$tid}; }
+
+  foreach my $tid (keys %::task_1)   {
+    # TODO: JGAULD -- problem with undefined affinity in task_0
+    ## TODO: BEGIN  if ($::task_1{$tid}{'age'} == 0) {
+      foreach my $var (keys %{$::task_1{$tid}}) {
+        $::task_0{$tid}{$var} = $::task_1{$tid}{$var};
+      }
+    ## TODO: END }
+  }
+
+  # estimate sleep delay to achieve desired interarrival by subtracting out
+  # the measured cpu runtime of the tool.
+  my $delay = $::arg_delay;
+  $delay = $MIN_DELAY if ($delay < $MIN_DELAY);
+  $delay = $MAX_DELAY if ($delay > $MAX_DELAY);
+  usleep( SI_M*$delay );
+
+  # Collect current state
+  $::tm_1 = (); $::tr_1 = (); %::percpu_1 = (); %::tids_1 = (); %::task_1 = (); %::task_n = ();
+  # Get current hires epoc timestamp
+  $::tm_1 = clock_gettime(CLOCK_MONOTONIC);
+  $::tr_1 = clock_gettime(CLOCK_REALTIME);
+
+  # Get list of pids and tids
+  &get_tids(\%::tids_1, \$::arg_tids);
+
+  # JGAULD: PRUNE LOGIC TBD
+
+  # Get current scheduling info for all tids if new or requiring refresh
+  &read_sched(\%::tids_1, \%::task_0, \%::task_1, \%::task_n);
+  my $num_new = keys %::task_n;
+
+  # Get current uptime
+  &get_uptime(\$::uptime);
+
+  # Delta calculation
+  $::tm_elapsed = $::tm_1 - $::tm_0;
+  $::tr_elapsed = $::tr_1 - $::tr_0;
+
+  # Print heading and column titles only if we have new pids
+  if ($num_new) {
+    # Print summary
+    &watchpids_header(
+      \$::tr_1,
+      \$::tm_elapsed,
+      \$::tr_elapsed,
+      \$::uptime,
+      \$::print_host
+    );
+
+    print "\n";
+
+    # Build up output line by specific area
+    my $L = ();
+    $L = '';
+    if ($::arg_tids) {
+      $L .= sprintf "%7s %7s %7s ", "PPID", "PID", "TID";
+    } else {
+      $L .= sprintf "%7s %7s ", "PPID", "PID";
+    }
+    $L .= sprintf "%1s %2s %*s %2s %3s %4s ",
+            "S", "P", $w_aff, "AFF", "PO", "NI", "PR";
+    $L .= sprintf "%-16s %-15s %s", "cgroup", "comm", "cmdline";
+    print $L, "\n";
+  }
+
+  # TODO: JGAULD : Use of uninitialized value in numeric comparison (<=>) at ./watchpids line 237.
+  #foreach my $tid (sort {($::task_1{$b}{$s_key1} <=> $::task_1{$a}{$s_key1}) or
+  #                       ($::task_1{$b}{$s_key2} <=> $::task_1{$a}{$s_key2}) or
+  #                       ($::task_1{$b}{$s_key3} <=> $::task_1{$a}{$s_key3})} keys %::task_n) {
+  # TODO: JGAULD make this configurable maybe? --long
+  my $COMMAND_LEN = 120;
+
+  # TODO: JGAULD -- add option for parent calling forest tree
+
+  foreach my $tid (keys %::task_n) {
+
+    # TODO: JGAULD : UNDEFINDED AFFINITY
+    my $aff =  Math::BigInt->new('0')->as_hex();
+    if (defined $::task_1{$tid}{'affinity'}) {
+      $aff = $::task_1{$tid}{'affinity'}->as_hex();
+    } else {
+        # TODO: JGAULD -- DEBUG -- only field is 'age', no other keys
+        if (defined $::arg_debug) {
+          print Data::Dumper->Dump([\%::task_1{$tid}], [qw(task_1)]);
+        }
+       next;
+    }
+
+    # Build up output line by specific area
+    my $L = ();
+    $L = '';
+    if ($::arg_tids) {
+      $L .= sprintf "%7d %7d %7d ",
+              $::task_1{$tid}{'ppid'}, $::task_1{$tid}{'pid'}, $tid;
+    } else {
+      $L .= sprintf "%7d %7d ",
+              $::task_1{$tid}{'ppid'}, $::task_1{$tid}{'pid'};
+    }
+    $L .= sprintf "%1s %2d %*s %2s %3d %4d ",
+            $::task_1{$tid}{'state'}, $::task_1{$tid}{'task_cpu'}, $w_aff, $aff,
+            $policies[$::task_1{$tid}{'policy'}], $::task_1{$tid}{'nice'},
+            $::task_1{$tid}{'priority'};
+    $L .= sprintf "%-16s %-15s %s",
+            substr($::task_1{$tid}{'cgroup'}, 0, 16),
+            substr($::task_1{$tid}{'comm'}, 0, 15),
+            substr($::task_1{$tid}{'cmdline'}, 0, $COMMAND_LEN);
+            # JGAULD: SHORTEN: $::task_1{$tid}{'cmdline'};
+
+    print $L, "\n";
+  }
+  if ($num_new) {
+    print "\n";
+  }
+
+  # exit repeat loop if we have exceeded overall time
+  last if ($::tm_1 > $::tm_final);
+
+} # REPEAT LOOP
+
+# Print that tool has finished
+print "done\n";
+
+# Capture timestamp and report delta
+$b1 = new Benchmark; $bd = Benchmark::timediff($b1, $b0);
+printf "processing time: %s\n", timestr($bd);
+exit 0;
+
+
+#-------------------------------------------------------------------------------
+# Convert a number to SI unit xxx.yyyG
+sub format_SI
+{
+  (my $value) = @_;
+  if ($value >= SI_G) {
+    return sprintf("%.3fG", $value/SI_G);
+  } elsif ($value >= SI_M) {
+    return sprintf("%.3fM", $value/SI_M);
+  } elsif ($value >= SI_k) {
+    return sprintf("%.3fk", $value/SI_k);
+  } else {
+    return sprintf("%.0f", $value);
+  }
+}
+
+# Convert to IEC binary unit xxx.yyyGi
+# Since underlying memory units are in pages, don't need decimals for Ki
+sub format_IEC
+{
+  (my $value) = @_;
+  if ($value >= Gi) {
+    return sprintf("%.3fGi", $value/Gi);
+  } elsif ($value >= Mi) {
+    return sprintf("%.3fMi", $value/Mi);
+  } elsif ($value >= Ki) {
+    return sprintf("%.0fKi", $value/Ki);
+  } else {
+    return sprintf("%.0f", $value);
+  }
+}
+
+# Determine max of array
+sub max {
+  my ($max, @vars) = @_;
+  for (@vars) {
+    $max = $_ if $_ > $max;
+  }
+  return $max;
+}
+
+# Determine tids and pid mapping by walking /proc/<pid>/task/<tid>
+sub get_tids
+{
+  (local *::tids, *::arg_tids) = @_;
+  my (@pids_, @tids_) = ();
+  my ($dh, $pid, $tid);
+
+  # get pid list
+  my $dir = '/proc';
+  opendir($dh, $dir) || croak "Cannot open directory: $dir ($!)";
+  @pids_ = grep { /^\d+$/ && -d "$dir/$_" } readdir($dh);
+  closedir $dh;
+
+  if ($::arg_tids) {
+      # get tid list
+      foreach $pid (@pids_) {
+        $dir = '/proc/' . $pid . '/task';
+        opendir(my $dh, $dir) || next;
+        @tids_ = grep { /^\d+$/ && -d "$dir/$_" } readdir($dh);
+        closedir $dh;
+        foreach $tid (@tids_) { $::tids{$tid} = $pid; }
+    }
+  } else {
+    foreach $pid (@pids_) { $::tids{$pid} = $pid; }
+  }
+}
+
+# Find module difficult, storing result in global variable
+sub wanted_cgroup_procs {
+  my $F = $File::Find::name;
+  if ($_ eq 'cgroup.procs') {
+    push @::cgroup_procs_paths, $F;
+  }
+}
+
+# Find cgroup.proc paths matching specified cgroup patterns
+sub find_matching_cgroup_procs
+{
+  (local *::cgroup_procs_match, local *::arg_watch_cgroup) = @_;
+
+  # Find all cgroup.procs paths for the pids cgroup controller
+  File::Find::find(\&wanted_cgroup_procs, '/sys/fs/cgroup/pids');
+}
+
+# Get array of tids corresponding to matching cgroups
+sub read_cgroup_procs
+{
+  (local *::tids, local *::cgroup_procs_match) = @_;
+  
+  my $tid = ();
+
+  # reset scheduling hi-water-marks by writing '0' to each task
+  foreach my $cgroup_procs (@::cgroup_procs_match) {
+    open(my $fh, $cgroup_procs) || goto SKIP_PROCS;
+    while (<$fh>) {
+      if (/^(\d+)$/) {
+        $tid = $1;
+        push @::tids, $tid;
+      }
+    }
+    close($fh);
+    SKIP_PROCS:;
+  }
+}
+
+# Parse cpu and scheduling info for each tid
+# - ignore the specific tid if there is incomplete data,
+#   (i.e., cannot obtain info because task has died,
+#    eg. missing ./stat, ./status, ./cmdline, ./wchan)
+#
+sub read_sched
+{
+  (local *::tids, local *::task_0, local *::task, local *::task_n) = @_;
+
+  # TODO: JGAULD -- consider changing this to global;
+  # maybe it has to be input option; very unlikely folks
+  # dynamically changing scheduling attributes
+  my $TASK_REFRESH_INTERVAL = 100;
+
+  %::task = ();
+  %::task_n = ();
+  foreach my $tid (keys %::tids) {
+    my ($fh, $file, $pid, $comm, $cmdline, $wchan, $id) = ();
+    my ($tpid, $tcomm, $state, $ppid, $pgrp, $sid,
+        $tty_nr, $tty_pgrp, $flags,
+        $min_flt, $cmin_flt, $maj_flt, $cmaj_flt,
+        $utime, $stime, $cutime, $cstime,
+        $priority, $nice, $num_threads,
+        $it_real_value, $start_time,
+        $vsize, $rss, $rsslim,
+        $start_code, $end_code, $start_stack, $esp, $eip,
+        $pending, $blocked, $sigign, $sigcatch, $wchan_addr,
+        $dum1, $dum2, $exit_signal, $task_cpu,
+        $rt_priority, $policy, $blkio_ticks,
+        $gtime, $cgtime,
+        $start_data, $end_data, $start_brk, $arg_start, $arg_end,
+        $env_start, $env_end, $exit_code) = ();
+    my ($cgroup) = ();
+    my ($VmSize, $VmRSS) = ();
+    my $Cpus_allowed = Math::BigInt->new('0');
+    my $affinity = Math::BigInt->new('0');
+
+    my ($status_valid, $cmdline_valid, $stat_valid, $cgroup_valid) = ();
+
+    $pid = $::tids{$tid};
+
+    # JGAULD: read stuff if new, else skip
+    my $bypass_refresh = 1;
+    if (exists $::task_0{$tid}) {
+      # Copy previous values.
+      foreach my $var (keys %{$::task_0{$tid}}) {
+        $::task{$tid}{$var} = $::task_0{$tid}{$var};
+      }
+      $::task{$tid}{'age'} = $::task_0{$tid}{'age'} + 1;
+      if ($::task{$tid}{'age'} == $TASK_REFRESH_INTERVAL) {
+        $::task{$tid}{'age'} = 0;
+        $bypass_refresh = 0;
+      }
+    } else {
+      $::task_n{$tid} = 1;
+      $::task{$tid}{'age'} = 0;
+      $bypass_refresh = 0;
+    }
+
+    next if ($bypass_refresh);
+
+    # parse /proc/<pid>/task/<tid>/status
+    $file = '/proc/' . $pid . '/task/' . $tid . '/status';
+    open($fh, $file) || next;
+    LOOP_STATUS: while (<$fh>) {
+      if (/^Name:\s+(.*)/) {
+        $comm = $1;
+      } elsif (/^State:\s+(\S+)/) {
+        $state = $1;
+      } elsif (/^PPid:\s+(\S+)/) {
+        $ppid = $1;
+      } elsif (/^VmSize:\s+(\S+)/) {
+        $VmSize = $1;
+      } elsif (/^VmRSS:\s+(\S+)/) {
+        $VmRSS = $1;
+      } elsif (/^Cpus_allowed:\s+([0]+,)*(\S+)/) {
+        my $h = $2; $h =~ tr/,/_/;
+        $Cpus_allowed = Math::BigInt->from_hex($h);
+        $affinity = $Cpus_allowed->band($::affinity_mask);
+        $status_valid = 1;
+        last LOOP_STATUS;
+      }
+    }
+    close($fh);
+
+    # parse /proc/<pid>/task/<tid>/cmdline
+    $file = '/proc/' . $pid . '/task/' . $tid . '/cmdline';
+    open($fh, $file) || next;
+    LOOP_CMDLINE: while (<$fh>) {
+      if (/^(.*)$/) {
+        $cmdline = $1;
+        $cmdline =~ s/\000/ /g;
+        $cmdline_valid = 1;
+        last LOOP_CMDLINE;
+      }
+    }
+    if (!$cmdline_valid) {
+      $cmdline_valid = 1;
+      $cmdline = $comm;
+    }
+    close($fh);
+
+
+    #Table 1-4: Contents of the stat files (as of 2.6.30-rc7)
+    #..............................................................................
+    # Field          Content
+    #  tpid          process id (or tid, if /proc/<pid>/task/<tid>/stat)
+    #  tcomm         filename of the executable
+    #  state         state (R is running, S is sleeping, D is sleeping in an
+    #                uninterruptible wait, Z is zombie, T is traced or stopped)
+    #  ppid          process id of the parent process
+    #  pgrp          pgrp of the process
+    #  sid           session id
+    #  tty_nr        tty the process uses
+    #  tty_pgrp      pgrp of the tty
+    #  flags         task flags
+    #  min_flt       number of minor faults
+    #  cmin_flt      number of minor faults with child's
+    #  maj_flt       number of major faults
+    #  cmaj_flt      number of major faults with child's
+    #  utime         user mode jiffies
+    #  stime         kernel mode jiffies
+    #  cutime        user mode jiffies with child's
+    #  cstime        kernel mode jiffies with child's
+    #  priority      priority level
+    #  nice          nice level
+    #  num_threads   number of threads
+    #  it_real_value	(obsolete, always 0)
+    #  start_time    time the process started after system boot
+    #  vsize         virtual memory size
+    #  rss           resident set memory size
+    #  rsslim        current limit in bytes on the rss
+    #  start_code    address above which program text can run
+    #  end_code      address below which program text can run
+    #  start_stack   address of the start of the main process stack
+    #  esp           current value of ESP
+    #  eip           current value of EIP
+    #  pending       bitmap of pending signals
+    #  blocked       bitmap of blocked signals
+    #  sigign        bitmap of ignored signals
+    #  sigcatch      bitmap of catched signals
+    #  wchan         address where process went to sleep
+    #  0             (place holder)
+    #  0             (place holder)
+    #  exit_signal   signal to send to parent thread on exit
+    #  task_cpu      which CPU the task is scheduled on
+    #  rt_priority   realtime priority
+    #  policy        scheduling policy (man sched_setscheduler)
+    #  blkio_ticks   time spent waiting for block IO
+    #  gtime         guest time of the task in jiffies
+    #  cgtime        guest time of the task children in jiffies
+    #  start_data    address above which program data+bss is placed
+    #  end_data      address below which program data+bss is placed
+    #  start_brk     address above which program heap can be expanded with brk()
+    #  arg_start     address above which program command line is placed
+    #  arg_end       address below which program command line is placed
+    #  env_start     address above which program environment is placed
+    #  env_end       address below which program environment is placed
+    #  exit_code     the thread's exit_code in the form reported by the waitpid system call
+
+    # parse /proc/<pid>/task/<tid>/stat
+    $file = '/proc/' . $pid . '/task/' . $tid . '/stat';
+    my $dummy;
+    open($fh, $file) || next;
+    $_ = <$fh>;
+    ($tpid, $tcomm, $dummy) = /^(\d+)\s+\((.*)\)\s+(.*)/;
+    ($state, $ppid, $pgrp, $sid,
+     $tty_nr, $tty_pgrp, $flags,
+     $min_flt, $cmin_flt, $maj_flt, $cmaj_flt,
+     $utime, $stime, $cutime, $cstime,
+     $priority, $nice, $num_threads,
+     $it_real_value, $start_time,
+     $vsize, $rss, $rsslim,
+     $start_code, $end_code, $start_stack, $esp, $eip,
+     $pending, $blocked, $sigign, $sigcatch, $wchan_addr,
+     $dum1, $dum2, $exit_signal, $task_cpu,
+     $rt_priority, $policy, $blkio_ticks, $gtime, $cgtime,
+     $start_data, $end_data, $start_brk, $arg_start, $arg_end,
+     $env_start, $env_end, $exit_code) = split(/\s+/, $dummy);
+    $stat_valid = 1;
+    close($fh);
+
+    #cat /proc/1/task/1/cgroup 
+    #12:cpu,cpuacct:/init.scope
+    #11:pids:/init.scope
+    #10:hugetlb:/
+    #9:memory:/init.scope
+    #8:rdma:/
+    #7:cpuset:/
+    #6:net_cls,net_prio:/
+    #5:devices:/init.scope
+    #4:blkio:/init.scope
+    #3:freezer:/
+    #2:perf_event:/
+    #1:name=systemd:/init.scope
+    #0::/init.scope
+
+    # Extract the pod id:
+    # /k8s-infra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
+    # Extract *.service or *.scope name:
+    # /system.slice/acpid.service
+    # /system.slice/system-ceph.slice/ceph-mds.scope
+
+    # parse /proc/<pid>/task/<tid>/cgroup
+    $file = '/proc/' . $pid . '/task/' . $tid . '/cgroup';
+    open($fh, $file) || next;
+    LOOP_CGROUP: while (<$fh>) {
+      if (/^\d+:(pids|cpu,cpuacct):(.*)/) {
+        $_ = $2;
+        if (/kubepods\/\w+\/(pod[a-z0-9-]+)\/\w+$/) {
+          $cgroup = $1;
+        } elsif (/\/([a-zA-Z0-9_-@:]+)\.\w+$/) {
+          $cgroup = $1;
+        } else {
+          $cgroup = '-'; # '-' looks prettier than '/'
+        }
+        $cgroup_valid = 1;
+        last LOOP_CGROUP;
+      }
+    }
+    close($fh);
+
+    # status
+    if (defined $status_valid) {
+      $::task{$tid}{'pid'}      = $pid;
+      $::task{$tid}{'comm'}     = $comm;
+      $::task{$tid}{'state'}    = $state;
+      $::task{$tid}{'ppid'}     = $ppid;
+      $::task{$tid}{'VmSize'}   = $VmSize;
+      $::task{$tid}{'VmRSS'}    = $VmRSS;
+      $::task{$tid}{'affinity'} = $affinity;
+    } else {
+      $::task{$tid}{'pid'}      = 0;
+      $::task{$tid}{'comm'}     = '-';
+      $::task{$tid}{'state'}    = '-';
+      $::task{$tid}{'ppid'}     = 0;
+      $::task{$tid}{'VmSize'}   = 0;
+      $::task{$tid}{'VmRSS'}    = 0;
+      $::task{$tid}{'affinity'} = Math::BigInt->new('0');
+    }
+
+    # cmdline
+    if (defined $cmdline_valid) {
+      $::task{$tid}{'cmdline'} = $cmdline;
+    } else {
+      $::task{$tid}{'cmdline'} = $comm;
+    }
+
+    # stat
+    if (defined $stat_valid) {
+      $::task{$tid}{'nice'}        = $nice;
+      $::task{$tid}{'policy'}      = $policy;
+      $::task{$tid}{'priority'}    = $priority;
+      $::task{$tid}{'rt_priority'} = $rt_priority;
+      $::task{$tid}{'start_time'}  = $start_time;
+      $::task{$tid}{'task_cpu'}    = $task_cpu;
+    } else {
+      $::task{$tid}{'nice'}        = 0;
+      $::task{$tid}{'policy'}      = '-';
+      $::task{$tid}{'priority'}    = 0;
+      $::task{$tid}{'rt_priority'} = 0;
+      $::task{$tid}{'start_time'}  = '';
+      $::task{$tid}{'task_cpu'}    = 0;
+    }
+
+    # cgroup
+    if (defined $cgroup_valid) {
+      $::task{$tid}{'cgroup'} = $cgroup;
+    } else {
+      $::task{$tid}{'cgroup'} = '-';
+    }
+
+  }
+}
+
+# Parse uptime from /proc/uptime
+sub get_uptime
+{
+  (local *::uptime) = @_;
+  $::uptime = 0.0;
+
+  my $file = '/proc/uptime';
+  open(my $fh, $file) || croak "Cannot open file: $file ($!)";
+  $_ = <$fh>;
+  if (/^(\S+)\s+\S+/) {
+    $::uptime = $1;
+  }
+  close($fh);
+}
+
+# Get number of online logical cpus
+sub get_num_logical_cpus {
+  (local *::num_cpus) = @_;
+  $::num_cpus = 0;
+
+  my $file = "/proc/cpuinfo";
+  open(my $fh, $file) || croak "Cannot open file: $file ($!)";
+  LOOP_CPUINFO: while (<$fh>) {
+    if (/^[Pp]rocessor\s+:\s\d+/) {
+      $::num_cpus++;
+    }
+  }
+  close($fh);
+}
+
+# Print header
+sub watchpids_header {
+  (local *::tr_1,
+   local *::tm_elapsed,
+   local *::tr_elapsed,
+   local *::uptime,
+  ) = @_;
+
+  # process epoch to get current timestamp
+  my $mm_in_s = 60;
+  my $hh_in_s = 60*60;
+  my $dd_in_s = 24*60*60;
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+  ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($::tr_1);
+  my $msec = 1000.0*($::tr_1 - int($::tr_1));
+
+  # convert uptime to elapsed <d>:<hh>:<mm>:<ss>
+  my ($up, $up_dd, $up_hh, $up_mm, $up_ss);
+  $up = int($::uptime);
+  $up_dd = int($up/$dd_in_s);
+  $up -= $dd_in_s*$up_dd;
+  $up_hh = int($up/$hh_in_s);
+  $up -= $hh_in_s*$up_hh;
+  $up_mm = int($up/$mm_in_s);
+  $up -= $mm_in_s*$up_mm;
+  $up_ss = $up;
+
+  #watchpids -- 2014/03/03 02:00:21.357  dt:2050.003 ms up:6:13:00:56
+  printf "%s %s -- ".
+    "%4d-%02d-%02d %02d:%02d:%02d.%03d  ".
+    "dt:%.3f ms  ".
+    "up:%d:%02d:%02d:%02d\n",
+    $::TOOLNAME, $::VERSION,
+    1900+$year, 1+$mon, $mday, $hour, $min, $sec, $msec,
+    $::tm_elapsed*1000.0,
+    $up_dd, $up_hh, $up_mm, $up_ss;
+}
+
+# Parse and validate command line arguments
+sub parse_watchpids_args {
+  (local *::arg_debug,
+   local *::arg_delay,
+   local *::arg_repeat,
+   local *::arg_period,
+   local *::arg_tids,
+  ) = @_;
+
+  # Local variables
+  my ($fail, $arg_help);
+
+  # Use the Argument processing module
+  use Getopt::Long;
+
+  # Print usage if no arguments
+  if (!@::ARGV) {
+    &Usage();
+    exit 0;
+  }
+
+  # Process input arguments
+  $fail = 0;
+  GetOptions(
+    "debug:i",      \$::arg_debug,
+    "delay=f",      \$::arg_delay,
+    "period=i",     \$::arg_period,
+    "repeat=i",     \$::arg_repeat,
+    "tids",         \$::arg_tids,
+    "help|h",       \$arg_help
+  ) || GetOptionsMessage();
+
+  # Print help documentation if user has selected --help
+  &ListHelp() if (defined $arg_help);
+
+  # Validate options
+  if ((defined $::arg_repeat) && (defined $::arg_period)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: cannot specify both --repeat and --period options.\n";
+  }
+  if ((defined $::arg_delay) && ($::arg_delay < 0.01)) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: --delay %f is less than 0.01.\n",
+          $::arg_delay;
+  }
+  $::arg_tids = (defined $::arg_tids) ? 1 : 0;
+  if (@::ARGV) {
+    $fail = 1;
+    warn "$::TOOLNAME: Input error: not expecting these options: '@::ARGV'.\n";
+  }
+
+  # Set reasonable defaults
+  $::arg_delay  ||= 1.0;
+  $::arg_repeat ||= 1;
+  if ($::arg_period) {
+    $::arg_repeat = $::arg_period / $::arg_delay;
+  } else {
+    $::arg_period = $::arg_delay * $::arg_repeat;
+  }
+
+  # Upon missing or invalid options, print usage
+  if ($fail == 1) {
+    &Usage();
+    exit 1;
+  }
+}
+
+# Print out a warning message and usage
+sub GetOptionsMessage {
+  warn "$::TOOLNAME: Error processing input arguments.\n";
+  &Usage();
+  exit 1;
+}
+
+# Print out program usage
+sub Usage {
+  printf "Usage: $::TOOLNAME OPTIONS\n";
+  printf " [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]\n";
+  printf " [--help]\n";
+
+  printf "\n";
+}
+
+# Print tool help
+sub ListHelp {
+  printf "$::TOOLNAME -- display per-task scheduling occupancy\n";
+  &Usage();
+  printf "Options: miscellaneous\n";
+  printf " --delay=<seconds>  : output interval (seconds):       default: 1.0\n";
+  printf " --repeat=<num>     : number of repeat samples:        default: 1\n";
+  printf " --period=<seconds> : overall tool duration (seconds): default: --\n";
+  printf " --help             : this help\n";
+  exit 0;
+}
+
+1;

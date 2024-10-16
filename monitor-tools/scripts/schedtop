@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 ########################################################################
 #
-# Copyright (c) 2015-2021 Wind River Systems, Inc.
+# Copyright (c) 2015-2024 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -16,7 +16,8 @@
 # Usage: schedtop OPTIONS
 #  [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]
 #  [--reset-hwm] [--idle] [--sort=<cpu|io>]
-#  [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-only] [--watch-quiet]
+#  [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-cgroup=cgroup1,...]
+#  [--watch-only] [--watch-quiet]
 #  [--trig-delay=time]
 #  [--help]
 
@@ -28,6 +29,7 @@ use Time::HiRes qw(clock_gettime usleep CLOCK_MONOTONIC CLOCK_REALTIME);
 use Benchmark ':hireswallclock';
 use Carp qw(croak carp);
 use Math::BigInt;
+use File::Find ();
 
 # Define toolname
 our $TOOLNAME = "schedtop";
@@ -73,6 +75,10 @@ our $USER_HZ = 100; # no easy way to get this
 our $CLOCK_NS = SI_G / $USER_HZ;
 our $print_host = 1;
 
+our @cgroup_procs_paths = ();
+our @cgroup_procs_match = ();
+our @cgroup_tids = ();
+
 # Print options
 our ($P_none, $P_lite, $P_brief, $P_full) = (0, 1, 2, 3);
 our ($P_ps, $P_cpu, $P_del, $P_io, $P_id, $P_cmd) = (0, 1, 2, 3, 4, 5);
@@ -88,6 +94,7 @@ our ($arg_debug,
      $arg_sort,
      $arg_print,
      @arg_watch_cmd,
+     @arg_watch_cgroup,
      $arg_watch_only,
      $arg_watch_quiet,
      $arg_trig_delay,
@@ -120,7 +127,7 @@ my @delta_list = (
 
 my @state_list = (
   'exec_max', 'wait_max', 'block_max',
-  'pid', 'ppid', 'state', 'comm', 'cmdline', 'wchan', 'affinity',
+  'pid', 'ppid', 'state', 'cgroup', 'comm', 'cmdline', 'wchan', 'affinity',
   'VmSize', 'VmRSS', 'start_time',
   'nice', 'policy', 'priority', 'rt_priority', 'task_cpu'
 );
@@ -142,6 +149,7 @@ $| = 1;
   \$::arg_sort,
   \$::arg_print,
   \@::arg_watch_cmd,
+  \@::arg_watch_cgroup,
   \$::arg_watch_only,
   \$::arg_watch_quiet,
   \$::arg_trig_delay,
@@ -198,8 +206,9 @@ printf "selected options: ".
   $::arg_sort, $::arg_print;
 if (@::arg_watch_cmd) {
   printf "selected watch/trigger options: ".
-          "watch-cmd=%s, only=%s, quiet=%s, delay=%d ms\n",
+          "watch-cmd=%s, watch-cgroup=%s, only=%s, quiet=%s, delay=%d ms\n",
     join(',', @::arg_watch_cmd),
+    join(',', @::arg_watch_cgroup),
     (defined $::arg_watch_only ? 'true' : 'false'),
     (defined $::arg_watch_quiet ? 'true' : 'false'),
     $::arg_trig_delay;
@@ -217,6 +226,12 @@ for (my $i=0; $i < $::num_cpus; $i++) {
   $::affinity_mask->bior($y);
 }
 $w_aff = &max(length 'AFF', length $::affinity_mask->as_hex());
+
+# Find cgroup.proc paths matching specified cgroup patterns
+&find_matching_cgroup_procs(\@::cgroup_procs_match, \@::arg_watch_cgroup);
+for my $file (@::cgroup_procs_match) {
+  print "matched cgroup:", $file, "\n";
+}
 
 # Reset scheduling hi-water marks
 if (defined $::arg_reset_hwm) {
@@ -246,7 +261,7 @@ if ($is_schedstat) {
 # Get current scheduling and io info for all tids
 &read_sched(\%::tids_1, \%::task_1);
 # Track watched tids for monitoring
-&track_watched_tids(\%::tids_1, \%::tids_w, \%::task_1, \@::arg_watch_cmd);
+&track_watched_tids(\%::tids_1, \%::tids_w, \%::task_1, \@::arg_watch_cmd, \@::arg_watch_cgroup);
 
 # determine column sort order
 my $s_keyw = 'watched';
@@ -295,11 +310,46 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     &read_stat(\%::percpu_1);
   }
   if (defined $::arg_watch_only) {
-    # Get list of pids and tids from watched commands;
-    # this reduces cpu impact dramatically
-    foreach my $tid (keys %::tids_w) {
-      $::tids_1{$tid} = $::tids_w{$tid};
+    # This determines a subset of pids and tids
+    # based on previous watched tids and matching cgroups.
+    # This should reduce cpu impact dramatically.
+
+    # Get list of pids and tids
+    &get_tids(\%::tids_1);
+
+    # Get array of tids corresponding to matching cgroups
+    &read_cgroup_procs(\@::cgroup_tids, \@::cgroup_procs_match);
+    my %cgroup_tids_h = map { $_ => 1 } @::cgroup_tids;
+
+    # Keep previous watched tids and find new matches from cgroup.procs
+    my @del_tids = ();
+    foreach my $tid (keys %::tids_1) {
+      my $pid = $::tids_1{$tid};
+      next if (exists $::tids_w{$tid});
+      if (exists $cgroup_tids_h{$tid}) {
+        $::tids_w{$tid} = $pid;
+        printf "ADD watching: tid=%7d\n", $tid;
+        next;
+      }
+      push(@del_tids, $tid);
     }
+
+    # Prune tids not actually being watched
+    foreach my $tid (@del_tids) {
+      delete $::tids_1{$tid};
+    }
+
+    # Prune watched tids that not longer exist
+    my @del_tids_w = ();
+    foreach my $tid (keys %::tids_w) {
+      next if (exists $::tids_1{$tid});
+      push(@del_tids_w, $tid);
+    }
+    foreach my $tid (@del_tids_w) {
+      printf "REM watching: tid=%7d\n", $tid;
+      delete $::tids_w{$tid};
+    }
+
   } else {
     # Get list of pids and tids
     &get_tids(\%::tids_1);
@@ -462,7 +512,7 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
   if ($::opt_P{$::P_cmd} == $::P_brief) {
     $L .= sprintf "%s", "cmdline";
   } elsif ($::opt_P{$::P_cmd} == $::P_full) {
-    $L .= sprintf "%-15s %s", "comm", "cmdline";
+    $L .= sprintf "%-16s %-15s %s", "cgroup", "comm", "cmdline";
   }
   print $L, "\n";
 
@@ -526,7 +576,8 @@ REPEAT_LOOP: for (my $repeat=1; $repeat <= $::arg_repeat; $repeat++) {
     if ($::opt_P{$::P_cmd} == $::P_brief) {
       $L .= sprintf "%s", $::D_task{$tid}{'cmdline'};
     } elsif ($::opt_P{$::P_cmd} == $::P_full) {
-      $L .= sprintf "%-15s %s",
+      $L .= sprintf "%-16s %-15s %s",
+              substr($::D_task{$tid}{'cgroup'}, 0, 16),
               substr($::D_task{$tid}{'comm'}, 0, 15),
               $::D_task{$tid}{'cmdline'};
     }
@@ -625,13 +676,32 @@ sub get_tids
 }
 
 # Reset scheduling hi-water-marks
+# NOTE: Reset by write 0 to sched is finicky; use brute force
 sub reset_sched_hwm
 {
   (local *::tids) = @_;
 
   # reset scheduling hi-water-marks by writing '0' to each task
+  my (%pids_) = ();
+  foreach my $tid (keys %::tids) {
+    my $pid = $::tids{$tid};
+    $pids_{$pid} = 1;
+  }
+  foreach my $pid (keys %pids_) {
+    my $file = '/proc/' . $pid . '/sched';
+    open(my $fh, "> $file") || next;
+    print $fh "0\n";
+    close($fh);
+  }
   foreach my $tid (keys %::tids) {
     my $file = '/proc/' . $tid . '/sched';
+    open(my $fh, "> $file") || next;
+    print $fh "0\n";
+    close($fh);
+  }
+  foreach my $tid (keys %::tids) {
+    my $pid = $::tids{$tid};
+    my $file = '/proc/' . $pid . '/task/' . $tid . '/sched';
     open(my $fh, "> $file") || next;
     print $fh "0\n";
     close($fh);
@@ -658,22 +728,81 @@ sub sysrq_trigger_crash
 # Track watched tids for monitoring
 sub track_watched_tids
 {
-  (local *::tids, local *::tids_w, local *::task, local *::arg_watch_cmd) = @_;
+  (local *::tids, local *::tids_w, local *::task, local *::arg_watch_cmd, local *::arg_watch_cgroup) = @_;
 
   foreach my $tid (keys %::tids) {
     my $pid = $::tids{$tid};
     my $comm = $::task{$tid}{'comm'};
+    my $cgroup = $::task{$tid}{'cgroup'};
+    my $cmdline = $::task{$tid}{'cmdline'};
     my $watched = 0;
+
+    next if (exists $::tids_w{$tid});
+
     foreach my $cmd (@::arg_watch_cmd) {
-      if (($cmd =~ /^\d+$/) && ($tid == $cmd)) {
+      if (($cmd =~ /^\d+$/) && (($tid == $cmd) || ($pid == $cmd))) {
         $::tids_w{$tid} = $pid;
-        printf "watching: tid=%7d, comm=%s\n", $tid, $comm;
+        printf "watching: tid=%7d, cgroup=%s, comm=%s, cmdline=%.40s\n", $tid, $cgroup, $comm, $cmdline;
       }
       if ((defined $comm) && ($comm =~ /^\Q$cmd\E/)) {
         $::tids_w{$tid} = $pid;
-        printf "watching: tid=%7d, comm=%s\n", $tid, $comm;
+        printf "watching: tid=%7d, cgroup=%s, comm=%s, cmdline=%.40s\n", $tid, $cgroup, $comm, $cmdline;
       }
     }
+    foreach my $cg (@::arg_watch_cgroup) {
+      if ((defined $cgroup) && ($cgroup =~ /^\Q$cg\E/)) {
+        $::tids_w{$tid} = $pid;
+        printf "watching: tid=%7d, cgroup=%s, comm=%s, cmdline=%.40s\n", $tid, $cgroup, $comm, $cmdline;
+      }
+    }
+  }
+}
+
+# Find module difficult, storing result in global variable
+sub wanted_cgroup_procs {
+  my $F = $File::Find::name;
+  if ($_ eq 'cgroup.procs') {
+    push @::cgroup_procs_paths, $F;
+  }
+}
+
+# Find cgroup.proc paths matching specified cgroup patterns
+sub find_matching_cgroup_procs
+{
+  (local *::cgroup_procs_match, local *::arg_watch_cgroup) = @_;
+
+  # Find all cgroup.procs paths for the pids cgroup controller
+  File::Find::find(\&wanted_cgroup_procs, '/sys/fs/cgroup/pids');
+
+  foreach my $file (@::cgroup_procs_paths) {
+    foreach my $cg (@::arg_watch_cgroup) {
+      if ($file =~ /\Q$cg\E(\.service|\.scope)/) {
+        push(@::cgroup_procs_match, $file);
+      } elsif ($file =~ /kubepods\/\w+\/\Q$cg\E/) {
+        push(@::cgroup_procs_match, $file);
+      }
+    }
+  }
+}
+
+# Get array of tids corresponding to matching cgroups
+sub read_cgroup_procs
+{
+  (local *::tids, local *::cgroup_procs_match) = @_;
+
+  my $tid = ();
+
+  # reset scheduling hi-water-marks by writing '0' to each task
+  foreach my $cgroup_procs (@::cgroup_procs_match) {
+    open(my $fh, $cgroup_procs) || goto SKIP_PROCS;
+    while (<$fh>) {
+      if (/^(\d+)$/) {
+        $tid = $1;
+        push @::tids, $tid;
+      }
+    }
+    close($fh);
+    SKIP_PROCS:;
   }
 }
 
@@ -703,7 +832,7 @@ sub read_sched
         $gtime, $cgtime,
         $start_data, $end_data, $start_brk, $arg_start, $arg_end,
         $env_start, $env_end, $exit_code) = ();
-
+    my ($cgroup) = ();
     my ($nr_switches, $nr_migrations) = (0,0);
     my ($exec_runtime, $exec_max) = (0.0, 0.0);
     my ($wait_max, $wait_sum, $wait_count) = (0.0, 0.0, 0);
@@ -716,7 +845,7 @@ sub read_sched
         $cancelled_write_bytes) = (0,0,0,0,0,0,0);
 
     my ($sched_valid, $io_valid, $status_valid, $cmdline_valid,
-        $wchan_valid, $stat_valid) = ();
+        $wchan_valid, $stat_valid, $cgroup_valid) = ();
 
     $pid = $::tids{$tid};
 
@@ -765,6 +894,67 @@ sub read_sched
     #prio                                         :                  120
     #clock-delta                                  :                   28
 
+    # Changes for 6.6.0 kernel
+    #cat /proc/1/sched
+    #systemd (1, #threads: 1)
+    #-------------------------------------------------------------------
+    #se.exec_start                                :     251536392.418317
+    #se.vruntime                                  :        542073.435409
+    #se.sum_exec_runtime                          :       1097697.572750
+    #se.nr_migrations                             :                35039
+    #sum_sleep_runtime                            :     249925608.224346
+    #sum_block_runtime                            :        234992.983051
+    #wait_start                                   :             0.000000
+    #sleep_start                                  :     251536392.418317
+    #block_start                                  :             0.000000
+    #sleep_max                                    :         11967.794377
+    #block_max                                    :          1230.041276
+    #exec_max                                     :           147.808142
+    #slice_max                                    :            78.070544
+    #wait_max                                     :           180.271599
+    #wait_sum                                     :        440802.706697
+    #wait_count                                   :              1022180
+    #iowait_sum                                   :            81.179285
+    #iowait_count                                 :                   63
+    #nr_migrations_cold                           :                    0
+    #nr_failed_migrations_affine                  :               145872
+    #nr_failed_migrations_running                 :                67209
+    #nr_failed_migrations_hot                     :                82715
+    #nr_forced_migrations                         :                   12
+    #nr_wakeups                                   :               264124
+    #nr_wakeups_sync                              :                   41
+    #nr_wakeups_migrate                           :                  205
+    #nr_wakeups_local                             :               146458
+    #nr_wakeups_remote                            :               117666
+    #nr_wakeups_affine                            :                  204
+    #nr_wakeups_affine_attempts                   :                  409
+    #nr_wakeups_passive                           :                    0
+    #nr_wakeups_idle                              :                    0
+    #avg_atom                                     :             1.072258
+    #avg_per_cpu                                  :            31.327879
+    #nr_switches                                  :              1023725
+    #nr_voluntary_switches                        :               264916
+    #nr_involuntary_switches                      :               758809
+    #se.load.weight                               :              1048576
+    #se.avg.load_sum                              :                 1490
+    #se.avg.runnable_sum                          :              1526937
+    #se.avg.util_sum                              :               365568
+    #se.avg.load_avg                              :                   32
+    #se.avg.runnable_avg                          :                   32
+    #se.avg.util_avg                              :                    7
+    #se.avg.last_update_time                      :      251536392418304
+    #se.avg.util_est.ewma                         :                  163
+    #se.avg.util_est.enqueued                     :                    7
+    #policy                                       :                    0
+    #prio                                         :                  120
+    #clock-delta                                  :                  112
+    #mm->numa_scan_seq                            :                    0
+    #numa_pages_migrated                          :                    0
+    #numa_preferred_nid                           :                   -1
+    #total_numa_faults                            :                    0
+    #current_node=0, numa_group_id=0
+    #numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0
+
     # parse /proc/<pid>/task/<tid>/sched
     $file = '/proc/' . $pid . '/task/' . $tid . '/sched';
     open($fh, $file) || goto SKIP_SCHED;
@@ -774,19 +964,19 @@ sub read_sched
     }
     my ($k, $v, $c0);
     LOOP_SCHED: while (<$fh>) {
-      if (/^se\.statistics.{1,2}wait_max\s+:\s+(\S+)/) {
+      if (/^wait_max\s+:\s+(\S+)/ || /^se\.statistics.{1,2}wait_max\s+:\s+(\S+)/) {
         $wait_max = $1;
-      } elsif (/^se\.statistics.{1,2}block_max\s+:\s+(\S+)/) {
+      } elsif (/^block_max\s+:\s+(\S+)/ || /^se\.statistics.{1,2}block_max\s+:\s+(\S+)/) {
         $block_max = $1;
-      } elsif (/^se\.statistics.{1,2}wait_sum\s+:\s+(\S+)/) {
+      } elsif (/^wait_sum\s+:\s+(\S+)/ || /^se\.statistics.{1,2}wait_sum\s+:\s+(\S+)/) {
         $wait_sum = $1;
-      } elsif (/^se\.statistics.{1,2}wait_count\s+:\s+(\S+)/) {
+      } elsif (/^wait_count\s+:\s+(\S+)/ || /^se\.statistics.{1,2}wait_count\s+:\s+(\S+)/) {
         $wait_count = $1;
-      } elsif (/^se\.statistics.{1,2}exec_max\s+:\s+(\S+)/) {
+      } elsif (/^exec_max\s+:\s+(\S+)/ || /^se\.statistics.{1,2}exec_max\s+:\s+(\S+)/) {
         $exec_max = $1;
-      } elsif (/^se\.statistics.{1,2}iowait_sum\s+:\s+(\S+)/) {
+      } elsif (/^iowait_sum\s+:\s+(\S+)/ || /^se\.statistics.{1,2}iowait_sum\s+:\s+(\S+)/) {
         $iowait_sum = $1;
-      } elsif (/^se\.statistics.{1,2}iowait_count\s+:\s+(\S+)/) {
+      } elsif (/^iowait_count\s+:\s+(\S+)/ || /^se\.statistics.{1,2}iowait_count\s+:\s+(\S+)/) {
         $iowait_count = $1;
       } elsif (/^se\.sum_exec_runtime\s+:\s+(\S+)/) {
         $exec_runtime = $1;
@@ -967,6 +1157,46 @@ sub read_sched
     $stat_valid = 1;
     close($fh);
 
+    #cat /proc/1/task/1/cgroup
+    #12:cpu,cpuacct:/init.scope
+    #11:pids:/init.scope
+    #10:hugetlb:/
+    #9:memory:/init.scope
+    #8:rdma:/
+    #7:cpuset:/
+    #6:net_cls,net_prio:/
+    #5:devices:/init.scope
+    #4:blkio:/init.scope
+    #3:freezer:/
+    #2:perf_event:/
+    #1:name=systemd:/init.scope
+    #0::/init.scope
+
+    # Extract the pod id:
+    # /k8s-infra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
+    # Extract *.service or *.scope name:
+    # /system.slice/acpid.service
+    # /system.slice/system-ceph.slice/ceph-mds.scope
+
+    # parse /proc/<pid>/task/<tid>/cgroup
+    $file = '/proc/' . $pid . '/task/' . $tid . '/cgroup';
+    open($fh, $file) || next;
+    LOOP_CGROUP: while (<$fh>) {
+      if (/^\d+:(pids|cpu,cpuacct):(.*)/) {
+        $_ = $2;
+        if (/kubepods\/\w+\/(pod[a-z0-9-]+)\/\w+$/) {
+          $cgroup = $1;
+        } elsif (/\/([a-zA-Z0-9_-@:]+)\.\w+$/) {
+          $cgroup = $1;
+        } else {
+          $cgroup = '-'; # '-' looks prettier than '/'
+        }
+        $cgroup_valid = 1;
+        last LOOP_CGROUP;
+      }
+    }
+    close($fh);
+
     # sched
     if (defined $sched_valid) {
       $::task{$tid}{'exec_runtime'}  = $exec_runtime;
@@ -1060,6 +1290,14 @@ sub read_sched
       $::task{$tid}{'start_time'}  = '';
       $::task{$tid}{'task_cpu'}    = 0;
     }
+
+    # cgroup
+    if (defined $cgroup_valid) {
+      $::task{$tid}{'cgroup'} = $cgroup;
+    } else {
+      $::task{$tid}{'cgroup'} = '-';
+    }
+
   }
 }
 
@@ -1327,6 +1565,7 @@ sub parse_schedtop_args {
    local *::arg_sort,
    local *::arg_print,
    local *::arg_watch_cmd,
+   local *::arg_watch_cgroup,
    local *::arg_watch_only,
    local *::arg_watch_quiet,
    local *::arg_trig_delay,
@@ -1356,6 +1595,7 @@ sub parse_schedtop_args {
     "sort=s",       \$::arg_sort,
     "print=s",      \$::arg_print,
     "watch-cmd=s@", \@::arg_watch_cmd,
+    "watch-cgroup=s@", \@::arg_watch_cgroup,
     "watch-only",   \$::arg_watch_only,
     "watch-quiet",  \$::arg_watch_quiet,
     "trig-delay=i", \$::arg_trig_delay,
@@ -1383,17 +1623,17 @@ sub parse_schedtop_args {
     $fail = 1;
     warn "$::TOOLNAME: Input error: --print=$::arg_print invalid; valid options are: brief, full\n";
   }
-  if ((defined $::arg_watch_only) && !(@::arg_watch_cmd)) {
+  if ((defined $::arg_watch_only) && !(@::arg_watch_cmd || @::arg_watch_cgroup)) {
     $fail = 1;
-    warn "$::TOOLNAME: Input error: --watch-only requires --watch-cmd option.\n";
+    warn "$::TOOLNAME: Input error: --watch-only requires --watch-cmd or --watch-cgroup option.\n";
   }
-  if ((defined $::arg_watch_quiet) && !(@::arg_watch_cmd)) {
+  if ((defined $::arg_watch_quiet) && !(@::arg_watch_cmd || @::arg_watch_cgroup)) {
     $fail = 1;
-    warn "$::TOOLNAME: Input error: --watch-quiet requires --watch-cmd option.\n";
+    warn "$::TOOLNAME: Input error: --watch-quiet requires --watch-cmd or --watch-cgroup option.\n";
   }
-  if ((defined $::arg_trig_delay) && !(@::arg_watch_cmd)) {
+  if ((defined $::arg_trig_delay) && !(@::arg_watch_cmd || @::arg_watch_cgroup)) {
     $fail = 1;
-    warn "$::TOOLNAME: Input error: --trig-delay requires --watch-cmd option.\n";
+    warn "$::TOOLNAME: Input error: --trig-delay requires --watch-cmd or --watch-cgroup option.\n";
   }
   if ((defined $::arg_trig_delay) && ($::arg_trig_delay < 1)) {
     $fail = 1;
@@ -1407,6 +1647,14 @@ sub parse_schedtop_args {
       push(@::arg_watch_cmd, split(',', $cmd));
     }
   }
+  if (@::arg_watch_cgroup) {
+    my @cgroups = @::arg_watch_cgroup;
+    @::arg_watch_cgroup = ();
+    for my $cgroup (@cgroups) {
+      push(@::arg_watch_cgroup, split(',', $cgroup));
+    }
+  }
+
   if (@::ARGV) {
     $fail = 1;
     warn "$::TOOLNAME: Input error: not expecting these options: '@::ARGV'.\n";
@@ -1443,7 +1691,8 @@ sub Usage {
   printf "Usage: $::TOOLNAME OPTIONS\n";
   printf " [--delay=<seconds>] [--repeat=<num>] [--period=<seconds>]\n";
   printf " [--reset-hwm] [--idle] [--sort=<cpu|io>] [--print=<brief|full>]\n";
-  printf " [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-only] [--watch-quiet]\n";
+  printf " [--watch-cmd=tid1,cmd1,cmd2,...] [--watch-cgroup=cgroup1,...]\n";
+  printf " [--watch-only] [--watch-quiet]\n";
   printf " [--trig-delay=time]\n";
   printf " [--help]\n";
 
@@ -1465,6 +1714,8 @@ sub ListHelp {
   printf("Watch specific tasks or commands:\n");
   printf(" --watch-cmd=tid1,cmd1,... : watch specific tids or 'comm' names\n");
   printf("   (matches from beginning of comm with partial name, eg, --watch-cmd=sirq)\n");
+  printf(" --watch-cgroup=cgroup1,... : watch specific cgroup names\n");
+  printf("   (matches from beginning of cgroup with partial name, eg, --watch-cgroup=sm)\n");
   printf(" --watch-only       : display only watched tasks (reduces impact of tool)\n");
   printf(" --watch-quiet      : suppress output after watch starts\n");
   printf("Trigger crash dump via sysrq:\n");

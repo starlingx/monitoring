@@ -1,0 +1,292 @@
+#!/usr/bin/env python
+
+########################################################################
+#
+# Copyright (c) 2024 Wind River Systems, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+########################################################################
+#
+# Calculate Kubernetes latency percentile metrics (50%, 95, and 99%) for
+# etcdserver and kube-apiserver. This is based on Prometheus format raw
+# metrics histograms within kube-apiserver.
+#
+# This obtains current Kubernetes raw metrics cumulative counters,
+# (e.g., kubectl get --raw /metrics). The counters represent cumulative
+# frequency of delays <= value. This calculates the delta from previous,
+# and does percentile calculation.
+#
+# Example:
+#   kubectl get --raw /metrics
+#
+# To see API calls:
+#   kubectl get --raw /metrics -v 6
+#
+# This does minimal parsing and aggregation to yield equivalent of the
+# following Prometheus PromQL queries using data over a time-window:
+#  histogram_quantile(0.95, sum(rate(etcd_request_duration_seconds_bucket[5m])) by (le))
+#  histogram_quantile(0.95, sum(rate(apiserver_request_duration_seconds_bucket{verb!~"CONNECT|WATCH|WATCH|PROXY"}[5m])) by (le))
+#  histogram_quantile(0.95, sum(rate(workqueue_queue_duration_seconds_bucket[5m])) by (le))
+#  histogram_quantile(0.95, sum(rate(rest_client_request_duration_seconds[5m])) by (le))
+#
+# Specific verbs are excluded to eliminate tooling anomolies, otherwise
+# histogram are polluted with >>40second delays.
+#
+# TODO(jgauld): Migrate code to use prometheus_client API;
+# prometheus_clientthat is not currently installed.
+#
+
+import argparse
+from copy import deepcopy
+from datetime import datetime, timedelta
+import logging
+import logging.handlers
+import os
+import pprint
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+LOG = logging.getLogger(__name__)
+
+KUBECONFIG = '/etc/kubernetes/admin.conf'
+re_bucket = re.compile(r'^([a-zA-Z0-9:_]+)_bucket{(.*)}\s+(\d+)')
+
+def get_raw_metrics(rawfile=None):
+    if rawfile is None:
+        fd, rawfile = tempfile.mkstemp(dir='/tmp', prefix='k8s-prom-raw-', suffix='.log')
+    with os.fdopen(fd, 'w') as f:
+        cmd = ['kubectl', '--kubeconfig={}'.format(KUBECONFIG),
+               'get', '--raw', '/metrics']
+        try:
+            subprocess.check_call(cmd, stdout=f, timeout=5)
+        except subprocess.TimeoutExpired as e:
+            LOG.error('get_raw_metrics: error=%s' % (str(e)))
+        except subprocess.CalledProcessError as e:
+            LOG.error('get_raw_metrics: error=%s' % (str(e)))
+        except Exception as e:
+            LOG.error('get_raw_metrics: error=%s' % (str(e)))
+    return rawfile
+
+def read_raw_metrics(rawfile=None):
+    patterns = {
+      'apiserver_request_duration_seconds': {'exclude_verbs': ['CONNECT', 'WATCH', 'WATCHLIST', 'PROXY']},
+      'etcd_request_duration_seconds': {},
+      'workqueue_queue_duration_seconds': {},
+      'rest_client_request_duration_seconds': {},
+    }
+    names = patterns.keys()
+
+    # Store aggregate bucket values metric[name][le]
+    metrics = {}
+    for name in names:
+        metrics[name] = {}
+
+    cleanup = False
+    if rawfile is None:
+        cleanup = True
+        rawfile = get_raw_metrics()
+
+    with open(rawfile) as f:
+        for l in f:
+            if l.startswith(tuple(names)):
+                # THIS IS TOO VERBOSE FOR TYPICAL DEBUG
+                #LOG.debug(l.rstrip())
+
+                match = re_bucket.search(l)
+                if match:
+                    name = match.group(1)
+                    tags = match.group(2)
+                    count = int(match.group(3))
+
+                    D = {}
+                    for key_value in tags.split(','):
+                        key, value = key_value.split('=')
+                        value = value.replace('"', '')
+                        D.update({key: value})
+
+                    # make sure we have a valid "le" bucket
+                    bucket = D.get('le')
+                    if bucket is None:
+                        continue
+
+                    # filter out specific verbs
+                    exclude_verbs = patterns[name].get('exclude_verbs', {})
+                    if 'verb' in D and D['verb'] in exclude_verbs:
+                        continue
+
+                    # Aggregate metric for matching name and "le" bucket
+                    if bucket not in metrics[name]:
+                        metrics[name][bucket] = 0
+                    metrics[name][bucket] += count
+
+    if cleanup:
+        os.unlink(rawfile)
+
+    return metrics
+
+
+def percentile(hist, q=0.95):
+    # Input: dictionary hist[le_bin] = freq
+
+    # these are sorted
+    le_bins = sorted(list(hist.keys()), key=float)
+
+    # Calculate number of binned samples
+    count = 0
+    for x in le_bins:
+        count += hist[x]
+
+    p0 = 0.0
+    x0 = 0.0
+
+    for x in le_bins:
+        x1 = float(x)
+        p = float(hist[x]) / float(count)
+        p1 = p0 + p
+        if p1 >= q:
+            percentile = x0 + (x1 - x0) * (q - p0) / (p1 - p0)
+            break
+        p0 = p1
+        percentile = x1
+
+    return percentile
+
+def k8smetrics(args=None):
+    # Read prometheus raw metrics snapshot at time t1
+    now = datetime.now()
+    tstamp1 = now
+    t1 = read_raw_metrics()
+    if args.debug:
+        LOG.debug("t1:")
+        pprint.pprint(t1, indent=1)
+
+    start_time = now
+    while now - start_time < timedelta(minutes=args.period_min):
+        # Copy all state information for time t0
+        t0 = deepcopy(t1)
+        tstamp0 = tstamp1
+
+        time.sleep(args.interval_min*60)
+
+        # Read prometheus raw metrics snapshot at time t1
+        now = datetime.now()
+        tstamp1 = now
+        t1 = read_raw_metrics()
+        if args.debug:
+            LOG.debug("t1:")
+            pprint.pprint(t1, indent=1)
+
+        # Print tool header for this interval
+        duration = tstamp1 - tstamp0
+        LOG.info('Samples from: %s - %s,  duration: %s'
+            % (tstamp0, tstamp1, duration))
+
+        # Calculate delta between cumulative snapshots
+        delta = {}
+        for name in t1.keys():
+            delta[name] = {}
+            for bucket in t1[name]:
+                v0 = t0[name].get(bucket, 0)
+                delta[name][bucket] = t1[name][bucket] - v0
+
+        # NOTE: le="+Inf" is identical to value of x_count
+        # le="y" is upper-bound of the bucket
+        hist = {}
+        for name in delta.keys():
+            hist[name] = {}
+            inf = delta[name].pop('+Inf', None)
+            if inf is None:
+                continue
+            buckets = sorted(list(delta[name].keys()), key=float)
+
+            # Calculate frequency distribution from cumulative frequency
+            maxbin = 0.0
+            v0 = 0
+            for x in buckets:
+                v = delta[name][x]
+                d = v - v0
+                # in the case of anomolous value (yeah, we going crazy)
+                if d < 0:
+                    if args.debug:
+                        LOG.debug('d<0: x=%s, v0=%s, v=%s, d=%s, inf=%s' % (x, v0, v, d, inf))
+                    d = 0
+                if d > 0:
+                    maxbin = float(x)
+                v0 = v
+                hist[name][x] = d
+
+            index = name.rfind('_seconds')
+            text = name[:index]
+            percentile_50 = 1000.0*percentile(hist[name], q=0.50)
+            percentile_95 = 1000.0*percentile(hist[name], q=0.95)
+            percentile_99 = 1000.0*percentile(hist[name], q=0.99)
+
+            # Print histogram summary and percentiles for each metric
+            print("{} : count: {}, p50: {:.0f} ms, p95: {:.0f} ms, p99: {:.0f} ms, maxbin: {:.0f} ms".format(
+                text, inf, percentile_50, percentile_95, percentile_99, 1000.0*maxbin))
+            print('bins:', end=' ')
+            [print('{0:5g}'.format(1000.0*float(x)), end=' ') for x in buckets]
+            print()
+            print('  <=:', end=' ')
+            [print('{0:5.0f}'.format(delta[name][x]), end=' ') for x in buckets]
+            print()
+            print('hist:', end=' ')
+            [print('{0:5.0f}'.format(hist[name][x]), end=' ') for x in buckets]
+            print()
+
+            # blank line between metrics
+            print()
+
+    return 0
+
+def main():
+    # Instantiate the parser
+    parser = argparse.ArgumentParser(description='Kubernetes latency percentile metrics')
+
+    # Optional argument
+    parser.add_argument('--period_min', type=int, default=1,
+                        help='sampling period in minutes')
+    parser.add_argument('--interval_min', type=int, default=1,
+                        help='sampling interval in minutes')
+    parser.add_argument('--debug', action='store_true',
+                        help='enable tool debug')
+
+    args = parser.parse_args()
+
+    # Configure logging
+    if args.debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    out_hdlr = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter(
+        '%(asctime)s %(process)s %(levelname)s %(module)s: %(message)s')
+    out_hdlr.setFormatter(formatter)
+    out_hdlr.setLevel(level)
+    LOG.addHandler(out_hdlr)
+    LOG.setLevel(level)
+
+    LOG.info("Kubernetes latency percentiles: period:%s mins, interval=%s mins",
+        args.period_min, args.interval_min)
+
+    try:
+        ret = k8smetrics(args=args)
+        sys.exit(ret)
+
+    except KeyboardInterrupt as e:
+        LOG.info('caught: %r, shutting down', e)
+        sys.exit(0)
+
+    except IOError:
+        sys.exit(0)
+
+    except Exception as e:
+        LOG.error('exception: %r', e, exc_info=1)
+        sys.exit(-4)
+
+if __name__ == '__main__':
+    main()

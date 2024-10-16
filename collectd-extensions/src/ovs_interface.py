@@ -1,7 +1,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# Copyright (C) 2019 Intel Corporation
+# Copyright (C) 2019-2024 Intel Corporation
 #
 ############################################################################
 #
@@ -741,7 +741,7 @@ def parse_ovs_appctl_bond_list(buf):
     buf = buf.strip().split("\n")
     result = {}
     for idx, line in enumerate(buf):
-        if idx is 0:
+        if idx == 0:
             continue
 
         line = line.strip()
@@ -837,7 +837,7 @@ def compare_interfaces(interfaces1, interfaces2):
     len1 = len(set1 - set2)
     len2 = len(set2 - set1)
 
-    if len1 is 0 and len2 is 0:
+    if len1 == 0 and len2 == 0:
         return True
     else:
         return False

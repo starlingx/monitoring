@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2022 Wind River Systems, Inc.
+# Copyright (c) 2018-2024 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -618,22 +618,23 @@ def output_top_10_pids(pid_dict, message):
     """Outputs the top 10 pids with the formatted message.
 
     Args:
-        pid_dict: Dict The Dictionary of PIDs with Name and RSS
-        message: Formatted String, the template message to be output.
+        pid_dict: dictionary  {pid: {'name': name, 'rss: value}
+        message: Formatted String, template output message
     """
 
     # Check that pid_dict has values
     if not pid_dict:
         return
-    proc = []
-    # Sort the dict based on Rss value from highest to lowest.
-    sorted_pid_dict = sorted(pid_dict.items(), key=lambda x: x[1]['rss'],
-                             reverse=True)
-    # Convert sorted_pid_dict into a list
-    [proc.append((i[1].get('name'), format_iec(i[1].get('rss')))) for i in
-        sorted_pid_dict]
-    # Output top 10 entries of the list
-    collectd.info(message % (str(proc[:10])))
+
+    # Output top 10 RSS usage entries
+    mems = ', '.join(
+        '{}: {}'.format(
+            v.get('name', '-'),
+            format_iec(v.get('rss', 0.0))) for k, v in sorted(
+                pid_dict.items(),
+                key=lambda t: -float(t[1]['rss']))[:10]
+    )
+    collectd.info(message % (mems))
 
 
 def config_func(config):
@@ -777,10 +778,10 @@ def read_func():
         # K8S platform addons usage, i.e., non-essential: monitor, openstack
         if pod.namespace in pc.K8S_NAMESPACE_ADDON:
             memory[pc.GROUP_OVERALL][pc.GROUP_K8S_ADDON] += MiB
-    # Limit output to every 5 minutes and after 29 seconds to avoid duplication
-    if datetime.datetime.now().minute % 5 == 0 and datetime.datetime.now(
 
-    ).second > 29:
+    # Get per-process and per-pod RSS memory every 5 minutes
+    now = datetime.datetime.now()
+    if now.minute % 5 == 0 and now.second > 29:
         # Populate the memory per process dictionary to output results
         pids = get_platform_memory_per_process()
 
@@ -795,13 +796,21 @@ def read_func():
         for uid in group_pods:
             if uid in obj._cache:
                 pod = obj._cache[uid]
-                # Ensure pods outside of Kube-System and Kube-Addon are only logged every 30 min
-                if datetime.datetime.now().minute % 30 == 0 and datetime.datetime.now().second > 29:
-                    collectd.info(f'The pod:{pod.name} running in namespace:{pod.namespace} '
-                                  f'has the following processes{group_pods[uid]}')
+                # Log detailed memory usage of all pods every 30 minutes
+                if now.minute % 30 == 0 and now.second > 29:
+                    mems = ', '.join(
+                        '{}({}): {}'.format(
+                            v.get('name', '-'),
+                            k,
+                            format_iec(v.get('rss', 0.0))) for k, v in sorted(
+                                group_pods[uid].items(),
+                                key=lambda t: -float(t[1]['rss']))
+                    )
+                    collectd.info(f'memory usage: Pod: {pod.name}, '
+                                  f'Namespace: {pod.namespace}, '
+                                  f'pids: {mems}')
             else:
-                collectd.warning('%s: uid %s for pod %s not found in namespace %s' % (
-                    PLUGIN, uid, pod.name, pod.namespace))
+                collectd.warning('%s: uid %s for pod not found' % (PLUGIN, uid))
                 continue
 
             # K8S platform system usage, i.e., essential: kube-system
@@ -815,16 +824,16 @@ def read_func():
                 for key in group_pods[uid]:
                     k8s_addon[key] = group_pods[uid][key]
 
-        message = 'The top 10 memory rss processes for the platform are : %s'
+        message = 'Top 10 memory usage pids: platform: %s'
         output_top_10_pids(platform, message)
 
-        message = 'The top 10 memory rss processes for the Kubernetes System are :%s'
+        message = 'Top 10 memory usage pids: Kubernetes System: %s'
         output_top_10_pids(k8s_system, message)
 
-        message = 'The top 10 memory rss processes Kubernetes Addon are :%s'
+        message = 'Top 10 memory usage pids: Kubernetes Addon: %s'
         output_top_10_pids(k8s_addon, message)
 
-        message = 'The top 10 memory rss processes overall are :%s'
+        message = 'Top 10 memory usage pids: overall: %s'
         output_top_10_pids(overall, message)
 
     # Calculate base memory usage (i.e., normal memory, exclude K8S and VMs)

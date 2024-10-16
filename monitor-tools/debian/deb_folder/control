@@ -13,4 +13,5 @@ Description: Monitor tools package
  This package contains data collection tools to monitor host performance.
  Tools are general purpose engineering and debugging related.
  Includes overall memory, cpu occupancy, per-task cpu,
- per-task scheduling, per-task io.
+ per-task scheduling, per-task io, newly created short-lived-processes,
+ local port scanning.
