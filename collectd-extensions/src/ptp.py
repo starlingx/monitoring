@@ -1580,7 +1580,7 @@ def handle_ptp4l_g8275_fields(instance):
         ctrl.ptp4l_announce_settings['timeSource'] = \
             G8275_PRC_HOLDOVER[ctrl.ptp4l_prtc_type]['timeSource']
 
-    elif ctrl.ptp4l_prc_state == CLOCK_STATE_INVALID:
+    elif ctrl.ptp4l_prc_state in [CLOCK_STATE_INVALID, CLOCK_STATE_FREERUN]:
         # PRC is freerun
         ctrl.ptp4l_announce_settings['clockAccuracy'] =  \
             G8275_PRC_FREERUN[ctrl.ptp4l_prtc_type]['clockAccuracy']
@@ -1986,7 +1986,7 @@ def check_clock_class(instance):
     else:
         new_clock_class = CLOCK_CLASS_248
 
-    if current_clock_class != new_clock_class:
+    if state != CLOCK_STATE_INVALID and current_clock_class != new_clock_class:
         # Set clockClass and timeTraceable
         data['clockClass'] = new_clock_class
         data['timeTraceable'] = int(time_traceable)
@@ -2177,6 +2177,7 @@ def read_func():
             collectd.info("%s no startup alarms found" % PLUGIN)
 
     obj.audits += 1
+    dpll_checked = set()
     for instance_name, ctrl in ptpinstances.items():
         collectd.debug("%s Instance: %s Instance type: %s"
                        % (PLUGIN, instance_name, ctrl.instance_type))
@@ -2278,7 +2279,9 @@ def read_func():
               [PTP_INSTANCE_TYPE_CLOCK, PTP_INSTANCE_TYPE_TS2PHC]):
             # Update the dpll state for each dpll owned by the instance
             for dpll in ptpinstances[instance].dpll_pci_slots:
-                read_dpll_status(dpll)
+                if dpll not in dpll_checked:
+                    read_dpll_status(dpll)
+                    dpll_checked.add(dpll)
 
         if obj.capabilities['primary_nic']:
             process_ptp_synce(instance)
