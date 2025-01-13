@@ -1889,17 +1889,26 @@ def check_time_drift(instance, gm_identity=None):
                     ctrl.oot_alarm_object.raised = False
         else:
             # Handle debounce of the OOT alarm.
-            # Debounce by 1 for the same severity level.
+            # Debounce by 1 for the state transitions (clear --> major/minor) of severity level.
+            # Alarm not raised for clear to major/minor severity state transition.
+            # Alarm raised for major to major/minor and minor to major/minor severity state
+            # transitions.
+            #
+            is_severity_state_clear_to_major_or_minor = False
+            if ctrl.oot_alarm_object.severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+                is_severity_state_clear_to_major_or_minor = True
+
             if ctrl.oot_alarm_object.severity != severity:
                 ctrl.oot_alarm_object.severity = severity
 
             # This will keep refreshing the alarm text with the current
-            # skew value while still debounce on state transitions.
+            # skew value while still debounce on state transitions (clear --> major/minor).
             #
             # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
             #
-            elif (severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
-                  severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
+            if not is_severity_state_clear_to_major_or_minor and (
+                    severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
+                    severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
                 # Handle raising the OOT Alarm.
                 rc = raise_alarm(ALARM_CAUSE__OOT, instance, offset)
                 if rc is True:
@@ -2624,17 +2633,26 @@ def check_ptp_regular(instance, ctrl, conf_file):
                 return 0
 
             # Handle debounce of the OOT alarm.
-            # Debounce by 1 for the same severity level.
+            # Debounce by 1 for the state transitions (clear --> major/minor) of severity level.
+            # Alarm not raised for clear to major/minor severity state transition.
+            # Alarm raised for major to major/minor and minor to major/minor severity state
+            # transitions.
+            #
+            is_severity_state_clear_to_major_or_minor = False
+            if ctrl.oot_alarm_object.severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
+                is_severity_state_clear_to_major_or_minor = True
+
             if ctrl.oot_alarm_object.severity != severity:
                 ctrl.oot_alarm_object.severity = severity
 
             # This will keep refreshing the alarm text with the current
-            # skew value while still debounce on state transitions.
+            # skew value while still debounce on state transitions (clear --> major/minor).
             #
             # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
             #
-            elif (severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
-                  severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
+            if not is_severity_state_clear_to_major_or_minor and (
+                    severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
+                    severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
                 # Handle raising the OOT Alarm.
                 rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
                 if rc is True:
