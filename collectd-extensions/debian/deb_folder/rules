@@ -4,13 +4,17 @@ export ROOT = $(CURDIR)/debian/tmp
 export LOCAL_UNIT_DIR = $(ROOT)/etc/systemd/system
 export LOCAL_DEFAULT_PLUGIN_DIR = $(ROOT)/etc/collectd.d
 export LOCAL_STARLINGX_PLUGIN_DIR = $(ROOT)/etc/collectd.d/starlingx
-export LOCAL_PYTHON_EXTENSIONS_DIR = $(ROOT)/opt/collectd/extensions/python
-export LOCAL_CONFIG_EXTENSIONS_DIR = $(ROOT)/opt/collectd/extensions/config
+export LOCAL_PYTHON_EXTENSIONS_DIR = $(ROOT)/usr/rootdirs/opt/collectd/extensions/python
+export LOCAL_CONFIG_EXTENSIONS_DIR = $(ROOT)/usr/rootdirs/opt/collectd/extensions/config
+export TMPFILES_DIR = $(ROOT)/etc/tmpfiles.d/
 
 %:
 	dh $@
 
 override_dh_install:
+	# Set up symlink /opt/collectd->/usr/rootdirs/opt/collectd
+	install -d $(TMPFILES_DIR)
+	install -m 644 debian/collectd-extensions-tmpfiles.conf $(TMPFILES_DIR)
 
 	# Adjustments in the configuration files for debian
 	sed -i '/Encoding "utf-8"/D' python_plugins.conf

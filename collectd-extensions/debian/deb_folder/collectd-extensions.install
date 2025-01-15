@@ -1,6 +1,7 @@
 etc/collectd.d/*
-opt/collectd/extensions/config/*
-opt/collectd/extensions/python/*
+etc/tmpfiles.d/collectd-extensions-tmpfiles.conf
+usr/rootdirs/opt/collectd/extensions/config/*
+usr/rootdirs/opt/collectd/extensions/python/*
 
 # %config(noreplace)
 etc/systemd/system/collectd.service
