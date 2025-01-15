@@ -4,7 +4,7 @@
       - stx-bandit-jobs
     check:
       jobs:
-        - openstack-tox-linters
+        - monitoring-tox-linters
         - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
@@ -13,7 +13,7 @@
         - kube-memory-tox-pylint
     gate:
       jobs:
-        - openstack-tox-linters
+        - monitoring-tox-linters
         - kube-cpusets-tox-py39
         - kube-cpusets-tox-flake8
         - kube-cpusets-tox-pylint
@@ -23,6 +23,13 @@
     post:
       jobs:
         - stx-monitoring-upload-git-mirror
+
+- job:
+    name: monitoring-tox-linters
+    parent: openstack-tox-linters
+    description: |
+      Run Openstack Tox linters using specific nodeset
+    nodeset: debian-bullseye
 
 - job:
     name: stx-monitoring-upload-git-mirror
