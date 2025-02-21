@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2024 Wind River Systems, Inc.
+# Copyright (c) 2019-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -314,7 +314,7 @@ class PTP_ctrl_object:
         self.log_throttle_count = 0
         self.phase = 0
         self.config_data = None
-        self.holdover_timestamp = None
+        self.pci_slot_holdover_ts = {}
         self.interface = None
         self.pci_slot_name = None
         self.timing_instance = None
@@ -356,6 +356,7 @@ PCI_SLOT_NAME = 'PCI_SLOT_NAME'
 
 # PTP crtl objects for each PTP instances
 ptpinstances = {}
+ordered_instances = OrderedDict()
 
 # Mapping of ptp interfaces to instances
 ptpinterfaces = {}
@@ -1522,6 +1523,10 @@ def init_func():
         if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_PTP4L:
             initialize_ptp4l_state_fields(instance)
 
+    # Set the ordered_instances dict to allow the read_func to process
+    # the instances in the order of ts2phc, clock, ptp4l, other
+    _set_instance_order()
+
     if tsc.nodetype == 'controller':
         obj.controller = True
 
@@ -1531,8 +1536,29 @@ def init_func():
     return 0
 
 
+def _set_instance_order():
+    """Order the ptp instances to allow the read_fun to check ts2phc->clock->ptp4l->other"""
+    checked_types = [PTP_INSTANCE_TYPE_PTP4L, PTP_INSTANCE_TYPE_TS2PHC, PTP_INSTANCE_TYPE_CLOCK]
+    for instance in ptpinstances:
+        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_TS2PHC:
+            ordered_instances[instance] = ptpinstances[instance]
+
+    for instance in ptpinstances:
+        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_CLOCK:
+            ordered_instances[instance] = ptpinstances[instance]
+
+    for instance in ptpinstances:
+        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            ordered_instances[instance] = ptpinstances[instance]
+
+    for instance in ptpinstances:
+        if not ptpinstances[instance].instance_type in checked_types:
+            ordered_instances[instance] = ptpinstances[instance]
+
+
 def handle_ptp4l_g8275_fields(instance):
     """set the required parameters for g8275 conformance"""
+    collectd.debug(f"{PLUGIN} handle_ptp4l_g8275_fields: {instance}")
     ctrl = ptpinstances[instance]
     previous_grandmaster_identity = ctrl.ptp4l_grandmaster_identity
     previous_clock_class = ctrl.ptp4l_clock_class
@@ -1619,6 +1645,7 @@ def handle_ptp4l_g8275_fields(instance):
 
 def write_ptp4l_gm_fields(instance, gm_fields_dict):
     """update the pmc GRANDMASTER_SETTINGS_NP values"""
+    collectd.debug(f"{PLUGIN} write_ptp4l_gm_fields: {instance}")
     ctrl = ptpinstances[instance]
     conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
                  '-' + instance + '.conf')
@@ -1637,6 +1664,7 @@ def write_ptp4l_gm_fields(instance, gm_fields_dict):
 
 def read_dpll_status(pci_slot):
     """read dpll status from sysfs file"""
+    collectd.debug(f"{PLUGIN} read_dppl_status {pci_slot}")
     filename = ICE_DEBUG_FS + pci_slot + '/cgu'
     current_dpll_type = None
     processing_cgu_input_status = False
@@ -1717,6 +1745,7 @@ def _get_phc2sys_command_line_option(instance, pidfile_path, flag):
 
 def check_phc2sys_offset():
     """check if phc2sys offset is set"""
+    collectd.debug(f"{PLUGIN} check_phc2sys_offset")
     phc2sysinstances = set()
     filenames = glob(PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN)
     if len(filenames) == 0:
@@ -1780,9 +1809,11 @@ def set_utc_offset(instance):
                 utc_offset_valid = bool(int(line.split()[1]))
         if not utc_offset_valid:
             utc_offset = ctrl.ptp4l_current_utc_offset
-            collectd.warning("%s currentUtcOffsetValid is %s, "
-                             "using the default currentUtcOffset %s"
-                             % (PLUGIN, utc_offset_valid, utc_offset))
+            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                collectd.warning("%s currentUtcOffsetValid is %s, "
+                                 "using the default currentUtcOffset %s"
+                                 % (PLUGIN, utc_offset_valid, utc_offset))
+            ctrl.log_throttle_count += 1
 
     if ctrl.ptp4l_current_utc_offset != int(utc_offset):
         ctrl.ptp4l_current_utc_offset = int(utc_offset)
@@ -1793,8 +1824,17 @@ def set_utc_offset(instance):
 
 def check_gnss_alarm(instance, alarm_object, interface, state):
     """check for GNSS alarm"""
-
+    collectd.debug(f"{PLUGIN} check_gnss_alarm: {instance} {interface}")
     ctrl = ptpinstances[instance]
+    # Set the pci slot and primary nic pci slot to allow
+    # creation of holdover timestamps per NIC
+    base_port = interface[:-1] + '0'
+    pci_slot = get_pci_slot(base_port)
+    if pci_slot in ts2phc_source_interfaces.keys():
+        primary_nic_pci_slot = ts2phc_source_interfaces[pci_slot]
+    else:
+        primary_nic_pci_slot = pci_slot
+
     severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
     if not state or state in [CLOCK_STATE_HOLDOVER,
                               CLOCK_STATE_FREERUN,
@@ -1807,10 +1847,22 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
 
     if state == CLOCK_STATE_HOLDOVER:
-        if not ctrl.holdover_timestamp:
-            ctrl.holdover_timestamp = timeutils.utcnow()
+        if pci_slot != primary_nic_pci_slot and \
+                primary_nic_pci_slot in ctrl.pci_slot_holdover_ts:
+            if ctrl.pci_slot_holdover_ts[primary_nic_pci_slot]:
+                # We were already in holdover because of the primary nic
+                # Copy the timestamp to secondary nic
+                ctrl.pci_slot_holdover_ts[pci_slot] = \
+                    ctrl.pci_slot_holdover_ts[primary_nic_pci_slot]
+        # If there is no entry for the current pci slot,
+        # create it and initialize
+        if pci_slot not in ctrl.pci_slot_holdover_ts \
+                or not ctrl.pci_slot_holdover_ts[pci_slot]:
+            ctrl.pci_slot_holdover_ts[pci_slot] = timeutils.utcnow()
+        collectd.info(f"{PLUGIN} Holdover timestamp for PHC {pci_slot}: "
+                      f"{ctrl.pci_slot_holdover_ts[pci_slot]}")
     else:
-        ctrl.holdover_timestamp = None
+        ctrl.pci_slot_holdover_ts[pci_slot] = None
 
     if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
         if alarm_object.raised is True:
@@ -1818,6 +1870,8 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
                 alarm_object.severity = \
                     fm_constants.FM_ALARM_SEVERITY_CLEAR
                 alarm_object.raised = False
+        # Clear pre-existing holdover timestamp
+        ctrl.pci_slot_holdover_ts[pci_slot] = None
     else:
         if alarm_object.severity != severity:
             alarm_object.severity = severity
@@ -1842,6 +1896,7 @@ def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
 
 def check_time_drift(instance, gm_identity=None):
     """Check time drift"""
+    collectd.debug(f"{PLUGIN} check_time_drift: %s" % instance)
     ctrl = ptpinstances[instance]
     phc2sys_clock_offset_ns = check_phc2sys_offset()
 
@@ -1924,6 +1979,7 @@ def check_time_drift(instance, gm_identity=None):
 
 
 def check_clock_class(instance):
+    collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
     data = {}
     conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
@@ -1963,6 +2019,7 @@ def check_clock_class(instance):
                           % (PLUGIN, pci_slot, primary_nic_pci_slot))
             state = dpll_status[primary_nic_pci_slot][CGU_PIN_GNSS_1PPS]['eec_cgu_state']
             instance_type = PTP_INSTANCE_TYPE_TS2PHC
+            pci_slot = primary_nic_pci_slot
 
     time_traceable = False
     frequency_traceable = False
@@ -1977,17 +2034,24 @@ def check_clock_class(instance):
         new_clock_class = CLOCK_CLASS_7
         time_traceable = True
         frequency_traceable = True
-        # Get the holdover timestamp of the clock/ts2phc instance
         holdover_timestamp = None
+        # Get the holdover timestamp of the clock/ts2phc instance
         for key, ctrl_obj in ptpinstances.items():
             if ctrl_obj.instance_type == instance_type:
-                holdover_timestamp = ctrl_obj.holdover_timestamp
+                if pci_slot in ctrl_obj.pci_slot_holdover_ts:
+                    holdover_timestamp = ctrl_obj.pci_slot_holdover_ts[pci_slot]
+                    collectd.debug(f"{PLUGIN} check_clock_class:"
+                                   "holdover_timestamp: {holdover_timestamp}")
+                else:
+                    collectd.warning(f"{PLUGIN} No holdover timestamp found for"
+                                     f"{key}: {pci_slot}")
 
         # If it is in holdover more than the holdover spec threshold,
         # set clock class to 140
         if holdover_timestamp:
             delta = timeutils.delta_seconds(holdover_timestamp,
                                             timeutils.utcnow())
+            collectd.info(f"{PLUGIN} {instance} holdover timer: {delta} seconds")
             if delta > HOLDOVER_THRESHOLD:
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
@@ -2017,6 +2081,7 @@ def check_clock_class(instance):
 
 def process_ptp_synce(instance):
     """process ptp synce alarms"""
+    collectd.debug(f"{PLUGIN} process_ptp_synce: {instance}")
     # Check GNSS signal status on primary NIC
     # Check SMA/1PPS signal status on secondary NIC
 
@@ -2187,9 +2252,9 @@ def read_func():
 
     obj.audits += 1
     dpll_checked = set()
-    for instance_name, ctrl in ptpinstances.items():
-        collectd.debug("%s Instance: %s Instance type: %s"
-                       % (PLUGIN, instance_name, ctrl.instance_type))
+    for instance_name, ctrl in ordered_instances.items():
+        collectd.info("%s Instance: %s Instance type: %s"
+                      % (PLUGIN, instance_name, ctrl.instance_type))
         instance = instance_name
         ptp_service = ctrl.instance_type + '@' + instance_name + '.service'
         conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
@@ -2306,7 +2371,7 @@ def read_func():
 
 def process_phc2sys_ha(ctrl):
     # Update state for phc2sys instances
-
+    collectd.debug(f"{PLUGIN} process_phc2sys_ha")
     previous_state = ctrl.timing_instance.state['phc2sys_source_interface']
     ctrl.timing_instance.set_instance_state_data()
     phc2sys_source_interface = ctrl.timing_instance.state['phc2sys_source_interface']
@@ -2471,6 +2536,7 @@ def process_phc2sys_ha(ctrl):
 
 
 def check_ptp_regular(instance, ctrl, conf_file):
+    collectd.debug(f"{PLUGIN} check_ptp_regular {instance}")
     # Let's read the port status information
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
