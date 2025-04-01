@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2024 Wind River Systems, Inc.
+# Copyright (c) 2018-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -504,7 +504,7 @@ def calculate_occupancy(
             continue
 
         # K8S platform system usage, i.e., essential: kube-system
-        # check for component label app.starlingx.io/component=platform        
+        # check for component label app.starlingx.io/component=platform
         if pod.is_platform_resource():
             cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += acct
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += wait
@@ -757,6 +757,8 @@ def update_cpu_data(init=False):
     since this routine was last run.
     """
 
+    global obj
+
     # Get epoch time in floating seconds
     now = time.time()
 
@@ -795,51 +797,7 @@ def update_cpu_data(init=False):
 
     # Refresh the k8s pod information if we have discovered new cgroups
     cg_pods = set(t1_cpuacct[pc.GROUP_PODS].keys())
-    if not cg_pods.issubset(obj.k8s_pods):
-        if obj.debug:
-            collectd.info('%s Refresh k8s pod information.' % (PLUGIN_DEBUG))
-        obj.k8s_pods = set()
-        try:
-            pods = obj._k8s_client.kube_get_local_pods()
-            for i in pods:
-                # NOTE: parent pod cgroup name contains annotation config.hash as
-                # part of its name, otherwise it contains the pod uid.
-                uid = i.metadata.uid
-                if ((i.metadata.annotations) and
-                        (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
-                    hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
-                                                          None)
-                    if hash_uid:
-                        if obj.debug:
-                            collectd.info('%s POD_ANNOTATION_KEY: '
-                                          'hash=%s, uid=%s, '
-                                          'name=%s, namespace=%s, qos_class=%s,'
-                                          'is_platform_label=%s'
-                                          % (PLUGIN_DEBUG,
-                                             hash_uid,
-                                             i.metadata.uid,
-                                             i.metadata.name,
-                                             i.metadata.namespace,
-                                             i.status.qos_class,
-                                             i.metadata.labels.get(pc.PLATFORM_LABEL_KEY) ==
-                                             pc.GROUP_PLATFORM))
-                        uid = hash_uid
-
-                obj.k8s_pods.add(uid)
-                if uid not in obj._cache:
-                    obj._cache[uid] = pc.POD_object(i.metadata.uid,
-                                                    i.metadata.name,
-                                                    i.metadata.namespace,
-                                                    i.status.qos_class,
-                                                    i.metadata.labels)
-            # Remove stale _cache entries
-            remove_uids = set(obj._cache.keys()) - obj.k8s_pods
-            for uid in remove_uids:
-                del obj._cache[uid]
-        except ApiException:
-            # continue with remainder of calculations, keeping cache
-            collectd.warning('%s encountered kube ApiException' % (PLUGIN))
-            pass
+    obj = pc.pods_monitoring(cg_pods, obj, PLUGIN_DEBUG)
 
     # Save initial state information
     if init:
