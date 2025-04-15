@@ -299,6 +299,7 @@ def get_cpuacct():
     cpuacct[pc.GROUP_PODS] = {}
     cpuacct[pc.CGROUP_SYSTEM] = {}
     cpuacct[pc.CGROUP_USER] = {}
+    cpuacct[pc.CGROUP_UTILS] = {}
     cpuacct[pc.CGROUP_INIT] = {}
     cpuacct[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -308,6 +309,7 @@ def get_cpuacct():
     cpuwait[pc.GROUP_PODS] = {}
     cpuwait[pc.CGROUP_SYSTEM] = {}
     cpuwait[pc.CGROUP_USER] = {}
+    cpuwait[pc.CGROUP_UTILS] = {}
     cpuwait[pc.CGROUP_INIT] = {}
     cpuwait[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -353,7 +355,19 @@ def get_cpuacct():
         cpuacct[pc.CGROUP_SYSTEM][name] = acct
         cpuwait[pc.CGROUP_SYSTEM][name] = wait
 
-    # Walk the system.slice cgroups and get cpuacct usage
+    # Walk the utils.slice cgroups and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.CGROUP_UTILS])
+    dir_list = next(os.walk(path))[1]
+    for name in dir_list:
+        if any(name.endswith(x) for x in exclude_types):
+            continue
+        cg_path = '/'.join([path, name])
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
+        wait = get_cgroup_cpu_wait_sum(cg_path)
+        cpuacct[pc.CGROUP_UTILS][name] = acct
+        cpuwait[pc.CGROUP_UTILS][name] = wait
+
+    # Walk the k8splatform.slice cgroups and get cpuacct usage
     path = '/'.join([CPUACCT, pc.CGROUP_K8SPLATFORM])
     if os.path.isdir(path):
         dir_list = next(os.walk(path))[1]
@@ -537,6 +551,11 @@ def calculate_occupancy(
                 cpuacct[pc.CGROUP_K8SPLATFORM][g]
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
                 cpuwait[pc.CGROUP_K8SPLATFORM][g]
+        if g in cpuacct[pc.CGROUP_UTILS].keys():
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuacct[pc.CGROUP_UTILS][g]
+            cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuwait[pc.CGROUP_UTILS][g]
 
     # Calculate platform cpuacct usage (this excludes apps)
     for g in pc.PLATFORM_GROUPS:
@@ -653,6 +672,26 @@ def calculate_occupancy(
             h_occ[g] = g_occ
         if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
             h_occw[g] = g_occw
+
+    # Calculate cgroup based occupancy for cgroups within utils.slice.
+    if pc.CGROUP_UTILS in cpuacct.keys():
+        for g in cpuacct[pc.CGROUP_UTILS]:
+            cputime_ms = \
+                float(cpuacct[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occ = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occ[g] = g_occ
+            cpuwait_ms = \
+                float(cpuwait[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occw = float(pc.ONE_HUNDRED) * float(cpuwait_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occw[g] = g_occw
+
+            # Keep hirunners exceeding minimum threshold.
+            if g_occ >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occ[g] = g_occ
+            if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occw[g] = g_occw
 
     if (hires and prefix == 'hires') or (dispatch and prefix == 'dispatch'):
         # Print cpu occupancy usage for high-level groupings
