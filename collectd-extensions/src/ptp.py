@@ -861,8 +861,13 @@ def raise_alarm(alarm_cause,
         return True
 
     elif alarm_cause == ALARM_CAUSE__PROCESS:
-        reason = 'Provisioned ' + PTP + ' \'' + obj.mode
-        reason += '\' time stamping mode seems to be unsupported by this host'
+        reason += f"PTP service {data} enabled but not running"
+        alarm.repair += (
+            f"enable service with: systemctl start {data}. "
+            "If it still persists: Check host hardware reference manual "
+            f"to verify the provisioned {PTP} '{obj.mode}' time stamping "
+            "mode is supported by this host."
+        )
 
     elif alarm_cause in [ALARM_CAUSE__1PPS_SIGNAL_LOSS,
                          ALARM_CAUSE__GNSS_SIGNAL_LOSS]:
@@ -932,10 +937,8 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
         o = PTP_alarm_object(instance)
         o.alarm = ALARM_CAUSE__PROCESS
         o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + ' does not support the provisioned '
-        o.reason += PTP + ' mode '
-        o.repair = 'Check host hardware reference manual '
-        o.repair += 'to verify that the selected PTP mode is supported'
+        o.reason = obj.hostname + ' '
+        o.repair = obj.hostname + ' '
         o.eid = obj.base_eid + '.instance=' + instance + '.ptp'
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN  # 'unknown'
         ALARM_OBJ_LIST.append(o)
@@ -2309,7 +2312,7 @@ def read_func():
                     if ctrl.process_alarm_object.raised is False:
                         collectd.error("%s PTP service %s enabled but not running" %
                                        (PLUGIN, ptp_service))
-                        if raise_alarm(ALARM_CAUSE__PROCESS, instance_name) is True:
+                        if raise_alarm(ALARM_CAUSE__PROCESS, instance_name, data=ptp_service) is True:
                             ctrl.process_alarm_object.raised = True
 
                 # clear all other alarms if the 'process' alarm is raised
