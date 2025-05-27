@@ -956,8 +956,9 @@ def pods_monitoring(cg_pods, obj, PLUGIN_DEBUG):
                 namespace = i.metadata.namespace
                 platform_label = False
                 # Check if platform label is present in namespace label or pod label
-                if namespace_labels[namespace].get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM \
-                   or i.metadata.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM:
+                if ((namespace_labels[namespace].get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM) or
+                        (i.metadata.labels and
+                         (i.metadata.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM))):
                     platform_label = True
 
                 if ((i.metadata.annotations) and
