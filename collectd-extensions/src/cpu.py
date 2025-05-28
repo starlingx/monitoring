@@ -38,7 +38,7 @@ PLUGIN_HISTOGRAM_INTERVAL = 300  # histogram interval in secs
 TIMESTAMP = 'timestamp'
 PLATFORM_CPU_PERCENT = 'platform-occupancy'
 CGROUP_PLATFORM_CPU_PERCENT = 'cgroup-platform-occupancy'
-SCHEDSTAT_SUPPORTED_VERSION = 15
+SCHEDSTAT_SUPPORTED_VERSION = 16
 
 # Linux per-cpu info
 CPUINFO = '/proc/cpuinfo'
