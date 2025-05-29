@@ -1981,6 +1981,32 @@ def check_time_drift(instance, gm_identity=None):
                                             offset))
 
 
+def is_service_running(ptp_service):
+    data = subprocess.check_output([SYSTEMCTL,
+                                    SYSTEMCTL_IS_ACTIVE_OPTION,
+                                    ptp_service]).decode()
+    if data.rstrip() == SYSTEMCTL_IS_ACTIVE_RESPONSE:
+        return True
+    return False
+
+
+def is_local_gm(ptp4l_instance):
+    ctrl = ptpinstances[ptp4l_instance]
+    parent_data_set = query_pmc(ptp4l_instance, "PARENT_DATA_SET", query_action="GET")
+    ptp4l_grandmaster_identity = parent_data_set.get(
+        "grandmasterIdentity", ctrl.ptp4l_grandmaster_identity
+    )
+
+    default_data_set = query_pmc(ptp4l_instance, "DEFAULT_DATA_SET", query_action="GET")
+    ptp4l_clock_identity = default_data_set.get(
+        "clockIdentity", ctrl.ptp4l_clock_identity
+    )
+
+    if ptp4l_grandmaster_identity == ptp4l_clock_identity:
+        return True
+    return False
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -1996,10 +2022,26 @@ def check_clock_class(instance):
     pci_slot = get_pci_slot(base_port)
     if pci_slot in ts2phc_source_interfaces.keys():
         primary_nic_pci_slot = ts2phc_source_interfaces[pci_slot]
+        mapped_ts2phc_instance = ts2phc_instance_map[pci_slot]
     else:
         collectd.warning("%s Instance %s is has no time source" %
                          (PLUGIN, instance))
         return
+
+    mapped_ts2phc_service = (
+        PTP_INSTANCE_TYPE_TS2PHC + "@" + mapped_ts2phc_instance + ".service"
+    )
+    is_ts2phc_running = is_service_running(mapped_ts2phc_service)
+    if not is_ts2phc_running:
+        collectd.info(
+            "%s PTP service %s is not running" % (PLUGIN, mapped_ts2phc_service)
+        )
+        if not is_local_gm(instance):
+            collectd.info(
+                "%s Instance %s is not local GM, clock-class will be updated by PTP source"
+                % (PLUGIN, instance)
+            )
+            return
 
     state = CLOCK_STATE_INVALID
     instance_type = PTP_INSTANCE_TYPE_CLOCK
@@ -2028,12 +2070,13 @@ def check_clock_class(instance):
     frequency_traceable = False
     new_clock_class = current_clock_class
     ctrl.ptp4l_prc_state = state
-    if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK,
-                 CLOCK_STATE_LOCKED_HO_ACQ]:
+    if (is_ts2phc_running and state in [
+        CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACK, CLOCK_STATE_LOCKED_HO_ACQ
+    ]):
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
         frequency_traceable = True
-    elif state == CLOCK_STATE_HOLDOVER:
+    elif is_ts2phc_running and state == CLOCK_STATE_HOLDOVER:
         new_clock_class = CLOCK_CLASS_7
         time_traceable = True
         frequency_traceable = True
@@ -2062,7 +2105,9 @@ def check_clock_class(instance):
     else:
         new_clock_class = CLOCK_CLASS_248
 
-    if state != CLOCK_STATE_INVALID and current_clock_class != new_clock_class:
+    if current_clock_class != new_clock_class and (
+        not is_ts2phc_running or state != CLOCK_STATE_INVALID
+    ):
         # Set clockClass and timeTraceable
         data['clockClass'] = new_clock_class
         data['timeTraceable'] = int(time_traceable)
