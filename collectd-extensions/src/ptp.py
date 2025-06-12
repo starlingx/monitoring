@@ -448,31 +448,34 @@ def read_files_for_timing_instances():
     else:
         for filename in filenames:
             instance = TimingInstance(filename)
-            if not instance.interfaces:
-                collectd.info("%s No interfaces configured for instance %s, "
-                              "not enabling HA monitoring; deleting instance"
-                              % (PLUGIN, instance.instance_name))
-            elif 'ha_enabled' in instance.config['global'].keys() \
-                    and instance.config['global']['ha_enabled'] == '1':
-                ptpinstances[instance.instance_name].timing_instance = instance
+            ptpinstances[instance.instance_name] = None
+            collectd.info("ptpinstances = %s" % ptpinstances)
+            if 'ha_enabled' in instance.config['global'].keys() \
+                    and instance.config['global']['ha_enabled'] == '1' \
+                    and instance.interfaces:
                 ptpinstances[instance.instance_name].phc2sys_ha_enabled = True
                 collectd.info("%s Found HA enabled phc2sys instance %s" %
                               (PLUGIN, instance.instance_name))
             else:
-                collectd.info("%s Phc2sys instance %s is not HA enabled, not enabling HA monitoring"
-                              "; deleting instance"
+                collectd.info("%s HA not enabled for instance %s, "
+                              "using default monitoring"
                               % (PLUGIN, instance.instance_name))
-                del instance
+                create_interface_alarm_objects('dummy', instance.instance_name)
+                ptpinstances[instance.instance_name].instance_type = \
+                    PTP_INSTANCE_TYPE_PHC2SYS
+                ptpinstances[instance.instance_name].phc2sys_ha_enabled = False
+            ptpinstances[instance.instance_name].timing_instance = instance
 
 
 class TimingInstance:
-    """The purpose of TimingInstance is to track the config and state data of a ptp instance"""
+    """The purpose of TimingInstance is to track the config and state data of a ptp instance.
 
-    """By supplying a config file path, a TimingInstance object will parse and store the instance
+    By supplying a config file path, a TimingInstance object will parse and store the instance
     configuration into a dict and provide functions for reading the state datafor each instance.
 
     At this time, only the phc2sys instance type is in use, but some of the other basic instance
-    functions have been defined for future enhancements."""
+    functions have been defined for future enhancements.
+    """
 
     def __init__(self, config_file_path) -> None:
         self.config_file_path = config_file_path
@@ -857,8 +860,8 @@ def raise_alarm(alarm_cause,
 def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_INSTANCE_TYPE_PTP4L):
     """Create alarm objects"""
 
-    collectd.debug("%s Alarm Object Create: Interface:%s, Instance: %s " %
-                   (PLUGIN, interface, instance))
+    collectd.info("%s Alarm Object Create: Interface:%s, Instance: %s " %
+                  (PLUGIN, interface, instance))
 
     if instance and not ptpinstances.get(instance, None):
         ctrl = PTP_ctrl_object(instance_type)
@@ -1391,6 +1394,9 @@ def init_func():
         read_clock_config()
         # Initialize TimingInstance for HA phc2sys
         read_files_for_timing_instances()
+        for key, ctrl in ptpinstances.items():
+            collectd.info("%s instance:%s type:%s found" %
+                          (PLUGIN, key, ctrl.instance_type))
 
     else:
         collectd.error("%s instance configuration directory %s not found" %
@@ -1441,22 +1447,23 @@ def init_func():
 
 def _set_instance_order():
     """Order the ptp instances to allow the read_fun to check ts2phc->clock->ptp4l->other"""
-    checked_types = [PTP_INSTANCE_TYPE_PTP4L, PTP_INSTANCE_TYPE_TS2PHC, PTP_INSTANCE_TYPE_CLOCK]
-    for instance in ptpinstances:
-        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_TS2PHC:
-            ordered_instances[instance] = ptpinstances[instance]
+    checked_types = [PTP_INSTANCE_TYPE_TS2PHC, PTP_INSTANCE_TYPE_CLOCK, PTP_INSTANCE_TYPE_PTP4L]
 
-    for instance in ptpinstances:
-        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_CLOCK:
-            ordered_instances[instance] = ptpinstances[instance]
+    def add_instances_by_type(instance_type):
+        # Use map and filter to order instances by type
+        for instance, ctrl in \
+                filter(lambda item: item[1].instance_type == instance_type, ptpinstances.items()):
+            ordered_instances[instance] = ctrl
+    for t in checked_types:
+        add_instances_by_type(t)
 
-    for instance in ptpinstances:
-        if ptpinstances[instance].instance_type == PTP_INSTANCE_TYPE_PTP4L:
-            ordered_instances[instance] = ptpinstances[instance]
+    # Add any remaining types not in checked_types
+    for instance, ctrl in \
+            filter(lambda item: item[1].instance_type not in checked_types, ptpinstances.items()):
+        ordered_instances[instance] = ctrl
 
-    for instance in ptpinstances:
-        if not ptpinstances[instance].instance_type in checked_types:
-            ordered_instances[instance] = ptpinstances[instance]
+    collectd.info(
+        f"{PLUGIN} Ordered instances: {list(ordered_instances.keys())}")
 
 
 def handle_ptp4l_g8275_fields(instance):
@@ -1838,7 +1845,8 @@ def check_time_drift(instance, gm_identity=None):
                            (PLUGIN, phc2sys_clock_offset_ns, ctrl.ptp4l_utc_offset_nanoseconds))
 
     if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-        collectd.info("%s found phc2sys offset %s" % (PLUGIN, phc2sys_clock_offset_ns))
+        collectd.info("%s found phc2sys offset %s" %
+                      (PLUGIN, phc2sys_clock_offset_ns))
         collectd.info("%s using utc offset %s" % (PLUGIN, utc_offset_ns))
     ctrl.log_throttle_count += 1
 
@@ -1915,12 +1923,14 @@ def is_service_running(ptp_service):
 
 def is_local_gm(ptp4l_instance):
     ctrl = ptpinstances[ptp4l_instance]
-    parent_data_set = query_pmc(ptp4l_instance, "PARENT_DATA_SET", query_action="GET")
+    parent_data_set = query_pmc(
+        ptp4l_instance, "PARENT_DATA_SET", query_action="GET")
     ptp4l_grandmaster_identity = parent_data_set.get(
         "grandmasterIdentity", ctrl.ptp4l_grandmaster_identity
     )
 
-    default_data_set = query_pmc(ptp4l_instance, "DEFAULT_DATA_SET", query_action="GET")
+    default_data_set = query_pmc(
+        ptp4l_instance, "DEFAULT_DATA_SET", query_action="GET")
     ptp4l_clock_identity = default_data_set.get(
         "clockIdentity", ctrl.ptp4l_clock_identity
     )
@@ -1955,7 +1965,8 @@ def check_clock_class(instance):
     is_ts2phc_running = is_service_running(mapped_ts2phc_service)
     if not is_ts2phc_running:
         collectd.info(
-            "%s PTP service %s is not running" % (PLUGIN, mapped_ts2phc_service)
+            "%s PTP service %s is not running" % (
+                PLUGIN, mapped_ts2phc_service)
         )
         if not is_local_gm(instance):
             collectd.info(
@@ -2019,7 +2030,8 @@ def check_clock_class(instance):
         if holdover_timestamp:
             delta = timeutils.delta_seconds(holdover_timestamp,
                                             timeutils.utcnow())
-            collectd.info(f"{PLUGIN} {instance} holdover timer: {delta} seconds")
+            collectd.info(
+                f"{PLUGIN} {instance} holdover timer: {delta} seconds")
             if delta > HOLDOVER_THRESHOLD:
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
@@ -2232,8 +2244,9 @@ def read_func():
             data = subprocess.check_output([SYSTEMCTL,
                                             SYSTEMCTL_IS_ENABLED_OPTION,
                                             ptp_service]).decode()
-            collectd.info("%s PTP service %s admin state:%s" %
-                          (PLUGIN, ptp_service, data.rstrip()))
+            is_running = is_service_running(ptp_service)
+            collectd.info("%s PTP service %s admin state:%s running:%s" %
+                          (PLUGIN, ptp_service, data.rstrip(), is_running))
 
             if data.rstrip() == SYSTEMCTL_IS_DISABLED_RESPONSE:
 
@@ -2258,23 +2271,22 @@ def read_func():
                                            (PLUGIN, PLUGIN_ALARMID, o.eid))
                 continue
 
-            data = subprocess.check_output([SYSTEMCTL,
-                                            SYSTEMCTL_IS_ACTIVE_OPTION,
-                                            ptp_service]).decode()
-
-            if data.rstrip() == SYSTEMCTL_IS_INACTIVE_RESPONSE:
-
+            if not is_running:
                 # Manage execution phase
                 if ctrl.phase != RUN_PHASE__NOT_RUNNING:
                     ctrl.phase = RUN_PHASE__NOT_RUNNING
                     ctrl.log_throttle_count = 0
 
                 if ctrl.process_alarm_object.alarm == ALARM_CAUSE__PROCESS and ctrl.instance_type \
-                        == PTP_INSTANCE_TYPE_PTP4L:
+                        in [PTP_INSTANCE_TYPE_PTP4L,
+                            PTP_INSTANCE_TYPE_PHC2SYS,
+                            PTP_INSTANCE_TYPE_TS2PHC]:
+                    # If the process is not running, raise the process alarm
                     if ctrl.process_alarm_object.raised is False:
                         collectd.error("%s PTP service %s enabled but not running" %
                                        (PLUGIN, ptp_service))
-                        if raise_alarm(ALARM_CAUSE__PROCESS, instance_name, data=ptp_service) is True:
+                        if raise_alarm(ALARM_CAUSE__PROCESS,
+                                       instance_name, data=ptp_service) is True:
                             ctrl.process_alarm_object.raised = True
 
                 # clear all other alarms if the 'process' alarm is raised
