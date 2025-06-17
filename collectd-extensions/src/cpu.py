@@ -357,7 +357,10 @@ def get_cpuacct():
 
     # Walk the utils.slice cgroups and get cpuacct usage
     path = '/'.join([CPUACCT, pc.CGROUP_UTILS])
-    dir_list = next(os.walk(path))[1]
+    if os.path.isdir(path):
+        dir_list = next(os.walk(path))[1]
+    else:
+        dir_list = []
     for name in dir_list:
         if any(name.endswith(x) for x in exclude_types):
             continue
