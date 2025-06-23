@@ -44,6 +44,8 @@ override_dh_install:
 	install -m 700 interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 remotels.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 ptp.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 cgu_handler.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ptp_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 ovs_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 service_res.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 
