@@ -44,6 +44,7 @@ from glob import glob
 from oslo_utils import timeutils
 from functools import lru_cache
 from ptp_interface import Interface
+import ptp_monitoring as pm
 from cgu_handler import CguHandler
 from pynetlink import DeviceType
 from pynetlink import LockStatus
@@ -113,6 +114,7 @@ PTPINSTANCE_CLOCK_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'clock-*.conf'
 PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'phc2sys-*.conf'
 PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
+PTPINSTANCE_MONITORING_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "monitoring-*.conf"
 
 
 def _get_ptp_options_path():
@@ -133,6 +135,7 @@ PTP_INSTANCE_TYPE_PTP4L = 'ptp4l'
 PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
 PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
 PTP_INSTANCE_TYPE_CLOCK = 'clock'
+PTP_INSTANCE_TYPE_MONITORING = "monitoring"
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -181,6 +184,11 @@ ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOW_PRIORITY = 21
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS = 22
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK = 23
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION = 24
+
+# Monitoring Alarm codes
+ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS = 30
+ALARM_CAUSE__MONITORING_SATELLITE_COUNT = 31
+ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB = 32
 
 # Run Phase
 RUN_PHASE__INIT = 0
@@ -455,6 +463,30 @@ ts2phc_instance_map = {}
 timing_instance_list = []
 
 
+def read_monitoring_ptp_config():
+    """read monitoring-ptp conf files"""
+    filenames = glob(PTPINSTANCE_MONITORING_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.debug(
+            "%s No PTP conf file located for %s"
+            % (PLUGIN, PTP_INSTANCE_TYPE_MONITORING)
+        )
+    else:
+        for filename in filenames:
+            instance = TimingInstance(filename)
+            ptpinstances[instance.instance_name] = None
+            create_interface_alarm_objects(
+                'dummy', instance.instance_name, PTP_INSTANCE_TYPE_MONITORING
+            )
+            collectd.info("ptpinstances = %s" % ptpinstances)
+            for device_path in instance.device_paths:
+                create_interface_alarm_objects(
+                    device_path, instance.instance_name, PTP_INSTANCE_TYPE_MONITORING
+                )
+
+            ptpinstances[instance.instance_name].timing_instance = instance
+
+
 def read_files_for_timing_instances():
     """read phc2sys conf files"""
     filenames = glob(PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN)
@@ -487,7 +519,7 @@ class TimingInstance:
     """The purpose of TimingInstance is to track the config and state data of a ptp instance.
 
     By supplying a config file path, a TimingInstance object will parse and store the instance
-    configuration into a dict and provide functions for reading the state datafor each instance.
+    configuration into a dict and provide functions for reading the state data for each instance.
 
     At this time, only the phc2sys instance type is in use, but some of the other basic instance
     functions have been defined for future enhancements.
@@ -496,17 +528,32 @@ class TimingInstance:
     def __init__(self, config_file_path) -> None:
         self.config_file_path = config_file_path
         self.interfaces = set()  # use a python set to prevent duplicates
+        self.device_paths = (
+            set()
+        )  # set to hold device_path list from monitoring instance
         self.config = {}  # dict of params from config file
-        self.state = {}  # dict to hold the values read from pmc or cgu
+        self.state = {}  # dict to hold the values read from pmc or cgu or gpsd
 
         # synce4l handling to be included when full synce4l support is implemented
-        self.instance_types = ["clock", "phc2sys", "ptp4l", "ts2phc"]
-        self.config_parsers_dict = {"clock": self.parse_clock_config,
-                                    "phc2sys": self.parse_phc2sys_config,
-                                    "ptp4l": self.parse_ptp4l_config,
-                                    "ts2phc": self.parse_ts2phc_config}
+        self.instance_types = [
+            "clock",
+            "phc2sys",
+            "ptp4l",
+            "ts2phc",
+            PTP_INSTANCE_TYPE_MONITORING,
+        ]
+        self.config_parsers_dict = {
+            "clock": self.parse_clock_config,
+            "phc2sys": self.parse_phc2sys_config,
+            "ptp4l": self.parse_ptp4l_config,
+            "ts2phc": self.parse_ts2phc_config,
+            PTP_INSTANCE_TYPE_MONITORING: self.parse_monitoring_config,
+        }
 
-        self.state_setter_dict = {"phc2sys": self.set_phc2sys_state}
+        self.state_setter_dict = {
+            "phc2sys": self.set_phc2sys_state,
+            PTP_INSTANCE_TYPE_MONITORING: self.set_monitoring_state,
+        }
 
         # Determine instance name and type
         # Instance is guaranteed to be one of the valid types because that was checked in
@@ -521,9 +568,13 @@ class TimingInstance:
                 collectd.info("%s Config file %s matches instance type %s"
                               % (PLUGIN, config_file_path, item))
                 self.instance_type = item
-                self.instance_name = instance
+                if item == PTP_INSTANCE_TYPE_MONITORING:
+                    self.instance_name = f"{item}-{instance}"
+                else:
+                    self.instance_name = instance
 
-        # Select the appropriate parser to initialize self.interfaces and self.config
+        # Select the appropriate parser to initialize self.interfaces/self.device_paths
+        # and self.config
         self.parse_instance_config()
 
         if self.instance_type == PTP_INSTANCE_TYPE_PHC2SYS:
@@ -541,7 +592,44 @@ class TimingInstance:
     def set_instance_state_data(self):
         collectd.debug("%s Setting state for %s" %
                        (PLUGIN, self.instance_name))
-        self.state_setter_dict[self.instance_type]()
+        self.state = self.state_setter_dict[self.instance_type]()
+
+    def config_to_dict(self, config):
+        return {section: dict(config[section]) for section in config}
+
+    def parse_monitoring_config(self):
+        config = pm.parse_monitoring_config(self.config_file_path)
+        collectd.info(f"{PLUGIN} parsing of {self.config_file_path}: {self.config_to_dict(config)}")
+        try:
+            self.device_paths = set(
+                [
+                    device_str.strip()
+                    for device_str in config["global"]["devices"].split(" ")
+                ]
+            )
+        except Exception as exc:
+            collectd.error(
+                "%s Reading devices from monitoring config file %s failed. error: %s"
+                % (PLUGIN, self.config_file_path, exc)
+            )
+        return config
+
+    def set_monitoring_state(self):
+        collectd.debug(
+            "%s Setting state for monitoring instance %s" % (PLUGIN, self.instance_name)
+        )
+        state = {}
+        for device_path in self.device_paths:
+            collectd.info((
+                f"{PLUGIN} instance {self.instance_name} reading gpsd data for"
+                f" {device_path}"
+            ))
+            state[device_path] = pm.get_gps_data(device_path)
+            collectd.info((
+                f"{PLUGIN} instance {self.instance_name} device {device_path}"
+                f" data: {state[device_path]}"
+            ))
+        return state
 
     def parse_clock_config(self) -> dict:
         # Clock config is not an .ini style format, parse it manually
@@ -646,12 +734,17 @@ class TimingInstance:
     def set_phc2sys_state(self):
         collectd.debug("%s Setting state for phc2sys instance %s" %
                        (PLUGIN, self.instance_name))
-        self.state['phc2sys_source_interface'] = self.query_phc2sys_socket('clock source',
-                                                                           self.phc2sys_com_socket)
-        self.state['phc2sys_forced_lock'] = self.query_phc2sys_socket('forced lock',
-                                                                      self.phc2sys_com_socket)
-        self.state['phc2sys_valid_sources'] = self.query_phc2sys_socket('valid sources',
-                                                                        self.phc2sys_com_socket)
+        state = {}
+        state["phc2sys_source_interface"] = self.query_phc2sys_socket(
+            "clock source", self.phc2sys_com_socket
+        )
+        state["phc2sys_forced_lock"] = self.query_phc2sys_socket(
+            "forced lock", self.phc2sys_com_socket
+        )
+        state["phc2sys_valid_sources"] = self.query_phc2sys_socket(
+            "valid sources", self.phc2sys_com_socket
+        )
+        return state
 
     def query_phc2sys_socket(self, query, unix_socket=None):
         if unix_socket:
@@ -817,8 +910,13 @@ def raise_alarm(alarm_cause,
             "mode is supported by this host."
         )
 
-    elif alarm_cause in [ALARM_CAUSE__1PPS_SIGNAL_LOSS,
-                         ALARM_CAUSE__GNSS_SIGNAL_LOSS]:
+    elif alarm_cause in [
+        ALARM_CAUSE__1PPS_SIGNAL_LOSS,
+        ALARM_CAUSE__GNSS_SIGNAL_LOSS,
+        ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS,
+        ALARM_CAUSE__MONITORING_SATELLITE_COUNT,
+        ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB,
+    ]:
         reason += ' state: ' + str(data)
 
     elif alarm_cause == ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOW_PRIORITY:
@@ -980,76 +1078,130 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
 
     if interface and not ptpinterfaces.get(interface, None):
         # Create required interface based alarm objects for supplied interface
-        o = PTP_alarm_object(interface)
-        # 1-PPS signal loss
-        o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname
-        o.reason += ' 1PPS signal loss'
-        o.repair = 'Check network'
-        o.eid = obj.base_eid + '.interface=' + interface + '.ptp=1PPS-signal-loss'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-        ALARM_OBJ_LIST.append(o)
+        if instance_type != PTP_INSTANCE_TYPE_MONITORING:
+            o = PTP_alarm_object(interface)
+            # 1-PPS signal loss
+            o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' 1PPS signal loss'
+            o.repair = 'Check network'
+            o.eid = obj.base_eid + '.interface=' + interface + '.ptp=1PPS-signal-loss'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
 
-        o = PTP_alarm_object(interface)
-        # Clock source selection change
-        o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE
-        o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
-        o.reason = obj.hostname
-        o.reason += ' phc2sys HA source selection algorithm selected new active source'
-        o.repair += 'Check network'
-        o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface\
-            + '.phc2sys=source-failover'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
-        ALARM_OBJ_LIST.append(o)
+            o = PTP_alarm_object(interface)
+            # Clock source selection change
+            o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE
+            o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
+            o.reason = obj.hostname
+            o.reason += ' phc2sys HA source selection algorithm selected new active source'
+            o.repair += 'Check network'
+            o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface\
+                + '.phc2sys=source-failover'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
+            ALARM_OBJ_LIST.append(o)
 
-        o = PTP_alarm_object(interface)
-        # Source clock no lock
-        o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname
-        o.reason += ' phc2sys HA source clock is not locked to a PRC'
-        o.repair += 'Check network and ptp4l configuration'
-        o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface + \
-            '.phc2sys=source-clock-no-prc-lock'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
-        ALARM_OBJ_LIST.append(o)
+            o = PTP_alarm_object(interface)
+            # Source clock no lock
+            o.alarm = ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' phc2sys HA source clock is not locked to a PRC'
+            o.repair += 'Check network and ptp4l configuration'
+            o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface + \
+                '.phc2sys=source-clock-no-prc-lock'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
 
-        o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + ' Hardware timestamping'
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Hardware timestamping is supported by this interface'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=hardware-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-        ALARM_OBJ_LIST.append(o)
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__UNSUPPORTED_HW
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname + " '" + interface + "' does not support "
+            o.reason += PTP + ' Hardware timestamping'
+            o.repair = 'Check host hardware reference manual to verify PTP '
+            o.repair += 'Hardware timestamping is supported by this interface'
+            o.eid = obj.base_eid + '.ptp=' + interface
+            o.eid += '.unsupported=hardware-timestamping'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+            ALARM_OBJ_LIST.append(o)
 
-        o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + ' Software timestamping'
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Software timestamping is supported by this interface'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=software-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-        ALARM_OBJ_LIST.append(o)
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__UNSUPPORTED_SW
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname + " '" + interface + "' does not support "
+            o.reason += PTP + ' Software timestamping'
+            o.repair = 'Check host hardware reference manual to verify PTP '
+            o.repair += 'Software timestamping is supported by this interface'
+            o.eid = obj.base_eid + '.ptp=' + interface
+            o.eid += '.unsupported=software-timestamping'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+            ALARM_OBJ_LIST.append(o)
 
-        o = PTP_alarm_object(interface)
-        o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
-        o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        o.reason = obj.hostname + " '" + interface + "' does not support "
-        o.reason += PTP + " Legacy timestamping"
-        o.repair = 'Check host hardware reference manual to verify PTP '
-        o.repair += 'Legacy or Raw Clock is supported by this host'
-        o.eid = obj.base_eid + '.ptp=' + interface
-        o.eid += '.unsupported=legacy-timestamping'
-        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
-        ALARM_OBJ_LIST.append(o)
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__UNSUPPORTED_LEGACY
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname + " '" + interface + "' does not support "
+            o.reason += PTP + " Legacy timestamping"
+            o.repair = 'Check host hardware reference manual to verify PTP '
+            o.repair += 'Legacy or Raw Clock is supported by this host'
+            o.eid = obj.base_eid + '.ptp=' + interface
+            o.eid += '.unsupported=legacy-timestamping'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
+            ALARM_OBJ_LIST.append(o)
+        else:  # instance_type == PTP_INSTANCE_TYPE_MONITORING
+            # Create monitoring instance specific required device_path based alarm
+            # objects for supplied interface (here interface means device_path e.g. /dev/gnss0)
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += " GNSS signal loss"
+            o.repair += "Check network"
+            o.eid = (
+                obj.base_eid
+                + ".monitoring="
+                + instance
+                + ".device_path="
+                + interface
+                + ".ptp=GNSS-signal-loss"
+            )
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
+
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__MONITORING_SATELLITE_COUNT
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += " GNSS satellite count below threshold"
+            o.repair += "Check network"
+            o.eid = (
+                obj.base_eid
+                + ".monitoring="
+                + instance
+                + ".device_path="
+                + interface
+                + ".ptp=GNSS-satellite-count"
+            )
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
+            ALARM_OBJ_LIST.append(o)
+
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += " GNSS signal quality db below threshold"
+            o.repair += "Check network"
+            o.eid = (
+                obj.base_eid
+                + ".monitoring="
+                + instance
+                + ".device_path="
+                + interface
+                + ".ptp=GNSS-signal-quality-db"
+            )
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_50  # THRESHOLD CROSS
+            ALARM_OBJ_LIST.append(o)
 
         # Add interface to ptpinterfaces dict if not present
         ptpinterfaces[interface] = []
@@ -1455,6 +1607,7 @@ def init_func():
         read_clock_config()
         # Initialize TimingInstance for HA phc2sys
         read_files_for_timing_instances()
+        read_monitoring_ptp_config()
         for key, ctrl in ptpinstances.items():
             collectd.info("%s instance:%s type:%s found" %
                           (PLUGIN, key, ctrl.instance_type))
@@ -2301,9 +2454,14 @@ def read_func():
         collectd.info("%s Instance: %s Instance type: %s"
                       % (PLUGIN, instance_name, ctrl.instance_type))
         instance = instance_name
-        ptp_service = ctrl.instance_type + '@' + instance_name + '.service'
-        conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
-                     '-' + instance_name + '.conf')
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_MONITORING:
+            ptp_service = "gpsd.service"
+            conf_file = PTPINSTANCE_PATH + instance_name + ".conf"
+        else:
+            ptp_service = ctrl.instance_type + "@" + instance_name + ".service"
+            conf_file = (
+                PTPINSTANCE_PATH + ctrl.instance_type + "-" + instance_name + ".conf"
+            )
 
         # Clock instance does not have a service, thus check non-clock instance type
         if ctrl.instance_type != PTP_INSTANCE_TYPE_CLOCK:
@@ -2348,7 +2506,8 @@ def read_func():
                 if ctrl.process_alarm_object.alarm == ALARM_CAUSE__PROCESS and ctrl.instance_type \
                         in [PTP_INSTANCE_TYPE_PTP4L,
                             PTP_INSTANCE_TYPE_PHC2SYS,
-                            PTP_INSTANCE_TYPE_TS2PHC]:
+                            PTP_INSTANCE_TYPE_TS2PHC,
+                            PTP_INSTANCE_TYPE_MONITORING]:
                     # If the process is not running, raise the process alarm
                     if ctrl.process_alarm_object.raised is False:
                         collectd.error("%s PTP service %s enabled but not running" %
@@ -2419,7 +2578,117 @@ def read_func():
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
             process_phc2sys_ha(ctrl)
 
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_MONITORING:
+            process_monitoring(ctrl)
+
     return 0
+
+
+def process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state):
+    if raise_condition:
+        rc = raise_alarm(alarm_obj.alarm, device_path, state, alarm_obj)
+        if rc is True:
+            alarm_obj.raised = True
+
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info(
+                "%s %s instance %s device_path %s alarm raised: %s"
+                % (
+                    PLUGIN,
+                    ctrl.instance_type,
+                    ctrl.timing_instance.instance_name,
+                    device_path,
+                    state,
+                )
+            )
+        ctrl.log_throttle_count += 1
+    else:
+        if alarm_obj.raised is True:
+            if clear_alarm(alarm_obj.eid) is True:
+                alarm_obj.raised = False
+                collectd.info(
+                    "%s %s instance %s device path %s alarm cleared: %s"
+                    % (
+                        PLUGIN,
+                        ctrl.instance_type,
+                        ctrl.timing_instance.instance_name,
+                        device_path,
+                        state,
+                    )
+                )
+
+
+def process_monitoring(ctrl):
+    collectd.debug(f"{PLUGIN} {ctrl.timing_instance.instance_name} process_monitoring")
+    # per device signal lock expected
+    expected_signal_lock = True
+
+    # per device expected satellite count, read from config file.
+    expected_satellite_count = None
+    try:
+        expected_satellite_count = int(
+            ctrl.timing_instance.config["global"]["satellite_count"]
+        )
+    except Exception as exc:
+        collectd.error(
+            "%s Reading satellite_count from monitoring config file %s failed. error: %s"
+            % (PLUGIN, ctrl.timing_instance.config_file_path, exc)
+        )
+
+    # per device expected signal quality db, read from config file.
+    expected_signal_quality_db = None
+    try:
+        expected_signal_quality_db = float(
+            ctrl.timing_instance.config['global']['signal_quality_db']
+        )
+    except Exception as exc:
+        collectd.error(
+            "%s Reading signal_quality_db from monitoring config file %s failed. error: %s"
+            % (PLUGIN, ctrl.timing_instance.config_file_path, exc)
+        )
+
+    ctrl.timing_instance.set_instance_state_data()
+    for device_path in ctrl.timing_instance.device_paths:
+        # alarm ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS
+        signal_lock = ctrl.timing_instance.state[device_path].lock_state
+        raise_condition = signal_lock != expected_signal_lock
+
+        alarm_obj = get_alarm_object(
+            ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS, device_path
+        )
+        state = f"signal lock {bool(signal_lock)} (expected: {expected_signal_lock})"
+
+        process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
+
+        # alarm ALARM_CAUSE__MONITORING_SATELLITE_COUNT
+        if expected_satellite_count is not None:
+            satellite_count = ctrl.timing_instance.state[device_path].satellite_count
+            raise_condition = satellite_count < expected_satellite_count
+
+            alarm_obj = get_alarm_object(
+                ALARM_CAUSE__MONITORING_SATELLITE_COUNT, device_path
+            )
+            state = f"satellite count {satellite_count} (expected: >= {expected_satellite_count})"
+
+            process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
+
+        # alarm ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB
+        if expected_signal_quality_db is not None:
+            # alarm is based upon avg snr
+            signal_quality_db = ctrl.timing_instance.state[
+                device_path
+            ].signal_quality_db.avg
+            raise_condition = signal_quality_db < expected_signal_quality_db
+
+            alarm_obj = get_alarm_object(
+                ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB, device_path
+            )
+            state = (
+                f"signal_quality_db {signal_quality_db}"
+                f" (expected: >= {expected_signal_quality_db})"
+            )
+
+            process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
 
 
 def process_phc2sys_ha(ctrl):

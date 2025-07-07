@@ -11,6 +11,7 @@
         - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
+        - collectd-extensions-py39
     gate:
       jobs:
         - starlingx-common-tox-linters
@@ -20,6 +21,7 @@
         - kube-memory-tox-py39
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
+        - collectd-extensions-py39
     post:
       jobs:
         - stx-monitoring-upload-git-mirror
@@ -122,6 +124,21 @@
       python_version: 3.9
       tox_envlist: py39
       tox_extra_args: -c kube-memory/kube-memory/tox.ini
+
+- job:
+    name: collectd-extensions-py39
+    parent: tox-py39
+    description: |
+      Run py39 for collectd-extensions
+    required-projects:
+      - starlingx/config
+    nodeset: debian-bullseye
+    files:
+      - collectd-extensions/*
+    vars:
+      python_version: 3.9
+      tox_envlist: py39
+      tox_extra_args: -c collectd-extensions/tox.ini
 
 - secret:
     name: stx-monitoring-github-secret2
