@@ -8,10 +8,12 @@
 # This file is part of the collectd 'Precision Time Protocol' Service Monitor.
 #
 ############################################################################
+from __future__ import annotations
+from dataclasses import dataclass
+from dataclasses import field
 import os
 import collectd
 import subprocess
-from enum import Enum
 
 # name of the plugin - all logs produced by this plugin are prefixed with this
 PLUGIN = 'ptp plugin'
@@ -23,20 +25,89 @@ ETHTOOL = '/usr/sbin/ethtool'
 uevent_path = '/sys/class/net/%s/device/uevent'
 gnss_path = '/sys/class/net/%s/device/gnss'
 switch_id_path = '/sys/class/net/%s/phys_switch_id'
-gnrd_switch_id_path = '/sys/module/zl3073x_core/parameters/clock_id'
-
-# Device's uevent fields
-DRIVER = 'DRIVER'
-PCI_CLASS = 'PCI_CLASS'
-PCI_ID = 'PCI_ID'
-PCI_SUBSYS_ID = 'PCI_SUBSYS_ID'
-PCI_SLOT_NAME = 'PCI_SLOT_NAME'
-MODALIAS = 'MODALIAS'
+pci_net_device_path = '/sys/bus/pci/devices/%s/net/'
+gnrd_switch_id_path = '/sys/module/zl3073x/parameters/clock_id'
 
 # Timestamping modes
 TIMESTAMP_MODE__HW = 'hardware'
 TIMESTAMP_MODE__SW = 'software'
 TIMESTAMP_MODE__LEGACY = 'legacy'
+
+
+@dataclass(frozen=True)
+class Uevent:
+
+    driver: str = field(hash=False, default=None)
+    pci_class: str = field(hash=False, default=None)
+    pci_id: str = field(hash=False, default=None)
+    pci_subsys_id: str = field(hash=False, default=None)
+    pci_slot_name: str = field(hash=False, default=None)
+    modalias: str = field(hash=False, default=None)
+
+    @classmethod
+    def load(cls, file: str) -> Uevent:
+        """Parse device's uevent data, and creates an Uevent object.
+
+        Examples of uevent files:
+
+        Westport Channel NIC:
+            DRIVER=ice
+            PCI_CLASS=20000
+            PCI_ID=8086:1593
+            PCI_SUBSYS_ID=8086:0005
+            PCI_SLOT_NAME=0000:1a:00.0
+            MODALIAS=pci:v00008086d00001593sv00008086sd00000005bc02sc00i00
+
+        Connorsville NIC:
+            DRIVER=ice
+            PCI_CLASS=20000
+            PCI_ID=8086:12D3
+            PCI_SUBSYS_ID=8086:0005
+            PCI_SLOT_NAME=0000:6c:00.0
+            MODALIAS=pci:v00008086d000012D3sv00008086sd00000005bc02sc00i00
+
+        file: Full path to device's uevent file.
+        """
+
+        if not file:
+            raise ValueError("Uevent file must be informed.")
+
+        if not os.path.exists(file):
+            raise ValueError("Given uevent file doesn't exist")
+
+        data = {}
+        with open(file, 'r', encoding='utf-8') as infile:
+            for line in infile:
+                if '=' in line:
+                    field, value = line.strip('\n').split('=')
+                    data[field] = value
+
+        return cls(
+            driver=data['DRIVER'],
+            pci_class=data['PCI_CLASS'],
+            pci_id=data['PCI_ID'],
+            pci_subsys_id=data['PCI_SUBSYS_ID'],
+            pci_slot_name=data['PCI_SLOT_NAME'],
+            modalias=data['MODALIAS']
+        )
+
+
+def read_uevent(interface):
+    """Read device's uevent data
+
+    Read device's uevent file provided by the driver via sysfs.
+
+    Returns : uevent data object
+    """
+    uevent = None
+    if interface:
+        filename = uevent_path % interface
+        try:
+            uevent = Uevent.load(filename)
+        except (ValueError, FileNotFoundError, PermissionError) as err:
+            collectd.info(f"{PLUGIN} {interface} Read uevent {filename} failed, "
+                          f"reason: {err}")
+    return uevent
 
 
 class Interface:
@@ -45,32 +116,61 @@ class Interface:
 
     def __init__(self, name):
         self.name = name
+        self.uevent = read_uevent(self.name)
         self.base_port = self._build_base_port()
         self.ts_supported_modes = self._read_suported_modes()
-        self.uevent = self._read_uevent()
         self.nmea = self._read_nmea_serial_port_name()
         if self.get_family() in ['Granite Rapid-D', 'Connorsville']:
             self.switch_id = self._read_microchip_gnss_clock_id()
         else:
             self.switch_id = self._read_phy_switch_id()
 
-    def base_port(interface):
+    def base_port(interface, uevent=None):
         """Interface's base port name"""
 
         """A network device card can have multiple ports,
         get the name of the 1st port available.
 
         Returns : the name of the 1st port of a NIC"""
-        if interface.startswith('eno'):
-            # replace last number per 1
-            base_port = interface[:-1] + '1'
-        else:
-            # replace last number per 0
-            base_port = interface[:-1] + '0'
+        # read uevent file if not provided
+        if not uevent:
+            uevent = read_uevent(interface)
+
+        if not uevent:
+            return None
+
+        pci_slot = uevent.pci_slot_name
+        if not pci_slot:
+            collectd.info(f"{PLUGIN} {interface} Uevent pci slot name is empty")
+            return None
+
+        # if the PCI slot ends with .0, the interface is its own base port
+        if pci_slot.endswith('.0'):
+            return interface
+
+        # get first device in slot
+        base_pci_slot = pci_slot[:-1] + '0'
+
+        # get base port name from PCI network device path
+        dirs = None
+        path = pci_net_device_path % base_pci_slot
+        if os.path.isdir(path):
+            try:
+                dirs = os.listdir(path)
+                collectd.debug(f"{PLUGIN} {interface} List dir {path} "
+                               f"output {dirs}")
+            except (FileNotFoundError, PermissionError) as err:
+                collectd.debug(f"{PLUGIN} {interface} List dir {path} failed, "
+                               f"reason: {err}")
+                return None
+        base_port = None
+        if dirs and len(dirs) == 1:
+            base_port = dirs[0]
+
         return base_port
 
     def _build_base_port(self):
-        return Interface.base_port(self.name)
+        return Interface.base_port(self.name, self.uevent)
 
     def _read_suported_modes(self):
         """Read interface's supported timestamping modes."""
@@ -147,39 +247,6 @@ class Interface:
 
         return modes
 
-    def _read_uevent(self):
-        """Read device's uevent data"""
-
-        """Read device's uevent file provided by the driver via sysfs.
-
-        Device's uevent data examples:
-
-        Westport Channel NIC:
-            DRIVER=ice
-            PCI_CLASS=20000
-            PCI_ID=8086:1593
-            PCI_SUBSYS_ID=8086:0005
-            PCI_SLOT_NAME=0000:1a:00.0
-            MODALIAS=pci:v00008086d00001593sv00008086sd00000005bc02sc00i00
-
-        Returns : a dict of the uevent data"""
-        data = {}
-        filename = uevent_path % self.name
-        if os.path.exists(filename):
-            with open(filename, 'r') as infile:
-                for line in infile:
-                    if '=' in line:
-                        field, value = line.strip('\n').split('=')
-                        data[field] = value
-
-        if data:
-            collectd.debug(f"{PLUGIN} {self.name} uevent data {data}")
-        else:
-            collectd.info(f"{PLUGIN} {self.name} no uevent data")
-            return None
-
-        return data
-
     def _read_nmea_serial_port_name(self):
         """Read device's GNSS NMEA serial port name"""
 
@@ -253,8 +320,12 @@ class Interface:
         switch_id = None
         filepath = switch_id_path % self.name
         if os.path.exists(filepath):
-            with open(filepath, 'r') as infile:
-                data = infile.read().strip('\n')
+            try:
+                with open(filepath, 'r') as infile:
+                    data = infile.read().strip('\n')
+            except (FileNotFoundError, PermissionError, OSError) as err:
+                collectd.debug(f"{PLUGIN} {self.name} Read phy_switch_id file failed, "
+                               f"reason: {err}")
 
         if data:
             collectd.debug(f"{PLUGIN} {self.name} phy switch id "
@@ -276,7 +347,7 @@ class Interface:
         """Read Microchip's GNSS module clock id"""
 
         """Read Microchip's GNSS module clock id file provided
-        by the zl3073x_core driver via sysfs.
+        by the zl3073x driver via sysfs.
 
         The clock_id file contains the id in decimal format,
         for example:
@@ -319,21 +390,21 @@ class Interface:
         """Get PCI id"""
         pci_id = None
         if self.uevent:
-            pci_id = self.uevent.get('PCI_ID', None)
+            pci_id = self.uevent.pci_id
         return pci_id
 
     def get_pci_subsys_id(self):
         """Get PCI subsys id"""
         pci_subsys_id = None
         if self.uevent:
-            pci_subsys_id = self.uevent.get('PCI_SUBSYS_ID', None)
+            pci_subsys_id = self.uevent.pci_subsys_id
         return pci_subsys_id
 
     def get_pci_slot(self):
         """Get device's PCI slot"""
         pci_slot = None
         if self.uevent:
-            pci_slot = self.uevent.get('PCI_SLOT_NAME', None)
+            pci_slot = self.uevent.pci_slot_name
         return pci_slot
 
     def get_nmea(self):
@@ -348,29 +419,16 @@ class Interface:
         """Get network interface family"""
         family = 'unknown'
         pci_id = self.get_pci_id()
-        pci_subsys_id = self.get_pci_subsys_id()
 
         family_dict = {
-            '8086:12D3': {
-                '8086:0005': 'Connorsville'
-            },
-            '8086:1591': {
-                '1374:02D6': 'Silicom STS2'
-            },
-            '8086:1592': {
-                '8086:000F': 'Logan Beach'
-            },
-            '8086:1593': {
-                '8086:0005': 'Salem Channel',
-                '8086:000F': 'Westport Channel'
-            },
-            '8086:579E': {
-                '8086:0000': 'Granite Rapid-D'
-            }
+            '8086:12D3': 'Connorsville',
+            '8086:1591': 'Silicom STS2',
+            '8086:1592': 'Logan Beach',
+            '8086:1593': 'Salem Channel/Westport Channel',
+            '8086:579E': 'Granite Rapid-D'
         }
 
-        if pci_id in family_dict.keys() and \
-           pci_subsys_id in family_dict[pci_id].keys():
-            family = family_dict[pci_id][pci_subsys_id]
+        if pci_id in family_dict.keys():
+            family = family_dict[pci_id]
 
         return family

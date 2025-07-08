@@ -114,6 +114,21 @@ PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'phc2sys-*.conf'
 PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
 
+
+def _get_ptp_options_path():
+    os_type = _get_os_release()
+    if os_type == '\"centos\"':
+        return '/etc/sysconfig'
+    elif os_type == 'debian':
+        return '/etc/default'
+    else:
+        collectd.error("%s unsupported OS type '%s'" % (PLUGIN, os_type))
+        return ''
+
+
+PTP_OPTIONS_PATH = _get_ptp_options_path()
+
+
 PTP_INSTANCE_TYPE_PTP4L = 'ptp4l'
 PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
 PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
@@ -297,10 +312,11 @@ G8275_PRC_FREERUN = {
 }
 
 # sysfs paths
+PTP_SYSFS_PATH = '/sys/class/net/%s/device/ptp/'
 GNSS_SYSFS_PATH = '/sys/class/net/%s/device/gnss/%s'
 USB_DEVICE_PATH = '/sys/bus/usb/devices/'
 USB_TTY_DEVICE_PATH = USB_DEVICE_PATH + '*/*/tty/%s'
-ZL3073X_SYSFS_PATH = '/sys/module/zl3073x_core'
+ZL3073X_SYSFS_PATH = '/sys/module/zl3073x'
 
 # default phc2sys HA socket
 PHC2SYS_HA_SOCKET_DEFAULT = '/var/run/phc2sys-phc-ha'
@@ -1273,6 +1289,19 @@ def is_nmea_tty_a_microchip_gnss_receiver(tty_device):
     return vendor_id in ['1546'] and product_id in ['01a9']
 
 
+def read_ptp_service_options(instance_name, instance_type):
+    data = None
+    filepath = os.path.join(PTP_OPTIONS_PATH, 'ptpinstance',
+                            f"{instance_type}-instance-{instance_name}")
+    try:
+        with open(filepath, 'r', encoding='utf-8') as infile:
+            data = infile.read().strip('\n')
+    except (FileNotFoundError, PermissionError) as err:
+        collectd.info(f"{PLUGIN} {instance_name} Read service options file {filepath} failed, "
+                      f"reason: {err}")
+    return data
+
+
 def read_ts2phc_config():
     """read ts2phc conf files"""
     filenames = glob(PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN)
@@ -1283,6 +1312,19 @@ def read_ts2phc_config():
         for filename in filenames:
             instance = TimingInstance(filename)
             instance_name = instance.instance_name
+
+            # Get source from ts2phc command line
+            service_options = read_ptp_service_options(instance_name, PTP_INSTANCE_TYPE_TS2PHC)
+            if service_options:
+                collectd.info(f"{PLUGIN} {instance_name} service options {service_options}")
+                source = None
+                matches = re.search('OPTIONS="-s (.*)"', service_options)
+                if matches:
+                    source = matches.group(1)
+                if source:
+                    collectd.info(f"{PLUGIN} ts2phc {instance_name} source is {source}")
+                    obj.capabilities['ts2phc_source'] = source
+
             primary_interface = None
             if instance.config.has_section('global'):
                 # primary interface
@@ -1299,28 +1341,47 @@ def read_ts2phc_config():
                         ts2phc_source_interfaces[interface] = interface
                         ts2phc_instance_map[interface] = instance_name
                         obj.capabilities['primary_nic'] = interface
+                        obj.capabilities['ts2phc_source'] = 'nmea'
 
                         collectd.info(f"{PLUGIN} ts2phc instance {instance_name} "
-                                      f"primary_nic {obj.capabilities['primary_nic']}")
+                                      f"primary_nic {primary_interface}")
                     elif is_microchip_gnss_module_available() and is_nmea_tty_a_microchip_gnss_receiver(nmea):
-                        primary_interface = "eno1"
-                        create_interface_alarm_objects("eno1", instance_name)
-                        ptpinstances[instance_name].instance_type = \
-                            PTP_INSTANCE_TYPE_TS2PHC
-                        ptpinstances[instance_name].timing_instance = instance
-                        # the placeholder "eno1" interface is not being added to
-                        # ts2phc_source_interface, and ts2phc_instance_map maps.
-                        obj.capabilities['primary_nic'] = "eno1"
-
                         collectd.info(f"{PLUGIN} ts2phc instance:{instance_name}"
                                       f" microchip GNSS module detected")
+
+                        # get the 1st GNR-D interface name
+                        ptp_paths = glob(PTP_SYSFS_PATH % '*')
+                        if len(ptp_paths) > 0:
+                            for path in ptp_paths:
+                                splitted_path = path.split(os.sep)
+                                if len(splitted_path) == 8:
+                                    interface = splitted_path[4]
+                                    if Interface(interface).get_family() == 'Granite Rapid-D':
+                                        primary_interface = interface
+                                        break
+
+                        if primary_interface:
+                            create_interface(primary_interface)
+                            create_interface_alarm_objects(primary_interface, instance_name)
+                            ptpinstances[instance_name].instance_type = \
+                                PTP_INSTANCE_TYPE_TS2PHC
+                            ptpinstances[instance_name].timing_instance = instance
+                            ts2phc_source_interfaces[primary_interface] = primary_interface
+                            ts2phc_instance_map[primary_interface] = instance_name
+                            obj.capabilities['primary_nic'] = primary_interface
+                            obj.capabilities['ts2phc_source'] = 'nmea'
+
+                            collectd.info(f"{PLUGIN} ts2phc instance {instance_name} "
+                                          f"primary_nic {primary_interface}")
+                        else:
+                            collectd.warning(f"{PLUGIN} Create ts2phc instance failed.")
                     else:
                         collectd.warning("%s invalid nmea serial port path: %s" %
                                          (PLUGIN, nmea))
 
             # secondary interfaces
             if instance.interfaces:
-                for interface in interfaces:
+                for interface in instance.interfaces:
                     create_interface(interface)
                     base_port = interfaces[interface].get_base_port()
                     # if interface is different than primary's
@@ -1386,7 +1447,7 @@ def init_func():
 
     obj.hostname = obj.gethostname()
     obj.base_eid = 'host=' + obj.hostname
-    obj.capabilities = {'primary_nic': None}
+    obj.capabilities = {'primary_nic': None, 'ts2phc_source': None}
 
     if os.path.exists(PTPINSTANCE_PATH):
         read_ptp4l_config()
@@ -1951,10 +2012,21 @@ def check_clock_class(instance):
     current_clock_class = data.get('clockClass', CLOCK_CLASS_248)
 
     # Determine the base port of the NIC from the interface
-    base_port = Interface.base_port(ctrl.interface)
-    primary_nic = ts2phc_source_interfaces.get(base_port, None)
+    interface = interfaces.get(ctrl.interface, None)
+    if not interface:
+        collectd.warning(f"{PLUGIN} {instance} Interface {ctrl.interface} not found")
+        return
+    base_port = interface.get_base_port()
+    # Granite Rapid-D and Connorsville NICs are always primary, because
+    # they can't be daisy-chained.
+    primary_nic = None
+    if interface.get_family() in ['Granite Rapid-D', 'Connorsville']:
+        primary_nic = base_port
+    else:
+        primary_nic = ts2phc_source_interfaces.get(base_port, None)
+
     if not primary_nic:
-        collectd.warning("%s Instance %s is has no time source" %
+        collectd.warning("%s Instance %s has no time source" %
                          (PLUGIN, instance))
         return
 
@@ -1981,9 +2053,9 @@ def check_clock_class(instance):
     ho_timer_interface = base_port
     if primary_nic == base_port:
         # We have the primary NIC
-        state, _ = get_netlink_dpll_status(primary_nic, DeviceType.EEC)
+        state, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
         instance_type = PTP_INSTANCE_TYPE_TS2PHC
-        collectd.info(f"{PLUGIN} {instance} Primary device {primary_nic} "
+        collectd.info(f"{PLUGIN} {instance} Primary device {base_port} "
                       f"status {state}")
     else:
         # We have a secondary NIC
@@ -2061,9 +2133,28 @@ def check_clock_class(instance):
                          frequency_traceable))
 
 
-def process_ptp_synce(instance):
-    """process ptp synce alarms"""
-    collectd.debug(f"{PLUGIN} process_ptp_synce: {instance}")
+def check_gnss_signal(instance):
+    """check GNSS signal and manage alarms"""
+    collectd.debug(f"{PLUGIN} check_gnss_signal: {instance}")
+
+    ctrl = ptpinstances[instance]
+    base_port = Interface.base_port(ctrl.interface)
+    state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
+    collectd.info(f"{PLUGIN} Monitoring instance: {instance} "
+                  f"device {ctrl.interface} status {state.value} pin %s"
+                  % (pin.pin_board_label if pin else "unknown"))
+    check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
+                     ctrl.interface, state)
+    if state not in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]:
+        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+            collectd.info("%s %s not locked to remote GNSS" %
+                          (PLUGIN, obj.hostname))
+        ctrl.log_throttle_count += 1
+
+
+def check_1pps_signal(instance):
+    """check 1PPS signal and manage alarms"""
+    collectd.debug(f"{PLUGIN} check_1pps_signal: {instance}")
     # Check GNSS signal status on primary NIC
     # Check SMA/1PPS signal status on secondary NIC
 
@@ -2072,68 +2163,45 @@ def process_ptp_synce(instance):
         'sma2': CGU_PIN_SMA2,
         # 'syncE': CGU_PIN_RCLKA
     }
+
     ctrl = ptpinstances[instance]
-    if ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC:
-        base_port = Interface.base_port(ctrl.interface)
-        state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
-        collectd.info(f"{PLUGIN} Monitoring instance: {instance} "
-                      f"device {ctrl.interface} status {state.value} pin %s"
-                      % (pin.pin_board_label if pin else "unknown"))
-        check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
-                         ctrl.interface, state)
-        if state not in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]:
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.info("%s %s not locked to remote GNSS"
-                              % (PLUGIN, obj.hostname))
-            ctrl.log_throttle_count += 1
-    elif ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
-        for interface, pin_function in ctrl.clock_ports.items():
-            alarm_obj = get_alarm_object(
-                ALARM_CAUSE__1PPS_SIGNAL_LOSS, interface)
-            if len(pin_function) == 0:
-                # No pins are configured for the secondary NIC
-                # It checks for alarm with the state of SMA1, SMA2 or GNSS-1PPS pins.
-                state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
-                if state in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
-                    state, pin = get_netlink_dpll_status(interface, DeviceType.EEC)
+    for interface, pin_function in ctrl.clock_ports.items():
+        alarm_obj = get_alarm_object(
+            ALARM_CAUSE__1PPS_SIGNAL_LOSS, interface)
+        if len(pin_function) == 0:
+            # No pins are configured for the secondary NIC
+            # It checks for alarm with the state of SMA1, SMA2 or GNSS-1PPS pins.
+            state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
+            if state in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
+                state, pin = get_netlink_dpll_status(interface, DeviceType.EEC)
+            collectd.info(f"{PLUGIN} Monitoring instance {instance} "
+                          f"device {ctrl.interface} status {state.value} pin %s"
+                          % (pin.pin_board_label if pin else "unknown"))
+            check_gnss_alarm(instance, alarm_obj, ctrl.interface, state)
+        else:
+            # Pins are configured, check GNSS then SMA
+            state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
+            if state not in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
+                # NIC has a GNSS connection and it takes priority over SMA1/SMA2
                 collectd.info(f"{PLUGIN} Monitoring instance {instance} "
-                              f"device {ctrl.interface} status {state.value} pin %s"
+                              f"device {interface} status {state.value} pin %s"
                               % (pin.pin_board_label if pin else "unknown"))
-                check_gnss_alarm(instance, alarm_obj,
-                                 ctrl.interface, state)
+                check_gnss_alarm(instance, alarm_obj, interface, state)
             else:
-                # Pins are configured, check GNSS then SMA
-                state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
-                if state not in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
-                    # NIC has a GNSS connection and it takes priority over SMA1/SMA2
-                    collectd.info(f"{PLUGIN} Monitoring instance {instance} "
-                                  f"device {interface} status {state.value} pin %s"
-                                  % (pin.pin_board_label if pin else "unknown"))
-                    check_gnss_alarm(instance,
-                                     alarm_obj,
-                                     interface,
-                                     state)
-                else:
-                    # Check the SMA pins if they are configured
-                    for key, function in pin_function.items():
-                        # Do not care about pins configured for 'output' functionality
-                        if key in pin_lookup.keys() and function.lower() != CGU_PIN_SMA_OUTPUT:
-                            pin_name = pin_lookup[key]
-                        else:
-                            # Do not care about the other pins
-                            continue
-                        pin = get_netlink_pin_status(interface, pin_name)
-                        if pin:
-                            collectd.info(f"{PLUGIN} Monitoring instance {instance} "
-                                          f"device {interface} pin {pin.pin_board_label} "
-                                          f"status {pin.pin_state.value}")
-                            check_pin_alarm(instance,
-                                            alarm_obj,
-                                            interface,
-                                            pin.pin_state)
-    elif ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L and ctrl.interface:
-        check_time_drift(instance)
-        check_clock_class(instance)
+                # Check the SMA pins if they are configured
+                for key, function in pin_function.items():
+                    # Do not care about pins configured for 'output' functionality
+                    if key in pin_lookup.keys() and function.lower() != CGU_PIN_SMA_OUTPUT:
+                        pin_name = pin_lookup[key]
+                    else:
+                        # Do not care about the other pins
+                        continue
+                    pin = get_netlink_pin_status(interface, pin_name)
+                    if pin:
+                        collectd.info(f"{PLUGIN} Monitoring instance {instance} "
+                                      f"device {interface} pin {pin.pin_board_label} "
+                                      f"status {pin.pin_state.value}")
+                        check_pin_alarm(instance, alarm_obj, interface, pin.pin_state)
 
 
 #####################################################################
@@ -2327,8 +2395,23 @@ def read_func():
             # Non-synce PTP
             check_ptp_regular(instance, ctrl, conf_file)
 
-        if obj.capabilities['primary_nic']:
-            process_ptp_synce(instance)
+        # Check GNSS and 1PPS alarms if nmea source is configured
+        if obj.capabilities['ts2phc_source'] == 'nmea':
+            if ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC:
+                check_gnss_signal(instance)
+            if ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
+                check_1pps_signal(instance)
+
+        # Check time drift and manage PTP clock class if any ts2phc
+        # source is configured, and instance type is PTP4l.
+        if obj.capabilities['ts2phc_source'] and \
+           ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            # Check time drift between PTP instance and system clock
+            check_time_drift(instance)
+            # Manage PTP clock class only for configured follower PHC clocks
+            if ctrl.interface and \
+               Interface.base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
+                check_clock_class(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
             handle_ptp4l_g8275_fields(instance)
