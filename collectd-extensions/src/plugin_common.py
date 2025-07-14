@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2024 Wind River Systems, Inc.
+# Copyright (c) 2019-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -27,6 +27,7 @@ from kubernetes import __version__ as K8S_MODULE_VERSION
 from kubernetes import client
 from kubernetes import config
 from kubernetes.client import Configuration
+from kubernetes.client.rest import ApiException
 import urllib3
 
 
@@ -87,6 +88,7 @@ GROUPS_AGGREGATED = [GROUP_PLATFORM, GROUP_BASE, GROUP_K8S_SYSTEM,
 CGROUP_INIT = 'init.scope'
 CGROUP_SYSTEM = 'system.slice'
 CGROUP_USER = 'user.slice'
+CGROUP_UTILS = 'utils.slice'
 CGROUP_MACHINE = 'machine.slice'
 CGROUP_K8SPLATFORM = 'k8splatform.slice'
 CGROUP_DOCKER = 'docker'
@@ -102,14 +104,11 @@ CONTAINERS_CGROUPS = [CGROUP_SYSTEM_CONTAINERD, CGROUP_SYSTEM_DOCKER,
 
 # Groupings by first level cgroup
 BASE_GROUPS = [CGROUP_INIT, CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER,
-               CGROUP_K8SPLATFORM]
+               CGROUP_UTILS, CGROUP_K8SPLATFORM]
 BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
 
 # Groupings of pods by kubernetes namespace
-K8S_NAMESPACE_SYSTEM = ['kube-system', 'armada', 'cert-manager', 'portieris',
-                        'vault', 'notification', 'platform-deployment-manager',
-                        'flux-helm', 'metrics-server', 'node-feature-discovery',
-                        'intel-power', 'power-metrics', 'sriov-fec-system']
+K8S_NAMESPACE_SYSTEM = ['kube-system']
 K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
 PLATFORM_LABEL_KEY = "app.starlingx.io/component"
 
@@ -701,6 +700,16 @@ class K8sClient(object):
             spec=pod.get('spec'),
             status=self._as_kube_status(pod.get('status')))
 
+    def _get_namespace_labels(self, namespace_list):
+        # some namespaces might not have label, so
+        # return empty dict for them
+        namespace_labels = {}
+        for n in namespace_list:
+            labels = n["metadata"].get("labels", {})
+            name = n["metadata"]["name"]
+            namespace_labels.update({name: labels})
+        return namespace_labels
+
     def _as_kube_status(self, status):
         # status (json) dictionary has the following keys:
         # 'conditions', 'containerStatuses', 'hostIP', 'phase',
@@ -778,14 +787,36 @@ class K8sClient(object):
             collectd.error("kube_get_local_pods: error=%s" % (str(err)))
             raise
 
+    def get_namespace_labels(self):
+        # Get namespace labels
+        try:
+            kube_results = subprocess.check_output(
+                ['kubectl', '--kubeconfig', KUBELET_CONF,
+                    'get', 'namespaces',
+                    '-o', 'json',
+                 ], timeout=K8S_TIMEOUT).decode()
+            json_results = json.loads(kube_results)
+
+        except subprocess.TimeoutExpired:
+            collectd.error('kube_get_namespaces: Timeout')
+            return {}
+        except json.JSONDecodeError as e:
+            collectd.error('kube_get_namespaces: Could not parse json output, error=%s' % (str(e)))
+            return {}
+        except subprocess.CalledProcessError as e:
+            collectd.error('kube_get_namespaces: Could not get namespaces, error=%s' % (str(e)))
+            return {}
+
+        return self._get_namespace_labels(json_results["items"])
+
 
 class POD_object:
-    def __init__(self, uid, name, namespace, qos_class, labels=None):
+    def __init__(self, uid, name, namespace, qos_class, platform_label=False):
         self.uid = uid
         self.name = name
         self.namespace = namespace
         self.qos_class = qos_class
-        self.labels = labels
+        self.platform_label = platform_label
 
     def __str__(self):
         return str(self.__class__) + ": " + str(self.__dict__)
@@ -797,8 +828,7 @@ class POD_object:
         """Check whether pod contains platform namespace or platform label"""
 
         if (self.namespace in K8S_NAMESPACE_SYSTEM
-                or (self.labels is not None and
-                    self.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM)):
+                or self.platform_label):
             return True
         return False
 
@@ -909,3 +939,64 @@ def format_range_set(items):
             s = "%s-%s" % (rng[0][1], rng[-1][1])
         ranges.append(s)
     return ','.join(ranges)
+
+
+def pods_monitoring(cg_pods, obj, PLUGIN_DEBUG):
+    if not cg_pods.issubset(obj.k8s_pods):
+        if obj.debug:
+            collectd.info('%s: Refresh k8s pod information.' % (PLUGIN_DEBUG))
+        obj.k8s_pods = set()
+        try:
+            namespace_labels = obj._k8s_client.get_namespace_labels()
+            pods = obj._k8s_client.kube_get_local_pods()
+            for i in pods:
+                # NOTE: parent pod cgroup name contains annotation config.hash as
+                # part of its name, otherwise it contains the pod uid.
+                uid = i.metadata.uid
+
+                namespace = i.metadata.namespace
+                platform_label = False
+                # Check if platform label is present in namespace label or pod label
+                if ((namespace_labels[namespace].get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM) or
+                        (i.metadata.labels and
+                         (i.metadata.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM))):
+                    platform_label = True
+
+                if ((i.metadata.annotations) and
+                        (POD_ANNOTATION_KEY in i.metadata.annotations)):
+                    hash_uid = i.metadata.annotations.get(POD_ANNOTATION_KEY,
+                                                          None)
+                    if hash_uid:
+                        if obj.debug:
+                            collectd.info('%s: POD_ANNOTATION_KEY: '
+                                          'hash=%s, uid=%s, '
+                                          'name=%s, namespace=%s, qos_class=%s, '
+                                          'is_platform_label=%s'
+                                          % (PLUGIN_DEBUG,
+                                             hash_uid,
+                                             i.metadata.uid,
+                                             i.metadata.name,
+                                             namespace,
+                                             i.status.qos_class,
+                                             platform_label))
+                        uid = hash_uid
+
+                obj.k8s_pods.add(uid)
+                if uid not in obj._cache:
+                    obj._cache[uid] = POD_object(i.metadata.uid,
+                                                 i.metadata.name,
+                                                 namespace,
+                                                 i.status.qos_class,
+                                                 platform_label)
+
+            # Remove stale _cache entries
+            remove_uids = set(obj._cache.keys()) - obj.k8s_pods
+            for uid in remove_uids:
+                del obj._cache[uid]
+
+        except ApiException:
+            # continue with remainder of calculations, keeping cache
+            collectd.warning('%s encountered kube ApiException' % (PLUGIN_DEBUG))
+            pass
+
+    return obj

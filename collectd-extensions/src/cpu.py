@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2024 Wind River Systems, Inc.
+# Copyright (c) 2018-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -38,7 +38,7 @@ PLUGIN_HISTOGRAM_INTERVAL = 300  # histogram interval in secs
 TIMESTAMP = 'timestamp'
 PLATFORM_CPU_PERCENT = 'platform-occupancy'
 CGROUP_PLATFORM_CPU_PERCENT = 'cgroup-platform-occupancy'
-SCHEDSTAT_SUPPORTED_VERSION = 15
+SCHEDSTAT_SUPPORTED_VERSION = 16
 
 # Linux per-cpu info
 CPUINFO = '/proc/cpuinfo'
@@ -299,6 +299,7 @@ def get_cpuacct():
     cpuacct[pc.GROUP_PODS] = {}
     cpuacct[pc.CGROUP_SYSTEM] = {}
     cpuacct[pc.CGROUP_USER] = {}
+    cpuacct[pc.CGROUP_UTILS] = {}
     cpuacct[pc.CGROUP_INIT] = {}
     cpuacct[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -308,6 +309,7 @@ def get_cpuacct():
     cpuwait[pc.GROUP_PODS] = {}
     cpuwait[pc.CGROUP_SYSTEM] = {}
     cpuwait[pc.CGROUP_USER] = {}
+    cpuwait[pc.CGROUP_UTILS] = {}
     cpuwait[pc.CGROUP_INIT] = {}
     cpuwait[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -353,7 +355,22 @@ def get_cpuacct():
         cpuacct[pc.CGROUP_SYSTEM][name] = acct
         cpuwait[pc.CGROUP_SYSTEM][name] = wait
 
-    # Walk the system.slice cgroups and get cpuacct usage
+    # Walk the utils.slice cgroups and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.CGROUP_UTILS])
+    if os.path.isdir(path):
+        dir_list = next(os.walk(path))[1]
+    else:
+        dir_list = []
+    for name in dir_list:
+        if any(name.endswith(x) for x in exclude_types):
+            continue
+        cg_path = '/'.join([path, name])
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
+        wait = get_cgroup_cpu_wait_sum(cg_path)
+        cpuacct[pc.CGROUP_UTILS][name] = acct
+        cpuwait[pc.CGROUP_UTILS][name] = wait
+
+    # Walk the k8splatform.slice cgroups and get cpuacct usage
     path = '/'.join([CPUACCT, pc.CGROUP_K8SPLATFORM])
     if os.path.isdir(path):
         dir_list = next(os.walk(path))[1]
@@ -504,7 +521,7 @@ def calculate_occupancy(
             continue
 
         # K8S platform system usage, i.e., essential: kube-system
-        # check for component label app.starlingx.io/component=platform        
+        # check for component label app.starlingx.io/component=platform
         if pod.is_platform_resource():
             cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += acct
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += wait
@@ -537,6 +554,11 @@ def calculate_occupancy(
                 cpuacct[pc.CGROUP_K8SPLATFORM][g]
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
                 cpuwait[pc.CGROUP_K8SPLATFORM][g]
+        if g in cpuacct[pc.CGROUP_UTILS].keys():
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuacct[pc.CGROUP_UTILS][g]
+            cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuwait[pc.CGROUP_UTILS][g]
 
     # Calculate platform cpuacct usage (this excludes apps)
     for g in pc.PLATFORM_GROUPS:
@@ -654,6 +676,26 @@ def calculate_occupancy(
         if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
             h_occw[g] = g_occw
 
+    # Calculate cgroup based occupancy for cgroups within utils.slice.
+    if pc.CGROUP_UTILS in cpuacct.keys():
+        for g in cpuacct[pc.CGROUP_UTILS]:
+            cputime_ms = \
+                float(cpuacct[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occ = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occ[g] = g_occ
+            cpuwait_ms = \
+                float(cpuwait[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occw = float(pc.ONE_HUNDRED) * float(cpuwait_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occw[g] = g_occw
+
+            # Keep hirunners exceeding minimum threshold.
+            if g_occ >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occ[g] = g_occ
+            if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occw[g] = g_occw
+
     if (hires and prefix == 'hires') or (dispatch and prefix == 'dispatch'):
         # Print cpu occupancy usage for high-level groupings
         collectd.info('%s %s Usage: %.1f%% (avg per cpu); '
@@ -757,6 +799,8 @@ def update_cpu_data(init=False):
     since this routine was last run.
     """
 
+    global obj
+
     # Get epoch time in floating seconds
     now = time.time()
 
@@ -795,51 +839,7 @@ def update_cpu_data(init=False):
 
     # Refresh the k8s pod information if we have discovered new cgroups
     cg_pods = set(t1_cpuacct[pc.GROUP_PODS].keys())
-    if not cg_pods.issubset(obj.k8s_pods):
-        if obj.debug:
-            collectd.info('%s Refresh k8s pod information.' % (PLUGIN_DEBUG))
-        obj.k8s_pods = set()
-        try:
-            pods = obj._k8s_client.kube_get_local_pods()
-            for i in pods:
-                # NOTE: parent pod cgroup name contains annotation config.hash as
-                # part of its name, otherwise it contains the pod uid.
-                uid = i.metadata.uid
-                if ((i.metadata.annotations) and
-                        (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
-                    hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
-                                                          None)
-                    if hash_uid:
-                        if obj.debug:
-                            collectd.info('%s POD_ANNOTATION_KEY: '
-                                          'hash=%s, uid=%s, '
-                                          'name=%s, namespace=%s, qos_class=%s,'
-                                          'is_platform_label=%s'
-                                          % (PLUGIN_DEBUG,
-                                             hash_uid,
-                                             i.metadata.uid,
-                                             i.metadata.name,
-                                             i.metadata.namespace,
-                                             i.status.qos_class,
-                                             i.metadata.labels.get(pc.PLATFORM_LABEL_KEY) ==
-                                             pc.GROUP_PLATFORM))
-                        uid = hash_uid
-
-                obj.k8s_pods.add(uid)
-                if uid not in obj._cache:
-                    obj._cache[uid] = pc.POD_object(i.metadata.uid,
-                                                    i.metadata.name,
-                                                    i.metadata.namespace,
-                                                    i.status.qos_class,
-                                                    i.metadata.labels)
-            # Remove stale _cache entries
-            remove_uids = set(obj._cache.keys()) - obj.k8s_pods
-            for uid in remove_uids:
-                del obj._cache[uid]
-        except ApiException:
-            # continue with remainder of calculations, keeping cache
-            collectd.warning('%s encountered kube ApiException' % (PLUGIN))
-            pass
+    obj = pc.pods_monitoring(cg_pods, obj, PLUGIN_DEBUG)
 
     # Save initial state information
     if init:
