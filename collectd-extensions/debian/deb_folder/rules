@@ -39,6 +39,7 @@ override_dh_install:
 
 	# collectd python plugin files - resource plugins
 	install -m 700 cpu.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 gpspipe.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 memory.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 ntpq.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
