@@ -1454,6 +1454,11 @@ def read_ptp_service_options(instance_name, instance_type):
     return data
 
 
+def prune_reconfigured_suffix(nmea_serialport):
+    # truncate suffix .pty (gpspipe output device) if any, to get the actual device path
+    return nmea_serialport.removesuffix(".pty") if nmea_serialport else None
+
+
 def read_ts2phc_config():
     """read ts2phc conf files"""
     filenames = glob(PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN)
@@ -1480,7 +1485,8 @@ def read_ts2phc_config():
             primary_interface = None
             if instance.config.has_section('global'):
                 # primary interface
-                nmea = instance.config['global'].get('ts2phc.nmea_serialport', None)
+                nmea_mask = instance.config['global'].get('ts2phc.nmea_serialport', None)
+                nmea = prune_reconfigured_suffix(nmea_mask)
                 if nmea:
                     interface = get_interface_name_from_gnss(nmea)
                     if interface:
