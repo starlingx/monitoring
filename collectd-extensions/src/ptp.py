@@ -496,7 +496,6 @@ def read_files_for_timing_instances():
     else:
         for filename in filenames:
             instance = TimingInstance(filename)
-            ptpinstances[instance.instance_name] = None
             collectd.info("ptpinstances = %s" % ptpinstances)
             if 'ha_enabled' in instance.config['global'].keys() \
                     and instance.config['global']['ha_enabled'] == '1' \
@@ -734,7 +733,7 @@ class TimingInstance:
     def set_phc2sys_state(self):
         collectd.debug("%s Setting state for phc2sys instance %s" %
                        (PLUGIN, self.instance_name))
-        state = {}
+        state = self.state
         state["phc2sys_source_interface"] = self.query_phc2sys_socket(
             "clock source", self.phc2sys_com_socket
         )
