@@ -28,7 +28,22 @@ sys.modules["collectd"] = Collectd()
 import ptp_monitoring as pm
 
 if __name__ == "__main__":
-    for device_path in ["/dev/gnss0", "/dev/gnss1", "/dev/gnssx"]:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Poll Gpsd data for the supplied GNSS devices')
+
+    parser.add_argument("--devices", action="extend", nargs="+", type=str,
+                        help='GNSS devices to be polled e.g /dev/gnss0 /dev/ttyACM0')
+    args = parser.parse_args()
+    print(f"Devices supplied as argument: {args.devices}")
+
+    # Default devices in case no devices argument passed
+    device_paths = ["/dev/gnss0", "/dev/gnss1", "/dev/gnssx"]
+    if args.devices:
+        device_paths = args.devices
+
+    for device_path in device_paths:
         data = pm.get_gps_data(device_path)
         message = f"{device_path}'s gps_data: {data}"
         print(message)
