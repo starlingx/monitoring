@@ -2046,7 +2046,7 @@ def _info_collecting_samples(hostname, instance, offset, gm_identity=None):
                       (PLUGIN, hostname, instance, float(offset)))
 
 
-def check_time_drift(instance, gm_identity=None):
+def check_time_drift(instance, gm_identity=None, master_offset=0):
     """Check time drift"""
     collectd.debug(f"{PLUGIN} check_time_drift: %s" % instance)
     ctrl = ptpinstances[instance]
@@ -2083,9 +2083,14 @@ def check_time_drift(instance, gm_identity=None):
         # Manage the sample OOT alarm severity
         severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
         offset = float(abs(raw_offset) - utc_offset_ns)
-        if abs(offset) > OOT_MAJOR_THRESHOLD:
+        fault_offset = master_offset if abs(master_offset) > abs(offset) else offset
+        collectd.info("%s instance %s phc offset %f master_offset %f" %
+                      (PLUGIN, instance, offset, master_offset))
+        if (abs(offset) > OOT_MAJOR_THRESHOLD
+                or abs(master_offset) > OOT_MAJOR_THRESHOLD):
             severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        elif abs(offset) > OOT_MINOR_THRESHOLD:
+        elif (abs(offset) > OOT_MINOR_THRESHOLD
+                or abs(master_offset) > OOT_MINOR_THRESHOLD):
             severity = fm_constants.FM_ALARM_SEVERITY_MINOR
 
         # Handle clearing of Out-Of-Tolerance alarm
@@ -2095,30 +2100,42 @@ def check_time_drift(instance, gm_identity=None):
                     ctrl.oot_alarm_object.severity = \
                         fm_constants.FM_ALARM_SEVERITY_CLEAR
                     ctrl.oot_alarm_object.raised = False
+
+        # Special Case:
+        # -------------
+        # Don't raise minor alarm when in software timestamping mode.
+        # Too much skew in software or legacy mode ; alarm would bounce.
+        elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
+                and obj.mode != 'hardware' \
+                and abs(master_offset) > OOT_MINOR_THRESHOLD:
+            collectd.info("%s instance %s minor skew detected, "
+                          "not raising OOT alarm in software mode" %
+                          (PLUGIN, instance))
+            return 0
+
         else:
-            # Handle debounce of the OOT alarm.
-            # Debounce by 1 for the state transitions (clear --> major/minor) of severity level.
-            # Alarm not raised for clear to major/minor severity state transition.
-            # Alarm raised for major to major/minor and minor to major/minor severity state
-            # transitions.
-            #
-            is_severity_state_clear_to_major_or_minor = False
-            if ctrl.oot_alarm_object.severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                is_severity_state_clear_to_major_or_minor = True
+            # Handle raising the OOT alarm.
+            # Because the polling cycle for the ptp plugin is 30 seconds, we cannot
+            # afford to wait two cycles while debouncing the OOT alarm.
+            # The previous logic required a skew to be present for 2 consecutive
+            # polling cycles before raising the OOT alarm, but this would fail to
+            # alarm for transient skews that are present for less than 60 seconds.
+
+            # The OOT alarm is now raised immediately when the skew is detected,
+            # and the severity is updated accordingly.
 
             if ctrl.oot_alarm_object.severity != severity:
                 ctrl.oot_alarm_object.severity = severity
 
             # This will keep refreshing the alarm text with the current
-            # skew value while still debounce on state transitions (clear --> major/minor).
+            # skew value.
             #
             # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
             #
-            if not is_severity_state_clear_to_major_or_minor and (
-                    severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
-                    severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
+            if severity in (fm_constants.FM_ALARM_SEVERITY_MINOR,
+                            fm_constants.FM_ALARM_SEVERITY_MAJOR):
                 # Handle raising the OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, instance, offset)
+                rc = raise_alarm(ALARM_CAUSE__OOT, instance, fault_offset)
                 if rc is True:
                     ctrl.oot_alarm_object.raised = True
 
@@ -2128,7 +2145,7 @@ def check_time_drift(instance, gm_identity=None):
                               "PTP instance: %s ; "
                               "Skew:%5d" % (PLUGIN,
                                             instance,
-                                            offset))
+                                            fault_offset))
 
 
 def is_service_running(ptp_service):
@@ -2570,8 +2587,8 @@ def read_func():
         # source is configured, and instance type is PTP4l.
         if obj.capabilities['ts2phc_source'] and \
            ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
-            # Check time drift between PTP instance and system clock
-            check_time_drift(instance)
+            # Removed redundant call to check_time_drift()
+            # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
             if ctrl.interface and \
                Interface.base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
@@ -2948,8 +2965,15 @@ def check_ptp_regular(instance, ctrl, conf_file):
 
     # Handle clearing nolock alarm
     elif ctrl.nolock_alarm_object.raised is True:
+        collectd.info("%s %s %s locked to remote Grand Master "
+                      "(%s)" % (PLUGIN, obj.hostname, instance, gm_identity))
         if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
             ctrl.nolock_alarm_object.raised = False
+
+    if got_master_offset:
+        check_time_drift(instance, gm_identity, master_offset)
+    else:
+        check_time_drift(instance, gm_identity)
 
     # Keep this FIT test code but make it commented out for security
     # if os.path.exists('/var/run/fit/ptp_data'):
@@ -2961,92 +2985,6 @@ def check_ptp_regular(instance, ctrl, conf_file):
     #             collectd.info("%s using ptp FIT data skew:%d" %
     #                           (PLUGIN, master_offset))
     #             break
-
-    # Send sample and Manage the Out-Of-Tolerance alarm
-    if got_master_offset is True:
-
-        if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-            _info_collecting_samples(obj.hostname, instance, master_offset,
-                                     gm_identity)
-
-        ctrl.log_throttle_count += 1
-
-        # setup the sample structure and dispatch
-        val = collectd.Values(host=obj.hostname)
-        val.type = PLUGIN_TYPE
-        val.type_instance = PLUGIN_TYPE_INSTANCE
-        val.plugin = 'ptp'
-        val.dispatch(values=[float(master_offset)])
-
-        # Manage the sample OOT alarm severity
-        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
-        if abs(master_offset) > OOT_MAJOR_THRESHOLD:
-            severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        elif abs(master_offset) > OOT_MINOR_THRESHOLD:
-            severity = fm_constants.FM_ALARM_SEVERITY_MINOR
-
-        # Handle clearing of Out-Of-Tolerance alarm
-        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR or clock_locked:
-            if ctrl.oot_alarm_object.raised is True:
-                if clear_alarm(ctrl.oot_alarm_object.eid) is True:
-                    ctrl.oot_alarm_object.severity = \
-                        fm_constants.FM_ALARM_SEVERITY_CLEAR
-                    ctrl.oot_alarm_object.raised = False
-
-        else:
-            # Special Case:
-            # -------------
-            # Don't raise minor alarm when in software timestamping mode.
-            # Too much skew in software or legacy mode ; alarm would bounce.
-            # TODO: Consider making ptp a real time process
-            if severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
-                    and obj.mode != 'hardware':
-                return 0
-
-            # Handle debounce of the OOT alarm.
-            # Debounce by 1 for the state transitions (clear --> major/minor) of severity level.
-            # Alarm not raised for clear to major/minor severity state transition.
-            # Alarm raised for major to major/minor and minor to major/minor severity state
-            # transitions.
-            #
-            is_severity_state_clear_to_major_or_minor = False
-            if ctrl.oot_alarm_object.severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                is_severity_state_clear_to_major_or_minor = True
-
-            if ctrl.oot_alarm_object.severity != severity:
-                ctrl.oot_alarm_object.severity = severity
-
-            # This will keep refreshing the alarm text with the current
-            # skew value while still debounce on state transitions (clear --> major/minor).
-            #
-            # Precision ... (PTP) clocking is out of tolerance by 1004 nsec
-            #
-            if not is_severity_state_clear_to_major_or_minor and (
-                    severity == fm_constants.FM_ALARM_SEVERITY_MINOR or
-                    severity == fm_constants.FM_ALARM_SEVERITY_MAJOR):
-                # Handle raising the OOT Alarm.
-                rc = raise_alarm(ALARM_CAUSE__OOT, instance, master_offset)
-                if rc is True:
-                    ctrl.oot_alarm_object.raised = True
-
-            # Record the value that is alarmable
-            if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
-                collectd.info("%s Grand Master ID: %s ; "
-                              "HOST ID: %s ; "
-                              "PTP instance: %s ; "
-                              "GM Present:%s ; "
-                              "Skew:%5d" % (PLUGIN,
-                                            gm_identity,
-                                            my_identity,
-                                            instance,
-                                            gm_present,
-                                            master_offset))
-
-        if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
-            # Check time drift in PHC clock
-            check_time_drift(instance, gm_identity)
-    else:
-        collectd.info("%s No Clock Sync" % PLUGIN)
 
     return 0
 
