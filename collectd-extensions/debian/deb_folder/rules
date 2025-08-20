@@ -47,8 +47,8 @@ override_dh_install:
 	install -m 700 ptp.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 cgu_handler.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 ptp_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
-	install -m 700 ptp_monitoring.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
-	install -m 700 ptp_monitoring_cli.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ptp_gnss_monitor.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
+	install -m 700 ptp_gnss_monitor_cli.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 ovs_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 service_res.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 

@@ -11,20 +11,20 @@ from unittest.mock import MagicMock
 # bypass 'import collectd' as it's C-based daemon, and cannot be directly imported.
 sys.modules["collectd"] = mock_collectd = MagicMock()
 sys.modules["gps"] = MagicMock()
-from src import ptp_monitoring as ptp_monitoring
+from src import ptp_gnss_monitor as ptp_monitoring
 
 
 class TestPtpMonitoring(unittest.TestCase):
     def test_parse_monitoring_config(self):
         config_file_path = (
-            "./tests/test_input_files/monitoring-ptp.conf"
+            "./tests/test_input_files/gnss-monitor-ptp.conf"
         )
 
         expected_devices = "/dev/gnss0 /dev/gnss1"
         expected_satellite_count = "12"
         expected_signal_quality_db = "30"
 
-        config = ptp_monitoring.parse_monitoring_config(config_file_path)
+        config = ptp_monitoring.parse_gnss_monitor_config(config_file_path)
         self.assertEqual(config["global"]["devices"], expected_devices)
         self.assertEqual(config["global"]["satellite_count"], expected_satellite_count)
         self.assertEqual(

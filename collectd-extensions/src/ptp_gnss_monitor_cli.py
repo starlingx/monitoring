@@ -25,7 +25,7 @@ class Collectd():
 # bypass 'import collectd' as it's C-based daemon, and cannot be directly imported.
 sys.modules["collectd"] = Collectd()
 
-import ptp_monitoring as pm
+import ptp_gnss_monitor as pm
 
 if __name__ == "__main__":
     import argparse

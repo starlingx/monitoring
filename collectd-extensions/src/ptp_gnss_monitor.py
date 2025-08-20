@@ -36,7 +36,7 @@ class GpsData:
     signal_quality_db: SignalQualityDb = SignalQualityDb()
 
 
-def parse_monitoring_config(config_file_path):
+def parse_gnss_monitor_config(config_file_path):
     # https://docs.python.org/3/library/configparser.html
     # You can access the parameters like so:
     # config['global']['parameter_name']

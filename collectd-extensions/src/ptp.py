@@ -44,7 +44,7 @@ from glob import glob
 from oslo_utils import timeutils
 from functools import lru_cache
 from ptp_interface import Interface
-import ptp_monitoring as pm
+import ptp_gnss_monitor as pm
 from cgu_handler import CguHandler
 from pynetlink import DeviceType
 from pynetlink import LockStatus
@@ -114,7 +114,7 @@ PTPINSTANCE_CLOCK_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'clock-*.conf'
 PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'phc2sys-*.conf'
 PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
-PTPINSTANCE_MONITORING_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "monitoring-*.conf"
+PTPINSTANCE_GNSS_MONITOR_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "gnss-monitor-*.conf"
 
 
 def _get_ptp_options_path():
@@ -135,7 +135,7 @@ PTP_INSTANCE_TYPE_PTP4L = 'ptp4l'
 PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
 PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
 PTP_INSTANCE_TYPE_CLOCK = 'clock'
-PTP_INSTANCE_TYPE_MONITORING = "monitoring"
+PTP_INSTANCE_TYPE_GNSS_MONITOR = "gnss-monitor"
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -185,10 +185,10 @@ ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS = 22
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK = 23
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION = 24
 
-# Monitoring Alarm codes
-ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS = 30
-ALARM_CAUSE__MONITORING_SATELLITE_COUNT = 31
-ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB = 32
+# gnss-monitor Alarm codes
+ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS = 30
+ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT = 31
+ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB = 32
 
 # Run Phase
 RUN_PHASE__INIT = 0
@@ -463,25 +463,25 @@ ts2phc_instance_map = {}
 timing_instance_list = []
 
 
-def read_monitoring_ptp_config():
-    """read monitoring-ptp conf files"""
-    filenames = glob(PTPINSTANCE_MONITORING_CONF_FILE_PATTERN)
+def read_gnss_monitor_ptp_config():
+    """read gnss-monitor-ptp conf files"""
+    filenames = glob(PTPINSTANCE_GNSS_MONITOR_CONF_FILE_PATTERN)
     if len(filenames) == 0:
         collectd.debug(
             "%s No PTP conf file located for %s"
-            % (PLUGIN, PTP_INSTANCE_TYPE_MONITORING)
+            % (PLUGIN, PTP_INSTANCE_TYPE_GNSS_MONITOR)
         )
     else:
         for filename in filenames:
             instance = TimingInstance(filename)
             ptpinstances[instance.instance_name] = None
             create_interface_alarm_objects(
-                'dummy', instance.instance_name, PTP_INSTANCE_TYPE_MONITORING
+                'dummy', instance.instance_name, PTP_INSTANCE_TYPE_GNSS_MONITOR
             )
             collectd.info("ptpinstances = %s" % ptpinstances)
             for device_path in instance.device_paths:
                 create_interface_alarm_objects(
-                    device_path, instance.instance_name, PTP_INSTANCE_TYPE_MONITORING
+                    device_path, instance.instance_name, PTP_INSTANCE_TYPE_GNSS_MONITOR
                 )
 
             ptpinstances[instance.instance_name].timing_instance = instance
@@ -529,7 +529,7 @@ class TimingInstance:
         self.interfaces = set()  # use a python set to prevent duplicates
         self.device_paths = (
             set()
-        )  # set to hold device_path list from monitoring instance
+        )  # set to hold device_path list from gnss-monitor instance
         self.config = {}  # dict of params from config file
         self.state = {}  # dict to hold the values read from pmc or cgu or gpsd
 
@@ -539,19 +539,19 @@ class TimingInstance:
             "phc2sys",
             "ptp4l",
             "ts2phc",
-            PTP_INSTANCE_TYPE_MONITORING,
+            PTP_INSTANCE_TYPE_GNSS_MONITOR,
         ]
         self.config_parsers_dict = {
             "clock": self.parse_clock_config,
             "phc2sys": self.parse_phc2sys_config,
             "ptp4l": self.parse_ptp4l_config,
             "ts2phc": self.parse_ts2phc_config,
-            PTP_INSTANCE_TYPE_MONITORING: self.parse_monitoring_config,
+            PTP_INSTANCE_TYPE_GNSS_MONITOR: self.parse_gnss_monitor_config,
         }
 
         self.state_setter_dict = {
             "phc2sys": self.set_phc2sys_state,
-            PTP_INSTANCE_TYPE_MONITORING: self.set_monitoring_state,
+            PTP_INSTANCE_TYPE_GNSS_MONITOR: self.set_gnss_monitor_state,
         }
 
         # Determine instance name and type
@@ -567,7 +567,7 @@ class TimingInstance:
                 collectd.info("%s Config file %s matches instance type %s"
                               % (PLUGIN, config_file_path, item))
                 self.instance_type = item
-                if item == PTP_INSTANCE_TYPE_MONITORING:
+                if item == PTP_INSTANCE_TYPE_GNSS_MONITOR:
                     self.instance_name = f"{item}-{instance}"
                 else:
                     self.instance_name = instance
@@ -596,8 +596,8 @@ class TimingInstance:
     def config_to_dict(self, config):
         return {section: dict(config[section]) for section in config}
 
-    def parse_monitoring_config(self):
-        config = pm.parse_monitoring_config(self.config_file_path)
+    def parse_gnss_monitor_config(self):
+        config = pm.parse_gnss_monitor_config(self.config_file_path)
         collectd.info(f"{PLUGIN} parsing of {self.config_file_path}: {self.config_to_dict(config)}")
         try:
             self.device_paths = set(
@@ -608,14 +608,14 @@ class TimingInstance:
             )
         except Exception as exc:
             collectd.error(
-                "%s Reading devices from monitoring config file %s failed. error: %s"
+                "%s Reading devices from gnss-monitor config file %s failed. error: %s"
                 % (PLUGIN, self.config_file_path, exc)
             )
         return config
 
-    def set_monitoring_state(self):
+    def set_gnss_monitor_state(self):
         collectd.debug(
-            "%s Setting state for monitoring instance %s" % (PLUGIN, self.instance_name)
+            "%s Setting state for gnss-monitor instance %s" % (PLUGIN, self.instance_name)
         )
         state = {}
         for device_path in self.device_paths:
@@ -912,9 +912,9 @@ def raise_alarm(alarm_cause,
     elif alarm_cause in [
         ALARM_CAUSE__1PPS_SIGNAL_LOSS,
         ALARM_CAUSE__GNSS_SIGNAL_LOSS,
-        ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS,
-        ALARM_CAUSE__MONITORING_SATELLITE_COUNT,
-        ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB,
+        ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS,
+        ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT,
+        ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB,
     ]:
         reason += ' state: ' + str(data)
 
@@ -1077,7 +1077,7 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
 
     if interface and not ptpinterfaces.get(interface, None):
         # Create required interface based alarm objects for supplied interface
-        if instance_type != PTP_INSTANCE_TYPE_MONITORING:
+        if instance_type != PTP_INSTANCE_TYPE_GNSS_MONITOR:
             o = PTP_alarm_object(interface)
             # 1-PPS signal loss
             o.alarm = ALARM_CAUSE__1PPS_SIGNAL_LOSS
@@ -1148,18 +1148,18 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
             o.eid += '.unsupported=legacy-timestamping'
             o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # 'config error'
             ALARM_OBJ_LIST.append(o)
-        else:  # instance_type == PTP_INSTANCE_TYPE_MONITORING
-            # Create monitoring instance specific required device_path based alarm
+        else:  # instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR
+            # Create gnss-monitor instance specific required device_path based alarm
             # objects for supplied interface (here interface means device_path e.g. /dev/gnss0)
             o = PTP_alarm_object(interface)
-            o.alarm = ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS
+            o.alarm = ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS
             o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
             o.reason = obj.hostname
             o.reason += " GNSS signal loss"
             o.repair += "Check network"
             o.eid = (
                 obj.base_eid
-                + ".monitoring="
+                + ".gnss-monitor="
                 + instance
                 + ".device_path="
                 + interface
@@ -1169,14 +1169,14 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
             ALARM_OBJ_LIST.append(o)
 
             o = PTP_alarm_object(interface)
-            o.alarm = ALARM_CAUSE__MONITORING_SATELLITE_COUNT
+            o.alarm = ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT
             o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
             o.reason = obj.hostname
             o.reason += " GNSS satellite count below threshold"
             o.repair += "Check network"
             o.eid = (
                 obj.base_eid
-                + ".monitoring="
+                + ".gnss-monitor="
                 + instance
                 + ".device_path="
                 + interface
@@ -1186,14 +1186,14 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
             ALARM_OBJ_LIST.append(o)
 
             o = PTP_alarm_object(interface)
-            o.alarm = ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB
+            o.alarm = ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB
             o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
             o.reason = obj.hostname
             o.reason += " GNSS signal quality db below threshold"
             o.repair += "Check network"
             o.eid = (
                 obj.base_eid
-                + ".monitoring="
+                + ".gnss-monitor="
                 + instance
                 + ".device_path="
                 + interface
@@ -1612,7 +1612,7 @@ def init_func():
         read_clock_config()
         # Initialize TimingInstance for HA phc2sys
         read_files_for_timing_instances()
-        read_monitoring_ptp_config()
+        read_gnss_monitor_ptp_config()
         for key, ctrl in ptpinstances.items():
             collectd.info("%s instance:%s type:%s found" %
                           (PLUGIN, key, ctrl.instance_type))
@@ -2315,7 +2315,7 @@ def check_gnss_signal(instance):
     ctrl = ptpinstances[instance]
     base_port = Interface.base_port(ctrl.interface)
     state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
-    collectd.info(f"{PLUGIN} Monitoring instance: {instance} "
+    collectd.info(f"{PLUGIN} gnss-monitor instance: {instance} "
                   f"device {ctrl.interface} status {state.value} pin %s"
                   % (pin.pin_board_label if pin else "unknown"))
     check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
@@ -2476,7 +2476,7 @@ def read_func():
         collectd.info("%s Instance: %s Instance type: %s"
                       % (PLUGIN, instance_name, ctrl.instance_type))
         instance = instance_name
-        if ctrl.instance_type == PTP_INSTANCE_TYPE_MONITORING:
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR:
             ptp_service = "gpsd.service"
             conf_file = PTPINSTANCE_PATH + instance_name + ".conf"
         else:
@@ -2529,7 +2529,7 @@ def read_func():
                         in [PTP_INSTANCE_TYPE_PTP4L,
                             PTP_INSTANCE_TYPE_PHC2SYS,
                             PTP_INSTANCE_TYPE_TS2PHC,
-                            PTP_INSTANCE_TYPE_MONITORING]:
+                            PTP_INSTANCE_TYPE_GNSS_MONITOR]:
                     # If the process is not running, raise the process alarm
                     if ctrl.process_alarm_object.raised is False:
                         collectd.error("%s PTP service %s enabled but not running" %
@@ -2600,13 +2600,13 @@ def read_func():
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
             process_phc2sys_ha(ctrl)
 
-        if ctrl.instance_type == PTP_INSTANCE_TYPE_MONITORING:
-            process_monitoring(ctrl)
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR:
+            process_gnss_monitor(ctrl)
 
     return 0
 
 
-def process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state):
+def process_gnss_monitor_alarm(ctrl, alarm_obj, device_path, raise_condition, state):
     if raise_condition:
         rc = raise_alarm(alarm_obj.alarm, device_path, state, alarm_obj)
         if rc is True:
@@ -2640,8 +2640,8 @@ def process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, stat
                 )
 
 
-def process_monitoring(ctrl):
-    collectd.debug(f"{PLUGIN} {ctrl.timing_instance.instance_name} process_monitoring")
+def process_gnss_monitor(ctrl):
+    collectd.debug(f"{PLUGIN} {ctrl.timing_instance.instance_name} process_gnss_monitor")
     # per device signal lock expected
     expected_signal_lock = True
 
@@ -2653,7 +2653,7 @@ def process_monitoring(ctrl):
         )
     except Exception as exc:
         collectd.error(
-            "%s Reading satellite_count from monitoring config file %s failed. error: %s"
+            "%s Reading satellite_count from gnss-monitor config file %s failed. error: %s"
             % (PLUGIN, ctrl.timing_instance.config_file_path, exc)
         )
 
@@ -2665,36 +2665,36 @@ def process_monitoring(ctrl):
         )
     except Exception as exc:
         collectd.error(
-            "%s Reading signal_quality_db from monitoring config file %s failed. error: %s"
+            "%s Reading signal_quality_db from gnss-monitor config file %s failed. error: %s"
             % (PLUGIN, ctrl.timing_instance.config_file_path, exc)
         )
 
     ctrl.timing_instance.set_instance_state_data()
     for device_path in ctrl.timing_instance.device_paths:
-        # alarm ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS
+        # alarm ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS
         signal_lock = ctrl.timing_instance.state[device_path].lock_state
         raise_condition = signal_lock != expected_signal_lock
 
         alarm_obj = get_alarm_object(
-            ALARM_CAUSE__MONITORING_GNSS_SIGNAL_LOSS, device_path
+            ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS, device_path
         )
         state = f"signal lock {bool(signal_lock)} (expected: {expected_signal_lock})"
 
-        process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
+        process_gnss_monitor_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
 
-        # alarm ALARM_CAUSE__MONITORING_SATELLITE_COUNT
+        # alarm ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT
         if expected_satellite_count is not None:
             satellite_count = ctrl.timing_instance.state[device_path].satellite_count
             raise_condition = satellite_count < expected_satellite_count
 
             alarm_obj = get_alarm_object(
-                ALARM_CAUSE__MONITORING_SATELLITE_COUNT, device_path
+                ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT, device_path
             )
             state = f"satellite count {satellite_count} (expected: >= {expected_satellite_count})"
 
-            process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
+            process_gnss_monitor_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
 
-        # alarm ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB
+        # alarm ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB
         if expected_signal_quality_db is not None:
             # alarm is based upon avg snr
             signal_quality_db = ctrl.timing_instance.state[
@@ -2703,14 +2703,14 @@ def process_monitoring(ctrl):
             raise_condition = signal_quality_db < expected_signal_quality_db
 
             alarm_obj = get_alarm_object(
-                ALARM_CAUSE__MONITORING_SIGNAL_QUALITY_DB, device_path
+                ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB, device_path
             )
             state = (
                 f"signal_quality_db {signal_quality_db}"
                 f" (expected: >= {expected_signal_quality_db})"
             )
 
-            process_monitoring_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
+            process_gnss_monitor_alarm(ctrl, alarm_obj, device_path, raise_condition, state)
 
 
 def process_phc2sys_ha(ctrl):
