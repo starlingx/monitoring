@@ -282,8 +282,11 @@ def get_platform_memory():
     # We can safely ignore reading this if the path does not exist.
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
-    path = '/'.join([MEMCONT, pc.K8S_ROOT, pc.KUBEPODS])
-    if os.path.isdir(path):
+    paths = ['/'.join([MEMCONT, pc.K8S_ROOT, pc.KUBEPODS]),
+             '/'.join([MEMCONT, pc.K8S_ROOT_STX, pc.KUBEPODS])]
+    for path in paths:
+        if not os.path.isdir(path):
+            continue
         for root, dirs, files in pc.walklevel(path, level=1):
             for name in dirs:
                 if name.startswith('pod') and MEMORY_STAT in files:
@@ -555,7 +558,7 @@ def get_platform_memory_per_process():
     if os.path.exists(os.path.join(MEMCONT)):
         starting_dir = next(os.walk(MEMCONT))[1]
         for directory in starting_dir:
-            if directory != str(pc.K8S_ROOT):
+            if directory not in [str(pc.K8S_ROOT), str(pc.K8S_ROOT_STX)]:
                 cg_path = '/'.join([MEMCONT, directory])
                 paths = get_cgroups_procs_paths(cg_path)
                 for path in paths:
@@ -565,8 +568,11 @@ def get_platform_memory_per_process():
     # We can safely ignore reading this if the path does not exist.
     # The path won't exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
-    path = '/'.join([MEMCONT, pc.K8S_ROOT])
-    if os.path.exists(path):
+    paths = ['/'.join([MEMCONT, pc.K8S_ROOT]),
+             '/'.join([MEMCONT, pc.K8S_ROOT_STX])]
+    for path in paths:
+        if not os.path.exists(path):
+            continue
         starting_dir = next(os.walk(path))[1]
         for directory in starting_dir:
             cg_path = '/'.join([path, directory])
