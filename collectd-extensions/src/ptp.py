@@ -1483,53 +1483,6 @@ def is_microchip_gnss_module_available():
     return os.path.exists(ZL3073X_SYSFS_PATH)
 
 
-def get_usb_vendor_id(usb):
-    """get USB device vendor id"""
-    vendor_id = None
-    vendor_id_path = os.path.join(USB_DEVICE_PATH, usb, 'idVendor')
-    try:
-        with open(vendor_id_path, 'r') as infile:
-            vendor_id = infile.read().strip()
-    except (FileNotFoundError, PermissionError) as err:
-        collectd.debug(f"Get USB vendor id failed, "
-                       f"reason {err}")
-    return vendor_id
-
-
-def get_usb_product_id(usb):
-    """get USB device product id"""
-    product_id = None
-    product_id_path = os.path.join(USB_DEVICE_PATH, usb, 'idProduct')
-    try:
-        with open(product_id_path, 'r') as infile:
-            product_id = infile.read().strip()
-    except (FileNotFoundError, PermissionError) as err:
-        collectd.debug(f"Get USB product id failed, "
-                       f"reason {err}")
-    return product_id
-
-
-def is_nmea_tty_a_microchip_gnss_receiver(tty_device):
-    """check if NMEA tty is an Microchip's GNSS receiver"""
-    vendor_id = None
-    product_id = None
-    nmea = split_gnss_path(tty_device)
-    if not nmea:
-        return False
-
-    # Search for an USB TTY device matching the NMEA, than
-    # get its vendor and product ids.
-    filenames = glob(USB_TTY_DEVICE_PATH % nmea)
-    if len(filenames) == 1:
-        splitted_path = filenames[0].split(os.sep)
-        if len(splitted_path) == 9:
-            usb = splitted_path[5]
-            vendor_id = get_usb_vendor_id(usb)
-            product_id = get_usb_product_id(usb)
-
-    return vendor_id in ['1546'] and product_id in ['01a9']
-
-
 def read_ptp_service_options(instance_name, instance_type):
     data = None
     filepath = os.path.join(PTP_OPTIONS_PATH, 'ptpinstance',
@@ -1592,7 +1545,7 @@ def read_ts2phc_config():
 
                         collectd.info(f"{PLUGIN} ts2phc instance {instance_name} "
                                       f"primary_nic {primary_interface}")
-                    elif is_microchip_gnss_module_available() and is_nmea_tty_a_microchip_gnss_receiver(nmea):
+                    elif is_microchip_gnss_module_available() and os.path.exists(nmea):
                         collectd.info(f"{PLUGIN} ts2phc instance:{instance_name}"
                                       f" microchip GNSS module detected")
 
@@ -1715,6 +1668,8 @@ def init_func():
     for key, value in interfaces.items():
         collectd.info("%s interface %s supports timestamping modes: %s" %
                       (PLUGIN, key, value.get_ts_supported_modes()))
+        collectd.info("%s interface %s base port: %s" %
+                      (PLUGIN, key, value.get_base_port()))
         collectd.info("%s interface %s pci slot: %s" %
                       (PLUGIN, key, value.get_pci_slot()))
         collectd.info("%s interface %s nmea: %s" %
