@@ -462,6 +462,9 @@ ts2phc_instance_map = {}
 # List of timing instances
 timing_instance_list = []
 
+# interface:ptp_instance_name map
+ptp4l_instance_map = {}
+
 
 def read_gnss_monitor_ptp_config():
     """read gnss-monitor-ptp conf files"""
@@ -487,8 +490,15 @@ def read_gnss_monitor_ptp_config():
             ptpinstances[instance.instance_name].timing_instance = instance
 
 
+# Phc2sys variables
+phc2sys_source = None
+phc2sys_sink = None
+
+
 def read_files_for_timing_instances():
     """read phc2sys conf files"""
+    global phc2sys_source
+    global phc2sys_sink
     filenames = glob(PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN)
     if len(filenames) == 0:
         collectd.debug("%s No PTP conf file located for %s" %
@@ -497,6 +507,32 @@ def read_files_for_timing_instances():
         for filename in filenames:
             instance = TimingInstance(filename)
             collectd.info("ptpinstances = %s" % ptpinstances)
+
+            service_options = read_ptp_service_options(instance.instance_name,
+                                                       PTP_INSTANCE_TYPE_PHC2SYS)
+            if service_options:
+                collectd.info(f"{PLUGIN} {instance.instance_name} "
+                              f"service options {service_options}")
+
+                matches = re.search('-s ([^\'" \t]+)', service_options)
+                if matches:
+                    phc2sys_source = matches.group(1)
+                if phc2sys_source:
+                    collectd.info(f"{PLUGIN} phc2sys {instance.instance_name} "
+                                  f"source is {phc2sys_source}")
+
+                # As phc2sys default sink device is CLOCK_REALTIME, the
+                # phc2sys_sink variable is initialized with this value.
+                # If '-c' command line option is provided, the default
+                # value is overwritten.
+                phc2sys_sink = 'CLOCK_REALTIME'
+                matches = re.search('-c ([^\'" \t]+)', service_options)
+                if matches:
+                    phc2sys_sink = matches.group(1)
+                if phc2sys_sink:
+                    collectd.info(f"{PLUGIN} phc2sys {instance.instance_name} "
+                                  f"sink is {phc2sys_sink}")
+
             if 'ha_enabled' in instance.config['global'].keys() \
                     and instance.config['global']['ha_enabled'] == '1' \
                     and instance.interfaces:
@@ -512,6 +548,11 @@ def read_files_for_timing_instances():
                     PTP_INSTANCE_TYPE_PHC2SYS
                 ptpinstances[instance.instance_name].phc2sys_ha_enabled = False
             ptpinstances[instance.instance_name].timing_instance = instance
+
+            for interface in instance.interfaces:
+                collectd.info(f"{PLUGIN} phc2sys {instance.instance_name} "
+                              f"source is {interface}")
+                phc2sys_source = interface
 
 
 class TimingInstance:
@@ -1275,8 +1316,49 @@ def query_pmc(instance, query_string, uds_address=None, query_action='GET') -> d
     return query_results_dict
 
 
+def query_pmc_indexed(instance, query_string, uds_address=None, query_action='GET') -> dict:
+    ctrl = ptpinstances[instance]
+    data = {}
+    query = query_action + ' ' + query_string
+    if uds_address:
+        try:
+            data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-s', uds_address,
+                                            '-u', '-b', '0', query]).decode()
+        except subprocess.CalledProcessError as err:
+            collectd.warning(f"{PLUGIN} Failed to query pmc: {err}")
+            return data
+    else:
+        conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
+                     '-' + instance + '.conf')
+        try:
+            data = subprocess.check_output([PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file,
+                                            '-u', '-b', '0', query]).decode()
+        except subprocess.CalledProcessError as err:
+            collectd.warning(f"{PLUGIN} Failed to query pmc: {err}")
+            return data
+
+    # Save all parameters in an ordered dict
+    query_results_dict = OrderedDict()
+    index = None
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if 'sending' not in line:
+            if query_string in line:
+                index = line.split(' ')[0]
+                query_results_dict[index] = {}
+            else:
+                # match key value array pairs
+                match = re_keyval.search(line)
+                if match:
+                    k = match.group(1)
+                    v = match.group(2)
+                    query_results_dict[index][k] = v
+    return query_results_dict
+
+
 def read_ptp4l_config():
     """read ptp4l conf files"""
+    global ptp4l_instance_map
     filenames = glob(PTPINSTANCE_PTP4L_CONF_FILE_PATTERN)
     if len(filenames) == 0:
         collectd.debug("%s No PTP conf file configured" % PLUGIN)
@@ -1292,6 +1374,14 @@ def read_ptp4l_config():
                     ptpinstances[instance_name].instance_type = \
                         PTP_INSTANCE_TYPE_PTP4L
                     ptpinstances[instance_name].timing_instance = instance
+                    # Into the interface to ptp intance map, add both
+                    # the instance and its base port.
+                    collectd.info(f"{PLUGIN} ptp4l {instance_name} "
+                                  f"interface {interface}")
+                    ptp4l_instance_map[interface] = instance_name
+                    ptp4l_instance_map[Interface.base_port(interface)] = \
+                        instance_name
+
             # timestamping mode
             if instance.config.has_section('global'):
                 obj.mode = instance.config['global'].get(
@@ -1474,7 +1564,7 @@ def read_ts2phc_config():
             if service_options:
                 collectd.info(f"{PLUGIN} {instance_name} service options {service_options}")
                 source = None
-                matches = re.search('OPTIONS="-s (.*)"', service_options)
+                matches = re.search('-s ([^\'" \t]+)', service_options)
                 if matches:
                     source = matches.group(1)
                 if source:
@@ -1614,7 +1704,7 @@ def init_func():
         read_files_for_timing_instances()
         read_gnss_monitor_ptp_config()
         for key, ctrl in ptpinstances.items():
-            collectd.info("%s instance:%s type:%s found" %
+            collectd.info("%s instance: %s type: %s found" %
                           (PLUGIN, key, ctrl.instance_type))
 
     else:
@@ -2308,6 +2398,149 @@ def check_clock_class(instance):
                          frequency_traceable))
 
 
+def process_ptp_bc(instance):
+    collectd.debug(f"{PLUGIN} process_ptp_bc {instance}")
+    ctrl = ptpinstances[instance]
+
+    # Get the PTP instance name current clock source of phc2sys.
+    upstream_instance = None
+    if phc2sys_source:
+        upstream_instance = ptp4l_instance_map.get(phc2sys_source, None)
+        if not upstream_instance:
+            upstream_instance = ptp4l_instance_map.get(
+                Interface.get_base_port(phc2sys_source),
+                None)
+    collectd.debug(f"{PLUGIN} phc2sys source is {phc2sys_source} "
+                   f"and ptp instance connected to GM is {upstream_instance}")
+    if not upstream_instance:
+        return
+
+    # The phc2sys must be configured to synchronize a PHC to system clock.
+    # If the phc2sys destination option (-c argument) is not provided,
+    # by default it is set CLOCK_REALTIME.
+    # Skip if the configured destination is not CLOCK_REALTIME.
+    collectd.debug(f"{PLUGIN} phc2sys sink is {phc2sys_sink}")
+    if phc2sys_sink and phc2sys_sink != "CLOCK_REALTIME":
+        return
+
+    # Skip if this PTP instance is the one connected to GM,
+    # the upstream PTP instance
+    if instance == upstream_instance:
+        return
+
+    # The PTP domain number must match to forward the GM status.
+    # Skip if this PTP instance's domain is different than the upstream instance.
+    domain = ctrl.timing_instance.config["global"].get("domainNumber", 0)
+    upstream_domain = ctrl.timing_instance.config["global"].get("domainNumber", 0)
+    collectd.debug(f"{PLUGIN} ptp4l {instance} has domain {domain} "
+                   f"and {upstream_instance} has domain {upstream_domain}")
+    if domain != upstream_domain:
+        return
+
+    # Query upstream's parent, time properties and port data sets, and
+    # current downstream grandmaster settings.
+    # To avoid status swing, if a query fails keep previous status.
+    upstream_parent_data = query_pmc(upstream_instance,
+                                     'PARENT_DATA_SET',
+                                     query_action='GET')
+    if len(upstream_parent_data) < 10:
+        collectd.info(f"{PLUGIN} failed to query upstream parent data, "
+                      f"response: {upstream_parent_data}")
+        return
+
+    upstream_time_properties_data = query_pmc(upstream_instance,
+                                              'TIME_PROPERTIES_DATA_SET',
+                                              query_action='GET')
+    if len(upstream_time_properties_data) < 8:
+        collectd.info(f"{PLUGIN} failed to query upstream time properties data, "
+                      f"response: {upstream_time_properties_data}")
+        return
+
+    upstream_port_data_set = query_pmc_indexed(upstream_instance,
+                                               'PORT_DATA_SET',
+                                               query_action='GET')
+    if any(len(pds) < 10 for pds in upstream_port_data_set.values()):
+        collectd.info(f"{PLUGIN} failed to query upstream port data set, "
+                      f"response: {upstream_port_data_set}")
+        return
+
+    current_data = query_pmc(instance,
+                             'GRANDMASTER_SETTINGS_NP',
+                             query_action='GET')
+    if len(current_data) < 11:
+        collectd.info(f"{PLUGIN} failed to query current GM settings NP, "
+                      f"response: {current_data}")
+        return
+
+    # Verify if upstream ptp4l instance is locked to external GM, looking at
+    # its port status.
+    port_locked = any(port['portState'] == 'SLAVE'
+                      for port in upstream_port_data_set.values())
+    collectd.info(f"{PLUGIN} upstream ptp4l locked to T-GM? {port_locked}")
+
+    new_data = {}
+    if 'gm.ClockClass' in upstream_parent_data.keys():
+        new_data['clockClass'] = upstream_parent_data['gm.ClockClass']
+    if 'gm.ClockAccuracy' in upstream_parent_data.keys():
+        new_data['clockAccuracy'] = upstream_parent_data['gm.ClockAccuracy']
+    if 'gm.OffsetScaledLogVariance' in upstream_parent_data.keys():
+        new_data['offsetScaledLogVariance'] = upstream_parent_data['gm.OffsetScaledLogVariance']
+    if 'currentUtcOffset' in upstream_time_properties_data.keys():
+        new_data['currentUtcOffset'] = upstream_time_properties_data['currentUtcOffset']
+    if 'leap61' in current_data.keys():
+        new_data['leap61'] = current_data['leap61']
+    if 'leap59' in current_data.keys():
+        new_data['leap59'] = current_data['leap59']
+    if 'currentUtcOffsetValid' in upstream_time_properties_data.keys():
+        new_data['currentUtcOffsetValid'] = upstream_time_properties_data['currentUtcOffsetValid']
+    if 'ptpTimescale' in upstream_time_properties_data.keys():
+        new_data['ptpTimescale'] = upstream_time_properties_data['ptpTimescale']
+    if 'timeTraceable' in upstream_time_properties_data.keys():
+        new_data['timeTraceable'] = upstream_time_properties_data['timeTraceable']
+    if 'frequencyTraceable' in upstream_time_properties_data.keys():
+        new_data['frequencyTraceable'] = upstream_time_properties_data['frequencyTraceable']
+    if 'timeSource' in upstream_time_properties_data.keys():
+        new_data['timeSource'] = upstream_time_properties_data['timeSource']
+
+    if not port_locked:
+        # Upstream ptp4l not connected to remote T-GM.
+        #
+        # Overwrite clock class with 165, T-BC in holdover,
+        # out of holdover specification.
+        #
+        # The other parameters were correct on upstream
+        # data sets.
+        #
+        # GRANDMASTER_SETTINGS_NP
+        #     clockClass              165
+        #     clockAccuracy           0xfe
+        #     offsetScaledLogVariance 0xffff
+        #     currentUtcOffset        37
+        #     leap61                  0
+        #     leap59                  0
+        #     currentUtcOffsetValid   0
+        #     ptpTimescale            1
+        #     timeTraceable           0
+        #     frequencyTraceable      0
+        #     timeSource              0xa0
+        new_data['clockClass'] = '165'
+
+    # use pmc to write ptp fields into this instance
+    fields = ['clockClass',
+              'clockAccuracy',
+              'offsetScaledLogVariance',
+              'currentUtcOffset',
+              'currentUtcOffsetValid',
+              'ptpTimescale',
+              'timeTraceable',
+              'frequencyTraceable',
+              'timeSource']
+
+    if any(new_data[field] != current_data[field]
+           for field in fields):
+        write_ptp4l_gm_fields(instance, new_data)
+
+
 def check_gnss_signal(instance):
     """check GNSS signal and manage alarms"""
     collectd.debug(f"{PLUGIN} check_gnss_signal: {instance}")
@@ -2592,7 +2825,10 @@ def read_func():
             # Manage PTP clock class only for configured follower PHC clocks
             if ctrl.interface and \
                Interface.base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
-                check_clock_class(instance)
+                if obj.capabilities['ts2phc_source'] == 'nmea':
+                    check_clock_class(instance)
+                elif obj.capabilities['ts2phc_source'] == 'generic':
+                    process_ptp_bc(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
             handle_ptp4l_g8275_fields(instance)
@@ -2881,6 +3117,7 @@ def process_phc2sys_ha(ctrl):
 
 def check_ptp_regular(instance, ctrl, conf_file):
     collectd.debug(f"{PLUGIN} check_ptp_regular {instance}")
+
     # Let's read the port status information
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
@@ -2928,20 +3165,38 @@ def check_ptp_regular(instance, ctrl, conf_file):
             collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
             gm_identity = line.split()[1]
 
-    # Let's read the clock state, GNSS 1PPS and SMA1
-    #
-    # Determine the base port of the NIC from the interface, and
-    # get state for primary or secondary NIC.
-    base_port = Interface.base_port(ctrl.interface)
-    pps_status, _ = get_netlink_dpll_status(base_port, DeviceType.PPS)
-    eec_status, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
-    clock_locked = any(
-        status in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]
-        for status in [pps_status, eec_status]
-    )
+    clock_locked = False
+    if obj.capabilities['ts2phc_source'] == 'nmea':
+        # Let's read the clock state, GNSS 1PPS and SMA1
+        #
+        # Determine the base port of the NIC from the interface, and
+        # get state for primary or secondary NIC.
+        base_port = Interface.base_port(ctrl.interface)
+        pps_status, _ = get_netlink_dpll_status(base_port, DeviceType.PPS)
+        eec_status, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
+        clock_locked = any(
+            status in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]
+            for status in [pps_status, eec_status]
+        )
 
-    collectd.info(f"{PLUGIN} {obj.hostname} {instance} base port {base_port} "
-                  f"eec {eec_status.value} pps {pps_status.value}")
+        collectd.info(f"{PLUGIN} {obj.hostname} {instance} base port {base_port} "
+                      f"eec {eec_status.value} pps {pps_status.value}")
+    elif obj.capabilities['ts2phc_source'] == 'generic':
+        # Let's read the upstream PTP clock state
+        #
+        # Determine upstream PTP instance, and query its Parent Data set.
+        upstream_instance = None
+        if phc2sys_source:
+            upstream_instance = ptp4l_instance_map.get(phc2sys_source, None)
+            if not upstream_instance:
+                base_port = Interface.base_port(phc2sys_source)
+                upstream_instance = ptp4l_instance_map.get(base_port, None)
+        if upstream_instance:
+            upstream_parent_data = query_pmc(upstream_instance,
+                                             'PARENT_DATA_SET',
+                                             query_action='GET')
+            upstream_ptp_clock_class = upstream_parent_data.get('gm.ClockClass', None)
+            clock_locked = upstream_ptp_clock_class in ['6', '7']
 
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
