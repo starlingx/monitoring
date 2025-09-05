@@ -2046,7 +2046,7 @@ def set_utc_offset(instance):
 
 def check_gnss_alarm(instance, alarm_object, interface, state):
     """check for GNSS alarm"""
-    collectd.debug(f"{PLUGIN} check_gnss_alarm: {instance} {interface}")
+    collectd.debug(f"{PLUGIN} check_gnss_alarm: {instance} {interface} {state}")
     ctrl = ptpinstances[instance]
     base_port = Interface.base_port(interface)
     primary_nic = ts2phc_source_interfaces.get(base_port, None)
@@ -2266,6 +2266,43 @@ def is_local_gm(ptp4l_instance):
     return False
 
 
+# Set state to the worst (least locked) of state_eec and state_pps
+# Priority: LOCKED_HO_ACQ > LOCKED > HOLDOVER > UNLOCKED > INVALID
+# Assign a custom order for comparison
+def lockstatus_priority(status):
+    if status == CLOCK_STATE_LOCKED_HO_ACQ:
+        return 5
+    elif status == CLOCK_STATE_LOCKED:
+        return 4
+    elif status == CLOCK_STATE_HOLDOVER:
+        return 3
+    elif status == CLOCK_STATE_UNLOCKED:
+        return 2
+    else:
+        # Clock state is either INVALID or UNKNOWN
+        return 1
+
+
+def get_dpll_state(base_port):
+    """Get current DPLL state for a given base_port.
+
+    Combine the status of EEC and PPS devices and return the worst state
+    and pin information.
+    """
+    state_eec, pin_eec = get_netlink_dpll_status(base_port, DeviceType.EEC)
+    state_pps, pin_pps = get_netlink_dpll_status(base_port, DeviceType.PPS)
+
+    # Set state to the worst (least locked) of state_eec and state_pps
+    # Priority: LOCKED_HO_ACQ > LOCKED > HOLDOVER > UNLOCKED > INVALID
+    if lockstatus_priority(state_eec) > lockstatus_priority(state_pps):
+        state = state_pps
+        pin = pin_pps
+    else:
+        state = state_eec
+        pin = pin_eec
+    return state, pin
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -2318,20 +2355,18 @@ def check_clock_class(instance):
     ho_timer_interface = base_port
     if primary_nic == base_port:
         # We have the primary NIC
-        state, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
+        state, _ = get_dpll_state(base_port)
         instance_type = PTP_INSTANCE_TYPE_TS2PHC
         collectd.info(f"{PLUGIN} {instance} Primary device {base_port} "
                       f"status {state}")
     else:
         # We have a secondary NIC
-        state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
-        if state == CLOCK_STATE_INVALID:
-            state, pin = get_netlink_dpll_status(base_port, DeviceType.EEC)
+        state, pin = get_dpll_state(base_port)
         if state not in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED, CLOCK_STATE_HOLDOVER] \
            and pin and pin.pin_type == PinType.EXT:
             # If the base NIC cgu shows a valid lock state and pin type is external,
             # check the status of the primary_nic GNSS connection
-            state, _ = get_netlink_dpll_status(primary_nic, DeviceType.EEC)
+            state, _ = get_dpll_state(primary_nic)
             collectd.info(f"{PLUGIN} {instance} Secondary device {base_port} "
                           f"is locked to an external source, checking primary "
                           f"{primary_nic}. Primary status is {state}")
@@ -2358,9 +2393,10 @@ def check_clock_class(instance):
                 if holdover_timestamp:
                     collectd.debug(f"{PLUGIN} check_clock_class:"
                                    f"holdover_timestamp: {holdover_timestamp}")
-                else:
-                    collectd.warning(f"{PLUGIN} No holdover timestamp found for "
-                                     f"{key}: {ho_timer_interface}")
+                    # found the holdover timestamp, no need to continue searching
+                    break
+                collectd.warning(f"{PLUGIN} No holdover timestamp found for "
+                                 f"{key}: {ho_timer_interface}")
 
         # If it is in holdover more than the holdover spec threshold,
         # set clock class to 140
