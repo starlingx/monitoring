@@ -401,8 +401,11 @@ def get_cpuacct():
     # We can safely ignore reading this if the path does not exist.
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
-    path = '/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS])
-    if os.path.isdir(path):
+    paths = ['/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS]),
+             '/'.join([CPUACCT, pc.K8S_ROOT_STX, pc.KUBEPODS])]
+    for path in paths:
+        if not os.path.isdir(path):
+            continue
         for root, dirs, files in pc.walklevel(path, level=1):
             for name in dirs:
                 if name.startswith('pod') and CPUACCT_USAGE in files:

@@ -56,6 +56,7 @@ ONE_HUNDRED = 100
 # cgroup definitions
 CGROUP_ROOT = '/sys/fs/cgroup'
 K8S_ROOT = 'k8s-infra'
+K8S_ROOT_STX = 'k8s-infra-stx'
 KUBEPODS = 'kubepods'
 
 # High level grouping categories
@@ -93,6 +94,7 @@ CGROUP_MACHINE = 'machine.slice'
 CGROUP_K8SPLATFORM = 'k8splatform.slice'
 CGROUP_DOCKER = 'docker'
 CGROUP_K8S = K8S_ROOT
+CGROUP_K8S_STX = K8S_ROOT_STX
 
 # Second level cgroups of system.slice for containerization
 CGROUP_SYSTEM_CONTAINERD = 'containerd.service'
@@ -105,7 +107,7 @@ CONTAINERS_CGROUPS = [CGROUP_SYSTEM_CONTAINERD, CGROUP_SYSTEM_DOCKER,
 # Groupings by first level cgroup
 BASE_GROUPS = [CGROUP_INIT, CGROUP_DOCKER, CGROUP_SYSTEM, CGROUP_USER,
                CGROUP_UTILS, CGROUP_K8SPLATFORM]
-BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_MACHINE]
+BASE_GROUPS_EXCLUDE = [CGROUP_K8S, CGROUP_K8S_STX, CGROUP_MACHINE]
 
 # Groupings of pods by kubernetes namespace
 K8S_NAMESPACE_SYSTEM = ['kube-system']
