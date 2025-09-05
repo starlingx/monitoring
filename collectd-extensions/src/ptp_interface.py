@@ -11,6 +11,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import field
+from glob import glob
 import os
 import collectd
 import subprocess
@@ -22,8 +23,10 @@ PLUGIN = 'ptp plugin'
 ETHTOOL = '/usr/sbin/ethtool'
 
 # Device's sysfs paths
-uevent_path = '/sys/class/net/%s/device/uevent'
-gnss_path = '/sys/class/net/%s/device/gnss'
+device_path = '/sys/class/net/%s/device/'
+uevent_path = device_path + 'uevent'
+gnss_path = device_path + 'gnss'
+ptp_path = device_path + 'ptp'
 switch_id_path = '/sys/class/net/%s/phys_switch_id'
 pci_net_device_path = '/sys/bus/pci/devices/%s/net/'
 gnrd_switch_id_path = '/sys/module/zl3073x/parameters/clock_id'
@@ -125,52 +128,29 @@ class Interface:
         else:
             self.switch_id = self._read_phy_switch_id()
 
-    def base_port(interface, uevent=None):
+    def base_port(interface):
         """Interface's base port name"""
 
         """A network device card can have multiple ports,
-        get the name of the 1st port available.
+        which shares the a single PTP hardware clock (PHC).
+        Get the name of the interface which holds the PHC.
 
-        Returns : the name of the 1st port of a NIC"""
-        # read uevent file if not provided
-        if not uevent:
-            uevent = read_uevent(interface)
-
-        if not uevent:
-            return None
-
-        pci_slot = uevent.pci_slot_name
-        if not pci_slot:
-            collectd.info(f"{PLUGIN} {interface} Uevent pci slot name is empty")
-            return None
-
-        # if the PCI slot ends with .0, the interface is its own base port
-        if pci_slot.endswith('.0'):
+        Returns : the name of the base port"""
+        # List the path to the interface in the same NIC,
+        # which holds the PHC.
+        prefix = interface[:-1] + '*'
+        paths = glob(ptp_path % prefix)
+        if len(paths) == 0:
+            collectd.info(f"{PLUGIN} {interface} Failed to find path "
+                          f"{ptp_path % prefix}.")
             return interface
 
-        # get first device in slot
-        base_pci_slot = pci_slot[:-1] + '0'
-
-        # get base port name from PCI network device path
-        dirs = None
-        path = pci_net_device_path % base_pci_slot
-        if os.path.isdir(path):
-            try:
-                dirs = os.listdir(path)
-                collectd.debug(f"{PLUGIN} {interface} List dir {path} "
-                               f"output {dirs}")
-            except (FileNotFoundError, PermissionError) as err:
-                collectd.debug(f"{PLUGIN} {interface} List dir {path} failed, "
-                               f"reason: {err}")
-                return None
-        base_port = None
-        if dirs and len(dirs) == 1:
-            base_port = dirs[0]
-
-        return base_port
+        # Return the name of the interface in the 1st path available.
+        path = next(iter(paths))
+        return path.split(os.sep)[4]
 
     def _build_base_port(self):
-        return Interface.base_port(self.name, self.uevent)
+        return Interface.base_port(self.name)
 
     def _read_suported_modes(self):
         """Read interface's supported timestamping modes."""
