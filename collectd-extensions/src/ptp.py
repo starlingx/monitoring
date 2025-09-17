@@ -1524,6 +1524,7 @@ def read_ts2phc_config():
                     collectd.info(f"{PLUGIN} ts2phc {instance_name} source is {source}")
                     obj.capabilities['ts2phc_source'] = source
 
+            create_interface_alarm_objects('dummy', instance_name, PTP_INSTANCE_TYPE_TS2PHC)
             primary_interface = None
             if instance.config.has_section('global'):
                 # primary interface
