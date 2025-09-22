@@ -79,6 +79,9 @@ PLUGIN_TYPE_INSTANCE = 'nsec'
 
 PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
 
+# dummy interface name
+DUMMY_INTERFACE = 'dummy'
+
 
 def _get_os_release():
     os_release = '/etc/os-release'
@@ -1524,8 +1527,8 @@ def read_ts2phc_config():
                     collectd.info(f"{PLUGIN} ts2phc {instance_name} source is {source}")
                     obj.capabilities['ts2phc_source'] = source
 
-            create_interface_alarm_objects('dummy', instance_name, PTP_INSTANCE_TYPE_TS2PHC)
             primary_interface = None
+            is_alarm_objects_created = False
             if instance.config.has_section('global'):
                 # primary interface
                 nmea_mask = instance.config['global'].get('ts2phc.nmea_serialport', None)
@@ -1538,6 +1541,7 @@ def read_ts2phc_config():
                         create_interface_alarm_objects(interface, instance_name)
                         ptpinstances[instance_name].instance_type = \
                             PTP_INSTANCE_TYPE_TS2PHC
+                        is_alarm_objects_created = True
                         ptpinstances[instance_name].timing_instance = instance
                         ts2phc_source_interfaces[interface] = interface
                         ts2phc_instance_map[interface] = instance_name
@@ -1566,6 +1570,7 @@ def read_ts2phc_config():
                             create_interface_alarm_objects(primary_interface, instance_name)
                             ptpinstances[instance_name].instance_type = \
                                 PTP_INSTANCE_TYPE_TS2PHC
+                            is_alarm_objects_created = True
                             ptpinstances[instance_name].timing_instance = instance
                             ts2phc_source_interfaces[primary_interface] = primary_interface
                             ts2phc_instance_map[primary_interface] = instance_name
@@ -1579,6 +1584,12 @@ def read_ts2phc_config():
                     else:
                         collectd.warning("%s invalid nmea serial port path: %s" %
                                          (PLUGIN, nmea))
+
+            if not is_alarm_objects_created:
+                # "-s generic" may not have ts2phc.nmea_serialport, in this case,
+                # ALARM_CAUSE__PROCESS still need to be tracked for ts2phc service
+                create_interface_alarm_objects(
+                    DUMMY_INTERFACE, instance_name, PTP_INSTANCE_TYPE_TS2PHC)
 
             # secondary interfaces
             if instance.interfaces:
@@ -2803,7 +2814,10 @@ def read_func():
 
         # Check GNSS and 1PPS alarms if nmea source is configured
         if obj.capabilities['ts2phc_source'] == 'nmea':
-            if ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC:
+            if (
+                ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC
+                and ctrl.interface != DUMMY_INTERFACE
+            ):
                 check_gnss_signal(instance)
             if ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
                 check_1pps_signal(instance)
