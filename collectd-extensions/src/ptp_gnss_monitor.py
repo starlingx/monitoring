@@ -115,6 +115,12 @@ def get_gps_data_by_session(session, device_path):
         signal_quality_db=SignalQualityDb(min=0, max=0, avg=0),
     )
     try:
+        # - TPV and SKY report are independent information and could come in any order.
+        # - A GPS receiver might have satellite visibility data (a SKY report) but still not
+        #   be able to calculate a usable position, hence sending a TPV report with mode: 0.
+        # - SKY report won't follow TPV, when GPS receiver is not functional.
+        tpv_report_scanned = False
+        sky_report_scanned = False
         for report in session:
             if report["class"] in ["VERSION", "WATCH", "DEVICE"]:
                 continue
@@ -138,12 +144,17 @@ def get_gps_data_by_session(session, device_path):
                     message = f"{PLUGIN} {device_path} have not achieved satellite lock: {report}"
                     collectd.debug(message)
                     data.lock_state = 0
-                    # reset satellite_count and signal_quality_db
-                    data.satellite_count = 0
-                    data.signal_quality_db = SignalQualityDb(min=0, max=0, avg=0)
+                    # Do not change satellite_count and signal_quality_db in case
+                    # SKY already scanned
                     break
                 else:
                     data.lock_state = 1
+                    if sky_report_scanned:
+                        break
+
+                # Set TPV report scanned flag
+                tpv_report_scanned = True
+
             # device key is optional in SKY class
             elif (
                 report["class"] == "SKY"
@@ -153,14 +164,23 @@ def get_gps_data_by_session(session, device_path):
                 # uSat key is optional in SKY class, Number of satellites used in navigation solution
                 if "uSat" in report:
                     data.satellite_count = report["uSat"]
+                else:
+                    data.satellite_count = 0
                 # satellites key is optional in SKY class, List of satellite objects in skyview
                 if "satellites" in report:
                     data.signal_quality_db = get_signal_to_noise_ratio(
                         report["satellites"]
                     )
+                else:
+                    data.signal_quality_db = SignalQualityDb(min=0, max=0, avg=0)
 
                 # All reports collected, No more polling required.
-                break
+                if tpv_report_scanned:
+                    break
+
+                # Set SKY report scanned flag
+                sky_report_scanned = True
+
     except Exception as exc:
         # In case of parsing error, should be reported instead of throwing exception
         message = f"{PLUGIN} Programming error occured: {type(exc)}:{exc}"
