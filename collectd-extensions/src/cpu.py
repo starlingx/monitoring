@@ -34,6 +34,7 @@ PLUGIN_DEBUG = 'DEBUG platform cpu'
 PLUGIN_HIRES_INTERVAL = 1        # hi-resolution sample interval in secs
 PLUGIN_DISPATCH_INTERVAL = 30    # dispatch interval in secs
 PLUGIN_HISTOGRAM_INTERVAL = 300  # histogram interval in secs
+PLUGIN_CPU_FREQUENCY_INTERVAL = 300  # cpu frequency interval in secs
 
 TIMESTAMP = 'timestamp'
 PLATFORM_CPU_PERCENT = 'platform-occupancy'
@@ -73,11 +74,17 @@ class CPU_object(pc.PluginObject):
         # CPU Plugin flags
         self.dispatch = False   # print occupancy and dispatch this sample
         self.histogram = False  # print occupancy histogram this sample
+        self.cpu_frequency = False  # print cpu frequency
 
         # CPU plugin configurable settings
         self.debug = True
         self.verbose = True
         self.hires = False
+        self.cpu_freq_non_platform_cores = True
+
+        # core cpu lists
+        self.cpu_list = list()       # platform configured cpu list
+        self.logical_cpus = list()   # list of logical cpus from /proc/cpuinfo
 
         # Cache Kubernetes pods data
         self._cache = {}
@@ -132,6 +139,11 @@ class CPU_object(pc.PluginObject):
         self.hist_occ = {}          # histogram bin counts per cgroup or derived aggregate
         self.shared_bins = np.histogram_bin_edges(
             np.array([0, 100], dtype=np.float64), bins=10, range=(0, 100))
+
+        # Derived measurements over cpu frequency interval
+        self.cpu_freq = {}              # cpu frequencies
+        self.cpu_freq_t0 = now          # cpu frequency timestamp time 0
+        self.cpu_freq_elapsed_ms = 0.0  # cpu frequency elapsed time
 
 
 # Instantiate the class
@@ -792,6 +804,62 @@ def aggregate_histogram(histogram, occ, shared_bins, hist_occ, debug):
                                  v['mean'], v['p95'], v['pmax']))
 
 
+def get_cpu_frequencies(cpu_list):
+    """Get the list of cpus frequencies """
+
+    global obj
+
+    for i in cpu_list:
+        file_path = f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+        try:
+            with open(file_path, "rb") as f:
+                freq = f.read().decode("utf-8")
+                obj.cpu_freq[i] = int(freq)
+        except Exception as e:
+            if obj.cpu_freq_non_platform_cores:
+                collectd.error(
+                    f"{PLUGIN} cannot read cpu frequency file {file_path}. "
+                    f"Only platform core cpus will be monitored. error=({e})")
+                obj.cpu_freq_non_platform_cores = False
+            else:
+                collectd.error(
+                    f"{PLUGIN} cannot read cpu frequency file {file_path}. "
+                    f"Stopping cpu core frequency monitoring. error=({e})")
+                obj.cpu_frequency = False
+            return
+
+    # collectd python module limits log messages to 1024 characters.
+    # Log cpu core frequencies in chunks of 64 cores to not exceed log size.
+    chunk_size = 64
+    num_chunks = int(np.ceil(len(cpu_list) / chunk_size))
+    for i in range(0, num_chunks):
+        start = i * chunk_size
+        end = i * chunk_size + chunk_size
+        cpu_freq_str = ", ".join(f"{cpu}: {obj.cpu_freq[cpu]}" for cpu in
+                                 cpu_list[start:end] if cpu in obj.cpu_freq)
+        collectd.info(f"{PLUGIN} core frequencies (KHz): {cpu_freq_str}")
+
+
+def update_cpu_frequency_data(init=False):
+    """Gather and update cpu frequency info. """
+
+    global obj
+
+    # Get epoch time in floating seconds
+    now = time.time()
+
+    obj.cpu_freq_elapsed_ms = float(pc.ONE_THOUSAND) * (now - obj.cpu_freq_t0)
+
+    if init or obj.cpu_freq_elapsed_ms >= 1000.0 * PLUGIN_CPU_FREQUENCY_INTERVAL:
+        if obj.cpu_freq_non_platform_cores:
+            get_cpu_frequencies(obj.logical_cpus)
+        else:
+            # Get core frequencies from platform cpus only
+            get_cpu_frequencies(obj.cpu_list)
+        # Clear t0 timestamp for next interval
+        obj.cpu_freq_t0 = now
+
+
 def update_cpu_data(init=False):
     """Gather cputime info and Update platform cpu occupancy metrics.
 
@@ -922,9 +990,13 @@ def config_func(config):
             obj.verbose = pc.convert2boolean(val)
         elif key == 'hires':
             obj.hires = pc.convert2boolean(val)
+        elif key == 'cpu_frequency_non_platform_cores':
+            obj.cpu_freq_non_platform_cores = pc.convert2boolean(val)
 
-    collectd.info('%s debug=%s, verbose=%s, hires=%s'
-                  % (PLUGIN, obj.debug, obj.verbose, obj.hires))
+    collectd.info('%s debug=%s, verbose=%s, hires=%s, '
+                  'cpu_frequency_non_platform_cores=%s'
+                  % (PLUGIN, obj.debug, obj.verbose, obj.hires,
+                     obj.cpu_freq_non_platform_cores))
 
     return pc.PLUGIN_PASS
 
@@ -989,6 +1061,13 @@ def init_func():
     # Gather initial cputime state information.
     update_cpu_data(init=True)
 
+    # Gather initial cpu frequency data.
+    if os.path.isfile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"):
+        obj.cpu_frequency = True
+        update_cpu_frequency_data(init=True)
+    else:
+        collectd.info(f"{PLUGIN} core frequency data cannot be read.")
+
     obj.init_completed()
     return pc.PLUGIN_PASS
 
@@ -1013,6 +1092,10 @@ def read_func():
     # Gather current cputime state information, and calculate occupancy
     # since this routine was last run.
     update_cpu_data()
+
+    # Gather cpu frequency data.
+    if obj.cpu_frequency:
+        update_cpu_frequency_data()
 
     # Prevent dispatching measurements at plugin startup
     if obj.elapsed_ms <= 500.0:
