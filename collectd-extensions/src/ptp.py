@@ -452,9 +452,51 @@ interfaces = {}
 def create_interface(interface):
     if interface not in interfaces.keys():
         interfaces[interface] = Interface(interface)
-        base_port = interfaces[interface].get_base_port()
-        if base_port not in interfaces.keys():
-            interfaces[base_port] = Interface(base_port)
+
+# In most NICs, every physical or virtual port shares a single PTP
+# hardware clock (PHC).  The interface that actually owns the PHC is
+# referred to as the base port.
+#
+# You can identify the base port by checking for the presence of the
+# directory:
+#   /sys/class/net/<interface-name>/device/ptp/ptp*
+
+# List of all base ports
+base_ports = []
+
+# maps an interface to NIC's base port
+base_port_map = {}
+
+
+def get_base_port(interface_name):
+    base_port = base_port_map.get(interface_name, None)
+    if base_port is None:
+        base_port = compute_base_port(interface_name)
+        base_port_map[interface_name] = base_port
+    return base_port
+
+
+def compute_base_port(interface_name):
+    base_port = None
+    if interface_name in interfaces.keys():
+        interface = interfaces[interface_name]
+        pci_slot = interface.get_pci_slot()
+        family = interface.get_family()
+        if family == 'Granite Rapid-D':
+            for base_port_name in base_ports:
+                if base_port_name in interfaces.keys():
+                    base_port_obj = interfaces[base_port_name]
+                    if base_port_obj.get_family() == 'Granite Rapid-D':
+                        base_port = base_port_name
+                        break
+        else:
+            for base_port_name in base_ports:
+                if base_port_name in interfaces.keys():
+                    base_port_obj = interfaces[base_port_name]
+                    if base_port_obj.get_pci_slot() == pci_slot[:-1] + '0':
+                        base_port = base_port_name
+                        break
+    return base_port
 
 # ts2phc_source_interfaces dictionary
 #
@@ -1382,7 +1424,7 @@ def read_ptp4l_config():
                     collectd.info(f"{PLUGIN} ptp4l {instance_name} "
                                   f"interface {interface}")
                     ptp4l_instance_map[interface] = instance_name
-                    ptp4l_instance_map[Interface.base_port(interface)] = \
+                    ptp4l_instance_map[get_base_port(interface)] = \
                         instance_name
 
             # timestamping mode
@@ -1401,7 +1443,7 @@ def initialize_ptp4l_state_fields(instance):
     ctrl = ptpinstances[instance]
 
     # Determine if there is a ts2phc instance disciplining this NIC
-    base_port = Interface.base_port(ctrl.interface)
+    base_port = get_base_port(ctrl.interface)
 
     mapped_ts2phc_instance = ts2phc_instance_map.get(base_port, None)
     if mapped_ts2phc_instance:
@@ -1595,7 +1637,7 @@ def read_ts2phc_config():
             if instance.interfaces:
                 for interface in instance.interfaces:
                     create_interface(interface)
-                    base_port = interfaces[interface].get_base_port()
+                    base_port = get_base_port(interface)
                     # if interface is different than primary's
                     if base_port != primary_interface:
                         ts2phc_source_interfaces[base_port] = primary_interface
@@ -1661,6 +1703,20 @@ def init_func():
     obj.base_eid = 'host=' + obj.hostname
     obj.capabilities = {'primary_nic': None, 'ts2phc_source': None}
 
+    # initialize base ports
+    for path in glob('/sys/class/net/*/device/ptp'):
+        splitted_path = path.split(os.sep)
+        if len(splitted_path) > 4:
+            interface_name = splitted_path[4]
+            create_interface(interface_name)
+            # Remove SRIOV interfaces
+            if interfaces.get(interface_name, None) and \
+               interfaces[interface_name].get_driver() == 'iavf':
+                interfaces.pop(interface_name)
+                continue
+            base_ports.append(interface_name)
+            base_port_map[interface_name] = interface_name
+
     if os.path.exists(PTPINSTANCE_PATH):
         read_ptp4l_config()
         read_ts2phc_config()
@@ -1681,7 +1737,7 @@ def init_func():
         collectd.info("%s interface %s supports timestamping modes: %s" %
                       (PLUGIN, key, value.get_ts_supported_modes()))
         collectd.info("%s interface %s base port: %s" %
-                      (PLUGIN, key, value.get_base_port()))
+                      (PLUGIN, key, get_base_port(key)))
         collectd.info("%s interface %s pci slot: %s" %
                       (PLUGIN, key, value.get_pci_slot()))
         collectd.info("%s interface %s nmea: %s" %
@@ -2015,7 +2071,7 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
     """check for GNSS alarm"""
     collectd.debug(f"{PLUGIN} check_gnss_alarm: {instance} {interface} {state}")
     ctrl = ptpinstances[instance]
-    base_port = Interface.base_port(interface)
+    base_port = get_base_port(interface)
     primary_nic = ts2phc_source_interfaces.get(base_port, None)
 
     severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
@@ -2285,7 +2341,7 @@ def check_clock_class(instance):
     if not interface:
         collectd.warning(f"{PLUGIN} {instance} Interface {ctrl.interface} not found")
         return
-    base_port = interface.get_base_port()
+    base_port = get_base_port(ctrl.interface)
     # Granite Rapid-D and Connorsville NICs are always primary, because
     # they can't be daisy-chained.
     primary_nic = None
@@ -2411,7 +2467,7 @@ def process_ptp_bc(instance):
         upstream_instance = ptp4l_instance_map.get(phc2sys_source, None)
         if not upstream_instance:
             upstream_instance = ptp4l_instance_map.get(
-                Interface.get_base_port(phc2sys_source),
+                get_base_port(phc2sys_source),
                 None)
     collectd.debug(f"{PLUGIN} phc2sys source is {phc2sys_source} "
                    f"and ptp instance connected to GM is {upstream_instance}")
@@ -2549,7 +2605,7 @@ def check_gnss_signal(instance):
     collectd.debug(f"{PLUGIN} check_gnss_signal: {instance}")
 
     ctrl = ptpinstances[instance]
-    base_port = Interface.base_port(ctrl.interface)
+    base_port = get_base_port(ctrl.interface)
     state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
     collectd.info(f"{PLUGIN} gnss-monitor instance: {instance} "
                   f"device {ctrl.interface} status {state.value} pin %s"
@@ -2830,7 +2886,7 @@ def read_func():
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
             if ctrl.interface and \
-               Interface.base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
+               get_base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
                 if obj.capabilities['ts2phc_source'] == 'nmea':
                     check_clock_class(instance)
                 elif obj.capabilities['ts2phc_source'] == 'generic':
@@ -3177,7 +3233,7 @@ def check_ptp_regular(instance, ctrl, conf_file):
         #
         # Determine the base port of the NIC from the interface, and
         # get state for primary or secondary NIC.
-        base_port = Interface.base_port(ctrl.interface)
+        base_port = get_base_port(ctrl.interface)
         pps_status, _ = get_netlink_dpll_status(base_port, DeviceType.PPS)
         eec_status, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
         clock_locked = any(
@@ -3195,7 +3251,7 @@ def check_ptp_regular(instance, ctrl, conf_file):
         if phc2sys_source:
             upstream_instance = ptp4l_instance_map.get(phc2sys_source, None)
             if not upstream_instance:
-                base_port = Interface.base_port(phc2sys_source)
+                base_port = get_base_port(phc2sys_source)
                 upstream_instance = ptp4l_instance_map.get(base_port, None)
         if upstream_instance:
             upstream_parent_data = query_pmc(upstream_instance,

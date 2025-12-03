@@ -120,37 +120,17 @@ class Interface:
     def __init__(self, name):
         self.name = name
         self.uevent = read_uevent(self.name)
-        self.base_port = self._build_base_port()
         self.ts_supported_modes = self._read_suported_modes()
-        self.nmea = self._read_nmea_serial_port_name()
+        # Don't try to read NMEA serial port name from SRIOV
+        # interfaces.
+        if self.get_driver() != 'iavf':
+            self.nmea = self._read_nmea_serial_port_name()
+        else:
+            self.nmea = None
         if self.get_family() in ['Granite Rapid-D', 'Connorsville']:
             self.switch_id = self._read_microchip_gnss_clock_id()
         else:
             self.switch_id = self._read_phy_switch_id()
-
-    def base_port(interface):
-        """Interface's base port name"""
-
-        """A network device card can have multiple ports,
-        which shares the a single PTP hardware clock (PHC).
-        Get the name of the interface which holds the PHC.
-
-        Returns : the name of the base port"""
-        # List the path to the interface in the same NIC,
-        # which holds the PHC.
-        prefix = interface[:-1] + '*'
-        paths = glob(ptp_path % prefix)
-        if len(paths) == 0:
-            collectd.info(f"{PLUGIN} {interface} Failed to find path "
-                          f"{ptp_path % prefix}.")
-            return interface
-
-        # Return the name of the interface in the 1st path available.
-        path = next(iter(paths))
-        return path.split(os.sep)[4]
-
-    def _build_base_port(self):
-        return Interface.base_port(self.name)
 
     def _read_suported_modes(self):
         """Read interface's supported timestamping modes."""
@@ -358,13 +338,16 @@ class Interface:
             collectd.debug(f"{PLUGIN} {self.name} clock id {clock_id}")
         return clock_id
 
-    def get_base_port(self):
-        """Get the name of the 1st interface of the NIC"""
-        return self.base_port
-
     def get_ts_supported_modes(self):
         """Get interface's supported timestamping modes."""
         return self.ts_supported_modes
+
+    def get_driver(self):
+        """Get driver name"""
+        driver = 'unknown'
+        if self.uevent:
+            driver = self.uevent.driver
+        return driver
 
     def get_pci_id(self):
         """Get PCI id"""
