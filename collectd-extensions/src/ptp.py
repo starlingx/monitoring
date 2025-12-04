@@ -118,6 +118,7 @@ PTPINSTANCE_PTP4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ptp4l-*.conf'
 PTPINSTANCE_PHC2SYS_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'phc2sys-*.conf'
 PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
 PTPINSTANCE_GNSS_MONITOR_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "gnss-monitor-*.conf"
+PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "instance-monitoring.conf"
 
 
 def _get_ptp_options_path():
@@ -199,7 +200,7 @@ RUN_PHASE__DISABLED = 1
 RUN_PHASE__NOT_RUNNING = 2
 RUN_PHASE__SAMPLING = 3
 
-# Clock Sync Out-Of-Tolerance thresholds
+# Clock Sync Out-Of-Tolerance thresholds (nsec)
 OOT_MINOR_THRESHOLD = int(1000)
 OOT_MAJOR_THRESHOLD = int(1000000)
 
@@ -369,6 +370,9 @@ class PTP_ctrl_object:
         self.prtc_present = False
         self.interface_list = []
         self.clock_ports = {}
+        # placeholder for instance's monitoring section parameters
+        # e.g. holdover and offset thresholds
+        self.monitoring_parameters = {}
 
         # Ptp4l G.8275 variables
         self.ptp4l_prtc_type = PTP4L_SOURCE_PRTC
@@ -598,6 +602,53 @@ def read_files_for_timing_instances():
                 collectd.info(f"{PLUGIN} phc2sys {instance.instance_name} "
                               f"source is {interface}")
                 phc2sys_source = interface
+
+
+def read_instance_monitoring_config():
+    """read instance-monitoring.conf file"""
+    filenames = glob(PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE_PATTERN)
+    if len(filenames) == 0:
+        collectd.debug(
+            f"{PLUGIN} No PTP conf file located for instance-monitoring.conf"
+        )
+    else:
+        # Single match expected.
+        filename = filenames[0]
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read(filename)
+        int_val_params_default = {
+            "holdover_seconds": HOLDOVER_THRESHOLD,
+            "offset_threshold_minor_nsec": OOT_MINOR_THRESHOLD,
+            "offset_threshold_major_nsec": OOT_MAJOR_THRESHOLD,
+        }
+        for ptp_instance_name in config.sections():
+            if ptpinstances.get(ptp_instance_name, None):
+                ptpinstances[ptp_instance_name].monitoring_parameters = dict(
+                    config[ptp_instance_name]
+                )
+                for param in int_val_params_default.keys():
+                    if param in ptpinstances[ptp_instance_name].monitoring_parameters.keys():
+                        param_value = ptpinstances[ptp_instance_name].monitoring_parameters[param]
+                        try:
+                            ptpinstances[ptp_instance_name].monitoring_parameters[param] = int(
+                                param_value
+                            )
+                        except ValueError as exc:
+                            # Set to default in case of error
+                            ptpinstances[ptp_instance_name].monitoring_parameters[param] = (
+                                int_val_params_default[param]
+                            )
+
+                            collectd.error(
+                                f"{PLUGIN} Reading PTP instance {ptp_instance_name}'s parameter "
+                                f"{param} value:{param_value} from config file {filename} "
+                                f"failed. error: {exc}. "
+                                f"Using default value:{int_val_params_default[param]}"
+                            )
+                collectd.info(
+                    f"{PLUGIN} PTP instance {ptp_instance_name}'s monitoring_parameters: "
+                    f"{ptpinstances[ptp_instance_name].monitoring_parameters}"
+                )
 
 
 class TimingInstance:
@@ -978,6 +1029,13 @@ def raise_alarm(alarm_cause,
         else:
             reason += str(float(data))
             reason += ' ' + PLUGIN_TYPE_INSTANCE
+
+        # Also add configured threshold to the reason
+        ctrl = ptpinstances[source]
+        reason += (
+            f" (configured threshold: minor:{ctrl.monitoring_parameters['offset_threshold_minor_nsec']} "
+            f"nsec, major:{ctrl.monitoring_parameters['offset_threshold_major_nsec']} nsec)"
+        )
 
     elif alarm.raised is True:
         # If alarm already raised then exit.
@@ -1724,6 +1782,10 @@ def init_func():
         # Initialize TimingInstance for HA phc2sys
         read_files_for_timing_instances()
         read_gnss_monitor_ptp_config()
+        # After reading all above per instance configs, read instance-monitoring.conf
+        # and set per instance's monitoring_parameters
+        read_instance_monitoring_config()
+
         for key, ctrl in ptpinstances.items():
             collectd.info("%s instance: %s type: %s found" %
                           (PLUGIN, key, ctrl.instance_type))
@@ -2199,11 +2261,9 @@ def check_time_drift(instance, gm_identity=None, master_offset=0):
         fault_offset = master_offset if abs(master_offset) > abs(offset) else offset
         collectd.info("%s instance %s phc offset %f master_offset %f" %
                       (PLUGIN, instance, offset, master_offset))
-        if (abs(offset) > OOT_MAJOR_THRESHOLD
-                or abs(master_offset) > OOT_MAJOR_THRESHOLD):
+        if (abs(fault_offset) > ctrl.monitoring_parameters["offset_threshold_major_nsec"]):
             severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-        elif (abs(offset) > OOT_MINOR_THRESHOLD
-                or abs(master_offset) > OOT_MINOR_THRESHOLD):
+        elif (abs(fault_offset) > ctrl.monitoring_parameters["offset_threshold_minor_nsec"]):
             severity = fm_constants.FM_ALARM_SEVERITY_MINOR
 
         # Handle clearing of Out-Of-Tolerance alarm
@@ -2220,7 +2280,7 @@ def check_time_drift(instance, gm_identity=None, master_offset=0):
         # Too much skew in software or legacy mode ; alarm would bounce.
         elif severity == fm_constants.FM_ALARM_SEVERITY_MINOR \
                 and obj.mode != 'hardware' \
-                and abs(master_offset) > OOT_MINOR_THRESHOLD:
+                and abs(master_offset) > ctrl.monitoring_parameters["offset_threshold_minor_nsec"]:
             collectd.info("%s instance %s minor skew detected, "
                           "not raising OOT alarm in software mode" %
                           (PLUGIN, instance))
@@ -2256,9 +2316,12 @@ def check_time_drift(instance, gm_identity=None, master_offset=0):
             if severity != fm_constants.FM_ALARM_SEVERITY_CLEAR:
                 collectd.info("%s ; "
                               "PTP instance: %s ; "
-                              "Skew:%5d" % (PLUGIN,
-                                            instance,
-                                            fault_offset))
+                              "Skew:%5d (configured threshold: minor:%d, major:%d)"
+                              % (PLUGIN,
+                                 instance,
+                                 fault_offset,
+                                 ctrl.monitoring_parameters["offset_threshold_minor_nsec"],
+                                 ctrl.monitoring_parameters["offset_threshold_major_nsec"]))
 
 
 def is_service_running(ptp_service):
@@ -2428,7 +2491,7 @@ def check_clock_class(instance):
                                             timeutils.utcnow())
             collectd.info(
                 f"{PLUGIN} {instance} holdover timer: {delta} seconds")
-            if delta > HOLDOVER_THRESHOLD:
+            if delta > ctrl.monitoring_parameters["holdover_seconds"]:
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
                 frequency_traceable = False
