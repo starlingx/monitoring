@@ -1,0 +1,21 @@
+Source: collectd-extensions
+Section: admin
+Priority: optional
+Maintainer: StarlingX Developers <starlingx-discuss@lists.starlingx.io>
+Build-Depends: debhelper-compat (= 13),
+ libsystemd-dev
+Standards-Version: 4.1.2
+Homepage: https://www.starlingx.io
+
+Package: collectd-extensions
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ collectd,
+ python3-fm-api,
+ python3-httplib2,
+ python3-oslo.concurrency,
+ python3-oslo.utils,
+ systemd,
+ tsconfig
+Description: StarlingX Server collectd Package
+ StarlingX collectd extensions
