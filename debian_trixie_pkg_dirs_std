@@ -1,0 +1,4 @@
+collectd-extensions
+kube-cpusets
+kube-memory
+monitor-tools
