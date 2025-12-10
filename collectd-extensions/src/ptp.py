@@ -213,6 +213,9 @@ CLOCK_STATE_LOCKED = LockStatus.LOCKED
 CLOCK_STATE_LOCKED_HO_ACQ = LockStatus.LOCKED_AND_HOLDOVER
 CLOCK_STATE_HOLDOVER = LockStatus.HOLDOVER
 CLOCK_STATE_UNLOCKED = LockStatus.UNLOCKED
+# derived clock states
+CLOCK_STATE_HOLDOVER_EXPIRED = "holdover-expired"
+CLOCK_STATE_HOLDOVER_UNSTABLE = "holdover-unstable(freerun)"
 
 # Synce Clock Generation Unit (CGU) input pin names
 CGU_PIN_SDP22 = 'CVL-SDP22'
@@ -253,6 +256,8 @@ CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
 # Holdover threshold is set to 4 hours to match the supported holdover time
 # for Columbiaville NICs
 HOLDOVER_THRESHOLD = 14400
+
+LOCKED_TO_HOLDOVER_THRESHOLD_SECONDS = 300  # 5 minutes
 
 PTP4L_SOURCE_EPRTC = 'ePRTC'
 PTP4L_SOURCE_PRTC = 'PRTC'
@@ -364,6 +369,7 @@ class PTP_ctrl_object:
         self.log_throttle_count = 0
         self.phase = 0
         self.holdover_timestamp = {}
+        self.locked_timestamp = {}
         self.interface = None
         self.timing_instance = None
         self.phc2sys_ha_enabled = False
@@ -620,6 +626,7 @@ def read_instance_monitoring_config():
             "holdover_seconds": HOLDOVER_THRESHOLD,
             "offset_threshold_minor_nsec": OOT_MINOR_THRESHOLD,
             "offset_threshold_major_nsec": OOT_MAJOR_THRESHOLD,
+            "locked_to_holdover_threshold_seconds": LOCKED_TO_HOLDOVER_THRESHOLD_SECONDS,
         }
         for ptp_instance_name in config.sections():
             if ptpinstances.get(ptp_instance_name, None):
@@ -2140,19 +2147,84 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
     if not state or state in [CLOCK_STATE_INVALID,
                               CLOCK_STATE_UNLOCKED]:
         severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+        # Reset locked_timestamp
+        ctrl.locked_timestamp[interface] = None
     elif state == CLOCK_STATE_HOLDOVER:
         severity = fm_constants.FM_ALARM_SEVERITY_MINOR
-    elif state in [CLOCK_STATE_LOCKED,
-                   CLOCK_STATE_LOCKED_HO_ACQ]:
-        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
 
-    if state == CLOCK_STATE_HOLDOVER:
         if interface != primary_nic:
             holdover_ts = ctrl.holdover_timestamp.get(primary_nic, None)
             if holdover_ts:
                 # We were already in holdover because of the primary nic
                 # Copy the timestamp to secondary nic
                 ctrl.holdover_timestamp[interface] = holdover_ts
+
+            locked_ts = ctrl.locked_timestamp.get(primary_nic, None)
+            if locked_ts:
+                # We were already in locked because of the primary nic
+                # Copy the timestamp to secondary nic
+                ctrl.locked_timestamp[interface] = locked_ts
+
+        # It should be locked at least for "locked_to_holdover_threshold_seconds" time
+        # before transitioning state from locked to holdover. Otherwise, change
+        # state from locked to holdover-unstable (instead of holdover).
+        locked_timestamp = ctrl.locked_timestamp.get(interface, None)
+        if locked_timestamp:
+            # state transition: locked to holdover happened.
+            delta = timeutils.delta_seconds(locked_timestamp,
+                                            timeutils.utcnow())
+            if delta < ctrl.monitoring_parameters['locked_to_holdover_threshold_seconds']:
+                # Overwrite state to holdover-unstable and severity to major
+                state = CLOCK_STATE_HOLDOVER_UNSTABLE
+                severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+                collectd.info(
+                    f"{PLUGIN} PTP instance {instance} interface {interface}'s state "
+                    f"{CLOCK_STATE_HOLDOVER} overwritten to {state} as it has not been locked long "
+                    f"enough: {delta} < "
+                    f"{ctrl.monitoring_parameters['locked_to_holdover_threshold_seconds']}"
+                )
+        else:
+            # state transition: invalid/unlocked/holdover to holdover happened.
+            holdover_timestamp = ctrl.holdover_timestamp.get(interface, None)
+            if holdover_timestamp:
+                # state transition: holdover to holdover happened.
+                # Overwrite holdover -> holdover-expired, in case it crosses threshold
+                delta = timeutils.delta_seconds(holdover_timestamp,
+                                                timeutils.utcnow())
+                # already in holdover over the holdover threshold, treat as holdover-expired
+                if delta > ctrl.monitoring_parameters['holdover_seconds']:
+                    # overwrite state and severity, treat as holdover-expired
+                    severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+                    state = CLOCK_STATE_HOLDOVER_EXPIRED
+                    collectd.info(
+                        f"{PLUGIN} PTP instance {instance} interface {interface}'s state "
+                        f"{CLOCK_STATE_HOLDOVER} overwritten to {state} as it has been on "
+                        f"holdover over threshold: {delta} > "
+                        f"{ctrl.monitoring_parameters['holdover_seconds']}"
+                    )
+            else:
+                # state transition: invalid/unlocked to holdover happened.
+                # This happens when last time's actual holdover overwritten to holdover-unstable,
+                # this next poll cycle sees actual state still in holdover.
+                # Overwrite state and severity, treat still as holdover-unstable
+                severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+                state = CLOCK_STATE_HOLDOVER_UNSTABLE
+
+        # Reset locked_timestamp, as state changed to holdover/holdover-expired/holdover-unstable
+        ctrl.locked_timestamp[interface] = None
+
+    elif state in [CLOCK_STATE_LOCKED,
+                   CLOCK_STATE_LOCKED_HO_ACQ]:
+        severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+        # Set locked_timestamp if not already have,
+        # don't overwrite when already have locked timestamp
+        if (
+            interface not in ctrl.locked_timestamp or
+            not ctrl.locked_timestamp[interface]
+        ):
+            ctrl.locked_timestamp[interface] = timeutils.utcnow()
+
+    if state == CLOCK_STATE_HOLDOVER:
         # If there is no entry for the current interface,
         # create it and initialize
         if interface not in ctrl.holdover_timestamp or \
@@ -2160,7 +2232,11 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
             ctrl.holdover_timestamp[interface] = timeutils.utcnow()
         collectd.info(f"{PLUGIN} Holdover timestamp for PHC {interface}: "
                       f"{ctrl.holdover_timestamp[interface]}")
+    elif state == CLOCK_STATE_HOLDOVER_EXPIRED:
+        # Don't overwrite holdover_timestamp
+        pass
     else:
+        # locked/invalid/unlocked/holdover-unstable
         ctrl.holdover_timestamp[interface] = None
 
     if severity == fm_constants.FM_ALARM_SEVERITY_CLEAR:
@@ -2172,8 +2248,11 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
         # Clear pre-existing holdover timestamp
         ctrl.holdover_timestamp[interface] = None
     else:
+        # This will keep refreshing the alarm text with major/minor
+        # severity and state
         if alarm_object.severity != severity:
             alarm_object.severity = severity
+            alarm_object.raised = False
         if alarm_object.raised is False:
             rc = raise_alarm(alarm_object.alarm, interface,
                              state, alarm_object)
@@ -2493,11 +2572,31 @@ def check_clock_class(instance):
             delta = timeutils.delta_seconds(holdover_timestamp,
                                             timeutils.utcnow())
             collectd.info(
-                f"{PLUGIN} {instance} holdover timer: {delta} seconds")
-            if delta > ctrl.monitoring_parameters["holdover_seconds"]:
+                f"{PLUGIN} {instance} holdover timer: {delta} seconds"
+                f" holdover_seconds: {ctrl.monitoring_parameters['holdover_seconds']}"
+                f" source {key} holdover_seconds:"
+                f" {ctrl_obj.monitoring_parameters['holdover_seconds']}")
+            # holdover expiration dependes upon minimum of ptp4l instance
+            # or source ts2phc/clock instance's holdover_seconds
+            if delta > min(
+                ctrl.monitoring_parameters["holdover_seconds"],
+                ctrl_obj.monitoring_parameters["holdover_seconds"]
+            ):
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
                 frequency_traceable = False
+        else:
+            # holdover_timestamp None means, source is on derived holdover-unstable state,
+            # this is treated as unlocked.
+            collectd.info(
+                f"{PLUGIN} {instance} new clock class: {CLOCK_CLASS_248}, as"
+                f" no holdover timestamp found for instance_type: {instance_type} and"
+                f" interface: {ho_timer_interface}"
+            )
+            new_clock_class = CLOCK_CLASS_248
+            time_traceable = False
+            frequency_traceable = False
+
     else:
         new_clock_class = CLOCK_CLASS_248
 
