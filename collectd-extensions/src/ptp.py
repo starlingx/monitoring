@@ -3254,11 +3254,24 @@ def check_ptp_regular(instance, ctrl, conf_file):
                 base_port = get_base_port(phc2sys_source)
                 upstream_instance = ptp4l_instance_map.get(base_port, None)
         if upstream_instance:
-            upstream_parent_data = query_pmc(upstream_instance,
-                                             'PARENT_DATA_SET',
-                                             query_action='GET')
-            upstream_ptp_clock_class = upstream_parent_data.get('gm.ClockClass', None)
-            clock_locked = upstream_ptp_clock_class in ['6', '7']
+            upstream_port_data_set = query_pmc_indexed(
+                upstream_instance, 'PORT_DATA_SET'
+            )
+            upstream_port_locked = any(
+                port['portState'] == 'SLAVE'
+                for port in upstream_port_data_set.values()
+            )
+
+            upstream_time_status = query_pmc_indexed(
+                upstream_instance, 'TIME_STATUS_NP'
+            )
+            upstream_identity = next(iter(upstream_time_status))
+            upstream_gm_identity = upstream_time_status[upstream_identity].get(
+                'gmIdentity', None
+            )
+
+            clock_locked = (upstream_identity != upstream_gm_identity and
+                            upstream_port_locked)
 
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
