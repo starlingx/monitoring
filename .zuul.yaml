@@ -41,7 +41,7 @@
 
 - job:
     name: kube-cpusets-tox-pylint
-    parent: openstack-tox-pylint
+    parent: tox
     description: |
       Run pylint test for kube-cpusets
     required-projects:
@@ -60,7 +60,7 @@
       Run flake8 test for kube-cpusets
     required-projects:
       - starlingx/config
-    nodeset: ubuntu-bionic
+    nodeset: debian-bullseye
     files:
       - kube-cpusets/kube-cpusets/*
     vars:
@@ -69,7 +69,7 @@
 
 - job:
     name: kube-cpusets-tox-py39
-    parent: tox-py39
+    parent: tox
     description: |
       Run py39 for kube-cpusets
     required-projects:
@@ -78,7 +78,6 @@
     files:
       - kube-cpusets/kube-cpusets/*
     vars:
-      python_version: 3.9
       tox_envlist: py39
       tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
 
@@ -87,7 +86,7 @@
     parent: tox
     required-projects:
       - starlingx/config
-    nodeset: ubuntu-bionic
+    nodeset: debian-bullseye
     description: |
       Run pylint test for kube-memory
     files:
@@ -101,7 +100,7 @@
     parent: tox
     description: |
       Run flake8 test for kube-memory
-    nodeset: ubuntu-bionic
+    nodeset: debian-bullseye
     required-projects:
       - starlingx/config
     files:
@@ -112,7 +111,7 @@
 
 - job:
     name: kube-memory-tox-py39
-    parent: tox-py39
+    parent: tox
     description: |
       Run py39 test for kube-memory
     nodeset: debian-bullseye
@@ -121,13 +120,12 @@
     files:
       - kube-memory/kube-memory/*
     vars:
-      python_version: 3.9
       tox_envlist: py39
       tox_extra_args: -c kube-memory/kube-memory/tox.ini
 
 - job:
     name: collectd-extensions-py39
-    parent: tox-py39
+    parent: tox
     description: |
       Run py39 for collectd-extensions
     required-projects:
@@ -136,7 +134,6 @@
     files:
       - collectd-extensions/*
     vars:
-      python_version: 3.9
       tox_envlist: py39
       tox_extra_args: -c collectd-extensions/tox.ini
 
