@@ -2405,8 +2405,8 @@ def check_clock_class(instance):
         collectd.warning(f"{PLUGIN} {instance} Interface {ctrl.interface} not found")
         return
     base_port = get_base_port(ctrl.interface)
-    # Granite Rapid-D and Connorsville NICs are always primary, because
-    # they can't be daisy-chained.
+    # Integrated Granite Rapid-D and Connorsville (E830) NICs are directly
+    # connected to an external DPLL, hence they are always primary.
     primary_nic = None
     if interface.get_family() in ['Granite Rapid-D', 'Connorsville']:
         primary_nic = base_port
@@ -2442,7 +2442,10 @@ def check_clock_class(instance):
     if primary_nic == base_port:
         # We have the primary NIC
         state, _ = get_dpll_state(base_port)
-        instance_type = PTP_INSTANCE_TYPE_TS2PHC
+        # Don't override instance_type for Connorsville NICs,
+        # because they are configured in clock instance.
+        if interface.get_family() != 'Connorsville':
+            instance_type = PTP_INSTANCE_TYPE_TS2PHC
         collectd.info(f"{PLUGIN} {instance} Primary device {base_port} "
                       f"status {state}")
     else:
