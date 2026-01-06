@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 ########################################################################
 #
-# Copyright (c) 2015-2024 Wind River Systems, Inc.
+# Copyright (c) 2015-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -1317,9 +1317,9 @@ sub read_schedstat
   $_ = <$fh>; ($version) = /^version\s+(\d+)/;
   $_ = <$fh>; ($timestamp) = /^timestamp\s+(\d+)/;
 
-  if ($version == 15) {
+  if ($version == 15 or $version == 16) {
     LOOP_SCHEDSTAT: while (<$fh>) {
-      # version 15: cputime is 7th field
+      # version 15 and 16: cputime is 7th field
       if (/^cpu(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+/) {
         $cpu = $1; $cputime = $2;
         $::percpu{$cpu} = $cputime;

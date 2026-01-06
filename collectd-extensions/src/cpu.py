@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2024 Wind River Systems, Inc.
+# Copyright (c) 2018-2025 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -34,11 +34,12 @@ PLUGIN_DEBUG = 'DEBUG platform cpu'
 PLUGIN_HIRES_INTERVAL = 1        # hi-resolution sample interval in secs
 PLUGIN_DISPATCH_INTERVAL = 30    # dispatch interval in secs
 PLUGIN_HISTOGRAM_INTERVAL = 300  # histogram interval in secs
+PLUGIN_CPU_FREQUENCY_INTERVAL = 300  # cpu frequency interval in secs
 
 TIMESTAMP = 'timestamp'
 PLATFORM_CPU_PERCENT = 'platform-occupancy'
 CGROUP_PLATFORM_CPU_PERCENT = 'cgroup-platform-occupancy'
-SCHEDSTAT_SUPPORTED_VERSION = 15
+SCHEDSTAT_SUPPORTED_VERSION = 16
 
 # Linux per-cpu info
 CPUINFO = '/proc/cpuinfo'
@@ -73,11 +74,17 @@ class CPU_object(pc.PluginObject):
         # CPU Plugin flags
         self.dispatch = False   # print occupancy and dispatch this sample
         self.histogram = False  # print occupancy histogram this sample
+        self.cpu_frequency = False  # print cpu frequency
 
         # CPU plugin configurable settings
         self.debug = True
         self.verbose = True
         self.hires = False
+        self.cpu_freq_non_platform_cores = True
+
+        # core cpu lists
+        self.cpu_list = list()       # platform configured cpu list
+        self.logical_cpus = list()   # list of logical cpus from /proc/cpuinfo
 
         # Cache Kubernetes pods data
         self._cache = {}
@@ -132,6 +139,11 @@ class CPU_object(pc.PluginObject):
         self.hist_occ = {}          # histogram bin counts per cgroup or derived aggregate
         self.shared_bins = np.histogram_bin_edges(
             np.array([0, 100], dtype=np.float64), bins=10, range=(0, 100))
+
+        # Derived measurements over cpu frequency interval
+        self.cpu_freq = {}              # cpu frequencies
+        self.cpu_freq_t0 = now          # cpu frequency timestamp time 0
+        self.cpu_freq_elapsed_ms = 0.0  # cpu frequency elapsed time
 
 
 # Instantiate the class
@@ -299,6 +311,7 @@ def get_cpuacct():
     cpuacct[pc.GROUP_PODS] = {}
     cpuacct[pc.CGROUP_SYSTEM] = {}
     cpuacct[pc.CGROUP_USER] = {}
+    cpuacct[pc.CGROUP_UTILS] = {}
     cpuacct[pc.CGROUP_INIT] = {}
     cpuacct[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -308,6 +321,7 @@ def get_cpuacct():
     cpuwait[pc.GROUP_PODS] = {}
     cpuwait[pc.CGROUP_SYSTEM] = {}
     cpuwait[pc.CGROUP_USER] = {}
+    cpuwait[pc.CGROUP_UTILS] = {}
     cpuwait[pc.CGROUP_INIT] = {}
     cpuwait[pc.CGROUP_K8SPLATFORM] = {}
 
@@ -353,7 +367,22 @@ def get_cpuacct():
         cpuacct[pc.CGROUP_SYSTEM][name] = acct
         cpuwait[pc.CGROUP_SYSTEM][name] = wait
 
-    # Walk the system.slice cgroups and get cpuacct usage
+    # Walk the utils.slice cgroups and get cpuacct usage
+    path = '/'.join([CPUACCT, pc.CGROUP_UTILS])
+    if os.path.isdir(path):
+        dir_list = next(os.walk(path))[1]
+    else:
+        dir_list = []
+    for name in dir_list:
+        if any(name.endswith(x) for x in exclude_types):
+            continue
+        cg_path = '/'.join([path, name])
+        acct = get_cgroup_cpuacct(cg_path, cpulist=obj.cpu_list)
+        wait = get_cgroup_cpu_wait_sum(cg_path)
+        cpuacct[pc.CGROUP_UTILS][name] = acct
+        cpuwait[pc.CGROUP_UTILS][name] = wait
+
+    # Walk the k8splatform.slice cgroups and get cpuacct usage
     path = '/'.join([CPUACCT, pc.CGROUP_K8SPLATFORM])
     if os.path.isdir(path):
         dir_list = next(os.walk(path))[1]
@@ -384,8 +413,11 @@ def get_cpuacct():
     # We can safely ignore reading this if the path does not exist.
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
-    path = '/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS])
-    if os.path.isdir(path):
+    paths = ['/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS]),
+             '/'.join([CPUACCT, pc.K8S_ROOT_STX, pc.KUBEPODS])]
+    for path in paths:
+        if not os.path.isdir(path):
+            continue
         for root, dirs, files in pc.walklevel(path, level=1):
             for name in dirs:
                 if name.startswith('pod') and CPUACCT_USAGE in files:
@@ -504,7 +536,7 @@ def calculate_occupancy(
             continue
 
         # K8S platform system usage, i.e., essential: kube-system
-        # check for component label app.starlingx.io/component=platform        
+        # check for component label app.starlingx.io/component=platform
         if pod.is_platform_resource():
             cpuacct[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += acct
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_K8S_SYSTEM] += wait
@@ -537,6 +569,11 @@ def calculate_occupancy(
                 cpuacct[pc.CGROUP_K8SPLATFORM][g]
             cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
                 cpuwait[pc.CGROUP_K8SPLATFORM][g]
+        if g in cpuacct[pc.CGROUP_UTILS].keys():
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuacct[pc.CGROUP_UTILS][g]
+            cpuwait[pc.GROUP_OVERALL][pc.GROUP_CONTAINERS] += \
+                cpuwait[pc.CGROUP_UTILS][g]
 
     # Calculate platform cpuacct usage (this excludes apps)
     for g in pc.PLATFORM_GROUPS:
@@ -654,6 +691,26 @@ def calculate_occupancy(
         if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
             h_occw[g] = g_occw
 
+    # Calculate cgroup based occupancy for cgroups within utils.slice.
+    if pc.CGROUP_UTILS in cpuacct.keys():
+        for g in cpuacct[pc.CGROUP_UTILS]:
+            cputime_ms = \
+                float(cpuacct[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occ = float(pc.ONE_HUNDRED) * float(cputime_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occ[g] = g_occ
+            cpuwait_ms = \
+                float(cpuwait[pc.CGROUP_UTILS][g]) / float(pc.ONE_MILLION)
+            g_occw = float(pc.ONE_HUNDRED) * float(cpuwait_ms) \
+                / float(elapsed_ms) / number_platform_cpus
+            occw[g] = g_occw
+
+            # Keep hirunners exceeding minimum threshold.
+            if g_occ >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occ[g] = g_occ
+            if g_occw >= HIRUNNER_MINIMUM_CPU_PERCENT:
+                h_occw[g] = g_occw
+
     if (hires and prefix == 'hires') or (dispatch and prefix == 'dispatch'):
         # Print cpu occupancy usage for high-level groupings
         collectd.info('%s %s Usage: %.1f%% (avg per cpu); '
@@ -747,6 +804,62 @@ def aggregate_histogram(histogram, occ, shared_bins, hist_occ, debug):
                                  v['mean'], v['p95'], v['pmax']))
 
 
+def get_cpu_frequencies(cpu_list):
+    """Get the list of cpus frequencies """
+
+    global obj
+
+    for i in cpu_list:
+        file_path = f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq"
+        try:
+            with open(file_path, "rb") as f:
+                freq = f.read().decode("utf-8")
+                obj.cpu_freq[i] = int(freq)
+        except Exception as e:
+            if obj.cpu_freq_non_platform_cores:
+                collectd.error(
+                    f"{PLUGIN} cannot read cpu frequency file {file_path}. "
+                    f"Only platform core cpus will be monitored. error=({e})")
+                obj.cpu_freq_non_platform_cores = False
+            else:
+                collectd.error(
+                    f"{PLUGIN} cannot read cpu frequency file {file_path}. "
+                    f"Stopping cpu core frequency monitoring. error=({e})")
+                obj.cpu_frequency = False
+            return
+
+    # collectd python module limits log messages to 1024 characters.
+    # Log cpu core frequencies in chunks of 64 cores to not exceed log size.
+    chunk_size = 64
+    num_chunks = int(np.ceil(len(cpu_list) / chunk_size))
+    for i in range(0, num_chunks):
+        start = i * chunk_size
+        end = i * chunk_size + chunk_size
+        cpu_freq_str = ", ".join(f"{cpu}: {obj.cpu_freq[cpu]}" for cpu in
+                                 cpu_list[start:end] if cpu in obj.cpu_freq)
+        collectd.info(f"{PLUGIN} core frequencies (KHz): {cpu_freq_str}")
+
+
+def update_cpu_frequency_data(init=False):
+    """Gather and update cpu frequency info. """
+
+    global obj
+
+    # Get epoch time in floating seconds
+    now = time.time()
+
+    obj.cpu_freq_elapsed_ms = float(pc.ONE_THOUSAND) * (now - obj.cpu_freq_t0)
+
+    if init or obj.cpu_freq_elapsed_ms >= 1000.0 * PLUGIN_CPU_FREQUENCY_INTERVAL:
+        if obj.cpu_freq_non_platform_cores:
+            get_cpu_frequencies(obj.logical_cpus)
+        else:
+            # Get core frequencies from platform cpus only
+            get_cpu_frequencies(obj.cpu_list)
+        # Clear t0 timestamp for next interval
+        obj.cpu_freq_t0 = now
+
+
 def update_cpu_data(init=False):
     """Gather cputime info and Update platform cpu occupancy metrics.
 
@@ -756,6 +869,8 @@ def update_cpu_data(init=False):
     This calculates the average cpu occupancy of the platform cores
     since this routine was last run.
     """
+
+    global obj
 
     # Get epoch time in floating seconds
     now = time.time()
@@ -795,51 +910,7 @@ def update_cpu_data(init=False):
 
     # Refresh the k8s pod information if we have discovered new cgroups
     cg_pods = set(t1_cpuacct[pc.GROUP_PODS].keys())
-    if not cg_pods.issubset(obj.k8s_pods):
-        if obj.debug:
-            collectd.info('%s Refresh k8s pod information.' % (PLUGIN_DEBUG))
-        obj.k8s_pods = set()
-        try:
-            pods = obj._k8s_client.kube_get_local_pods()
-            for i in pods:
-                # NOTE: parent pod cgroup name contains annotation config.hash as
-                # part of its name, otherwise it contains the pod uid.
-                uid = i.metadata.uid
-                if ((i.metadata.annotations) and
-                        (pc.POD_ANNOTATION_KEY in i.metadata.annotations)):
-                    hash_uid = i.metadata.annotations.get(pc.POD_ANNOTATION_KEY,
-                                                          None)
-                    if hash_uid:
-                        if obj.debug:
-                            collectd.info('%s POD_ANNOTATION_KEY: '
-                                          'hash=%s, uid=%s, '
-                                          'name=%s, namespace=%s, qos_class=%s,'
-                                          'is_platform_label=%s'
-                                          % (PLUGIN_DEBUG,
-                                             hash_uid,
-                                             i.metadata.uid,
-                                             i.metadata.name,
-                                             i.metadata.namespace,
-                                             i.status.qos_class,
-                                             i.metadata.labels.get(pc.PLATFORM_LABEL_KEY) ==
-                                             pc.GROUP_PLATFORM))
-                        uid = hash_uid
-
-                obj.k8s_pods.add(uid)
-                if uid not in obj._cache:
-                    obj._cache[uid] = pc.POD_object(i.metadata.uid,
-                                                    i.metadata.name,
-                                                    i.metadata.namespace,
-                                                    i.status.qos_class,
-                                                    i.metadata.labels)
-            # Remove stale _cache entries
-            remove_uids = set(obj._cache.keys()) - obj.k8s_pods
-            for uid in remove_uids:
-                del obj._cache[uid]
-        except ApiException:
-            # continue with remainder of calculations, keeping cache
-            collectd.warning('%s encountered kube ApiException' % (PLUGIN))
-            pass
+    obj = pc.pods_monitoring(cg_pods, obj, PLUGIN_DEBUG)
 
     # Save initial state information
     if init:
@@ -919,9 +990,13 @@ def config_func(config):
             obj.verbose = pc.convert2boolean(val)
         elif key == 'hires':
             obj.hires = pc.convert2boolean(val)
+        elif key == 'cpu_frequency_non_platform_cores':
+            obj.cpu_freq_non_platform_cores = pc.convert2boolean(val)
 
-    collectd.info('%s debug=%s, verbose=%s, hires=%s'
-                  % (PLUGIN, obj.debug, obj.verbose, obj.hires))
+    collectd.info('%s debug=%s, verbose=%s, hires=%s, '
+                  'cpu_frequency_non_platform_cores=%s'
+                  % (PLUGIN, obj.debug, obj.verbose, obj.hires,
+                     obj.cpu_freq_non_platform_cores))
 
     return pc.PLUGIN_PASS
 
@@ -986,6 +1061,13 @@ def init_func():
     # Gather initial cputime state information.
     update_cpu_data(init=True)
 
+    # Gather initial cpu frequency data.
+    if os.path.isfile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"):
+        obj.cpu_frequency = True
+        update_cpu_frequency_data(init=True)
+    else:
+        collectd.info(f"{PLUGIN} core frequency data cannot be read.")
+
     obj.init_completed()
     return pc.PLUGIN_PASS
 
@@ -1010,6 +1092,10 @@ def read_func():
     # Gather current cputime state information, and calculate occupancy
     # since this routine was last run.
     update_cpu_data()
+
+    # Gather cpu frequency data.
+    if obj.cpu_frequency:
+        update_cpu_frequency_data()
 
     # Prevent dispatching measurements at plugin startup
     if obj.elapsed_ms <= 500.0:
