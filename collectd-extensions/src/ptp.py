@@ -249,6 +249,8 @@ CGU_PINS_ORDERED_BY_PRIO = [
 # PTP Clock Class
 CLOCK_CLASS_6 = '6'      # T-GM connected to PRTC in locked mode
 CLOCK_CLASS_7 = '7'      # T-GM in holdover, within holdover specification
+CLOCK_CLASS_135 = '135'  # T-BC in holdover, within holdover specification
+CLOCK_CLASS_165 = '165'  # T-BC in holdover, out of holdover specification
 CLOCK_CLASS_140 = '140'  # T-GM in holdover, out of holdover specification
 CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
 
@@ -374,6 +376,8 @@ class PTP_ctrl_object:
         self.timing_instance = None
         self.phc2sys_ha_enabled = False
         self.prtc_present = False
+        # disciplined by ts2phc either nmea or generic
+        self.disciplined_by_ts2phc = False
         self.interface_list = []
         self.clock_ports = {}
         # placeholder for instance's monitoring section parameters
@@ -385,11 +389,14 @@ class PTP_ctrl_object:
         self.ptp4l_current_utc_offset = 37
         self.ptp4l_current_utc_offset_valid = '0'
         self.ptp4l_clock_accuracy = None
-        self.ptp4l_clock_class = None
+        self.ptp4l_clock_class = CLOCK_CLASS_248
+        self.ptp4l_time_traceable = '0'
+        self.ptp4l_frequency_traceable = '0'
         self.ptp4l_clock_identity = None
         self.ptp4l_grandmaster_identity = None
         self.ptp4l_offset_scaled_log_variance = None
         self.ptp4l_prc_state = None
+        self.ptp4l_ptp_source_state = None
         self.ptp4l_time_source = None
         self.ptp4l_utc_offset_nanoseconds = None
         self.ptp4l_announce_settings = {}
@@ -1511,7 +1518,10 @@ def initialize_ptp4l_state_fields(instance):
     base_port = get_base_port(ctrl.interface)
 
     mapped_ts2phc_instance = ts2phc_instance_map.get(base_port, None)
-    if mapped_ts2phc_instance:
+    # "-s generic" ts2phc instance's port has mapping to None primary_interface,
+    # and this supposed to mean prtc not present.
+    mapped_primary_interface = ts2phc_source_interfaces.get(base_port, None)
+    if mapped_ts2phc_instance and mapped_primary_interface:
         collectd.info("%s ptp4l instance %s is mapped to ts2phc instance %s"
                       % (PLUGIN, instance, mapped_ts2phc_instance))
         ctrl.prtc_present = True
@@ -1519,6 +1529,10 @@ def initialize_ptp4l_state_fields(instance):
     else:
         ctrl.prtc_present = False
         collectd.info("%s Instance %s PRTC not present" % (PLUGIN, instance))
+
+    # Determine if this instance is disciplined by ts2phc, either nmea or generic
+    if base_port in ts2phc_source_interfaces.keys():
+        ctrl.disciplined_by_ts2phc = True
 
     # Read any configured G.8275.x field values, set to default if not present
     if ctrl.timing_instance.config.has_section('global'):
@@ -1705,6 +1719,7 @@ def read_ts2phc_config():
                     base_port = get_base_port(interface)
                     # if interface is different than primary's
                     if base_port != primary_interface:
+                        # In case of "-s generic", primary_interface is None.
                         ts2phc_source_interfaces[base_port] = primary_interface
                         ts2phc_instance_map[base_port] = instance_name
 
@@ -1872,7 +1887,6 @@ def handle_ptp4l_g8275_fields(instance):
     collectd.debug(f"{PLUGIN} handle_ptp4l_g8275_fields: {instance}")
     ctrl = ptpinstances[instance]
     previous_grandmaster_identity = ctrl.ptp4l_grandmaster_identity
-    previous_clock_class = ctrl.ptp4l_clock_class
 
     if ctrl.timing_instance.config.has_section('global') \
             and 'dataset_comparison' not in ctrl.timing_instance.config['global'].keys():
@@ -1882,6 +1896,13 @@ def handle_ptp4l_g8275_fields(instance):
 
     data_grandmaster_settings = query_pmc(
         instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
+
+    time_properties_data = query_pmc(
+        instance, 'TIME_PROPERTIES_DATA_SET', query_action='GET')
+    if 'timeTraceable' in time_properties_data.keys():
+        ctrl.ptp4l_time_traceable = time_properties_data['timeTraceable']
+    if 'frequencyTraceable' in time_properties_data.keys():
+        ctrl.ptp4l_frequency_traceable = time_properties_data['frequencyTraceable']
 
     parent_data_set = query_pmc(
         instance, 'PARENT_DATA_SET', query_action='GET')
@@ -1926,25 +1947,97 @@ def handle_ptp4l_g8275_fields(instance):
         ctrl.ptp4l_announce_settings['timeSource'] = \
             G8275_PRC_FREERUN[ctrl.ptp4l_prtc_type]['timeSource']
 
-    new_clock_class = previous_clock_class
-    if previous_grandmaster_identity != ctrl.ptp4l_grandmaster_identity \
-            and ctrl.prtc_present is False:
+    if previous_grandmaster_identity != ctrl.ptp4l_grandmaster_identity:
         # GM for this node just changed
         if ctrl.ptp4l_grandmaster_identity == ctrl.ptp4l_clock_identity:
             # We became a GM
-            if int(number_ports) > 1:
-                new_clock_class = '165'
-            else:
-                new_clock_class = '248'
-            ctrl.ptp4l_announce_settings['timeTraceable'] = '0'
-            ctrl.ptp4l_clock_class = new_clock_class
-            ctrl.ptp4l_announce_settings['clockClass'] = new_clock_class
             collectd.info("%s Local clock is GM for instance %s: %s"
                           % (PLUGIN, instance, ctrl.ptp4l_grandmaster_identity))
         else:
             # Fields will be set according to new GM announcements
             collectd.info("%s New GM selected for instance %s: %s"
                           % (PLUGIN, instance, ctrl.ptp4l_grandmaster_identity))
+
+    # Do following clock-class overwrite (with holdover logic) when the PTP port is not
+    # disciplined by ts2phc (neither nmea nor generic), and disciplined by ptp-source
+    # (consider all portState could be master sometimes).
+    # This follows T-BC or T-TSC clockclass rules on failed scenarios.
+    # Not Done: T-TSC (slave-only/slave ports without any master ports).
+    new_clock_class = None
+    new_time_traceable = None
+    new_freq_traceable = None
+    if ctrl.disciplined_by_ts2phc is False:
+        # port_locked: slave port exists, or rely on gm identity vs clock identity
+        port_locked = ctrl.ptp4l_grandmaster_identity != ctrl.ptp4l_clock_identity
+        previous_ptp4l_ptp_source_state = ctrl.ptp4l_ptp_source_state
+        # Never port locked earlier (from startup), state stays unlocked
+        state = CLOCK_STATE_UNLOCKED
+        if port_locked:
+            state = CLOCK_STATE_LOCKED
+        elif (previous_ptp4l_ptp_source_state in [
+            CLOCK_STATE_LOCKED,
+            CLOCK_STATE_HOLDOVER,
+            CLOCK_STATE_HOLDOVER_EXPIRED]
+        ):
+            state = CLOCK_STATE_HOLDOVER
+
+        if state == CLOCK_STATE_LOCKED:
+            # When PTP4l is no longer slave, local GM (GRANDMASTER_SETTINGS_NP)
+            # reflected on PARENT_DATA_SET and TIME_PROPERTIES_DATA_SET.
+            #
+            # When PTP4l becomes slave (port-locked), upstream GM settings
+            # reflected on PARENT_DATA_SET and TIME_PROPERTIES_DATA_SET.
+            # Manually need to set to GRANDMASTER_SETTINGS_NP.
+            new_clock_class = ctrl.ptp4l_clock_class
+            new_time_traceable = ctrl.ptp4l_time_traceable
+            new_freq_traceable = ctrl.ptp4l_frequency_traceable
+
+            # reset holdover_timestamp
+            ctrl.holdover_timestamp[ctrl.interface] = None
+        elif state == CLOCK_STATE_UNLOCKED:
+            new_clock_class = CLOCK_CLASS_248
+            new_time_traceable = '0'
+            new_freq_traceable = '0'
+        elif state == CLOCK_STATE_HOLDOVER:
+            # PTP4l port not locked to remote GM, and transitioned from locked/holdover to
+            # holdover
+            # Check local holdover state - T-BC maintains its own holdover timer
+            #
+            # If there is no entry for the current interface,
+            # create it and initialize
+            if (
+                ctrl.interface not in ctrl.holdover_timestamp or
+                not ctrl.holdover_timestamp[ctrl.interface]
+            ):
+                ctrl.holdover_timestamp[ctrl.interface] = timeutils.utcnow()
+                collectd.info(f"{PLUGIN} Holdover timestamp for {instance} PHC {ctrl.interface}: "
+                              f"{ctrl.holdover_timestamp[ctrl.interface]}")
+
+            # Check if this T-BC is within or out of holdover spec
+            delta = timeutils.delta_seconds(
+                ctrl.holdover_timestamp[ctrl.interface],
+                timeutils.utcnow(),
+            )
+            if delta <= ctrl.monitoring_parameters['holdover_seconds']:
+                # T-BC in holdover, within holdover specification per G.8275.1/2
+                new_clock_class = CLOCK_CLASS_135
+                new_time_traceable = '1'
+            else:
+                state = CLOCK_STATE_HOLDOVER_EXPIRED
+                # T-BC in holdover, out of holdover specification per G.8275.1/2
+                new_clock_class = CLOCK_CLASS_165
+                new_time_traceable = '0'
+
+        ctrl.ptp4l_ptp_source_state = state
+        if new_clock_class is not None:
+            ctrl.ptp4l_announce_settings['clockClass'] = new_clock_class
+            ctrl.ptp4l_clock_class = new_clock_class
+        if new_time_traceable is not None:
+            ctrl.ptp4l_announce_settings['timeTraceable'] = new_time_traceable
+            ctrl.ptp4l_time_traceable = new_time_traceable
+        if new_freq_traceable is not None:
+            ctrl.ptp4l_announce_settings['frequencyTraceable'] = new_freq_traceable
+            ctrl.ptp4l_frequency_traceable = new_freq_traceable
 
     gm_settings_to_write = OrderedDict(data_grandmaster_settings)
     gm_settings_to_write.update(ctrl.ptp4l_announce_settings)
@@ -2472,8 +2565,6 @@ def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
     data = {}
-    conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
-                 '-' + instance + '.conf')
 
     data = query_pmc(instance, 'GRANDMASTER_SETTINGS_NP', query_action='GET')
     current_clock_class = data.get('clockClass', CLOCK_CLASS_248)
@@ -2607,19 +2698,7 @@ def check_clock_class(instance):
         data['clockClass'] = new_clock_class
         data['timeTraceable'] = int(time_traceable)
         data['frequencyTraceable'] = int(frequency_traceable)
-        parameters = ' '.join("{} {}".format(*i) for i in data.items())
-        cmd = 'SET GRANDMASTER_SETTINGS_NP ' + parameters
-        collectd.debug("%s cmd=%s" % (PLUGIN, cmd))
-        try:
-            data = subprocess.check_output(
-                [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0', cmd]).decode()
-        except subprocess.CalledProcessError as exc:
-            collectd.error(
-                "%s Failed to set clockClass for instance %s" % (PLUGIN, instance))
-        collectd.info("%s instance:%s Updated clockClass from %s to %s timeTraceable=%s,"
-                      "frequencyTraceable=%s"
-                      % (PLUGIN, instance, current_clock_class, new_clock_class, time_traceable,
-                         frequency_traceable))
+        write_ptp4l_gm_fields(instance, data)
 
 
 def process_ptp_bc(instance):
@@ -2726,28 +2805,77 @@ def process_ptp_bc(instance):
     if 'timeSource' in upstream_time_properties_data.keys():
         new_data['timeSource'] = upstream_time_properties_data['timeSource']
 
-    if not port_locked:
-        # Upstream ptp4l not connected to remote T-GM.
+    # This clockclass overwrite follows T-BC rules, as this ptp-instance PHC,
+    # - disciplined by generic source of ts2phc instance
+    # - accompanied by upstream ptp instance with ptp source
+    # - not supposed to be end of timing chain (not T-TSC)
+    new_clock_class = None
+    new_time_traceable = None
+    new_freq_traceable = None
+    previous_ptp4l_ptp_source_state = ctrl.ptp4l_ptp_source_state
+    # Never port locked earlier (from startup), state stays unlocked
+    state = CLOCK_STATE_UNLOCKED
+    if port_locked:
+        state = CLOCK_STATE_LOCKED
+    elif (previous_ptp4l_ptp_source_state in [
+        CLOCK_STATE_LOCKED,
+        CLOCK_STATE_HOLDOVER,
+        CLOCK_STATE_HOLDOVER_EXPIRED]
+    ):
+        state = CLOCK_STATE_HOLDOVER
+
+    if state == CLOCK_STATE_LOCKED:
+        # reset holdover_timestamp
+        ctrl.holdover_timestamp[ctrl.interface] = None
+    elif state == CLOCK_STATE_UNLOCKED:
+        new_clock_class = CLOCK_CLASS_248
+        new_time_traceable = '0'
+        new_freq_traceable = '0'
+    elif state == CLOCK_STATE_HOLDOVER:
+        # Upstream PTP4l port not locked to remote GM, and transitioned from locked/holdover to
+        # holdover
+        # Check local holdover state - T-BC maintains its own holdover timer
         #
-        # Overwrite clock class with 165, T-BC in holdover,
-        # out of holdover specification.
-        #
-        # The other parameters were correct on upstream
-        # data sets.
-        #
-        # GRANDMASTER_SETTINGS_NP
-        #     clockClass              165
-        #     clockAccuracy           0xfe
-        #     offsetScaledLogVariance 0xffff
-        #     currentUtcOffset        37
-        #     leap61                  0
-        #     leap59                  0
-        #     currentUtcOffsetValid   0
-        #     ptpTimescale            1
-        #     timeTraceable           0
-        #     frequencyTraceable      0
-        #     timeSource              0xa0
-        new_data['clockClass'] = '165'
+        # If there is no entry for the current interface,
+        # create it and initialize
+        if (
+            ctrl.interface not in ctrl.holdover_timestamp or
+            not ctrl.holdover_timestamp[ctrl.interface]
+        ):
+            upstream_ctrl = ptpinstances[upstream_instance]
+            upstream_holdover_timestamp = upstream_ctrl.holdover_timestamp.get(
+                upstream_ctrl.interface, None
+            )
+            if upstream_holdover_timestamp:
+                # copy upstream ptp4l holdover timestamp in case of presence
+                ctrl.holdover_timestamp[ctrl.interface] = upstream_holdover_timestamp
+            else:
+                ctrl.holdover_timestamp[ctrl.interface] = timeutils.utcnow()
+            collectd.info(f"{PLUGIN} Holdover timestamp for {instance} PHC {ctrl.interface}: "
+                          f"{ctrl.holdover_timestamp[ctrl.interface]}")
+
+        # Check if this T-BC is within or out of holdover spec
+        delta = timeutils.delta_seconds(
+            ctrl.holdover_timestamp[ctrl.interface],
+            timeutils.utcnow(),
+        )
+        if delta <= ctrl.monitoring_parameters['holdover_seconds']:
+            # T-BC in holdover, within holdover specification per G.8275.1/2
+            new_clock_class = CLOCK_CLASS_135
+            new_time_traceable = '1'
+        else:
+            state = CLOCK_STATE_HOLDOVER_EXPIRED
+            # T-BC in holdover, out of holdover specification per G.8275.1/2
+            new_clock_class = CLOCK_CLASS_165
+            new_time_traceable = '0'
+
+    ctrl.ptp4l_ptp_source_state = state
+    if new_clock_class is not None:
+        new_data['clockClass'] = new_clock_class
+    if new_time_traceable is not None:
+        new_data['timeTraceable'] = new_time_traceable
+    if new_freq_traceable is not None:
+        new_data['frequencyTraceable'] = new_freq_traceable
 
     # use pmc to write ptp fields into this instance
     fields = ['clockClass',
@@ -3050,14 +3178,17 @@ def read_func():
             # Removed redundant call to check_time_drift()
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
-            if ctrl.interface and \
-               get_base_port(ctrl.interface) in ts2phc_source_interfaces.keys():
+            if ctrl.disciplined_by_ts2phc:
                 if obj.capabilities['ts2phc_source'] == 'nmea':
                     check_clock_class(instance)
                 elif obj.capabilities['ts2phc_source'] == 'generic':
                     process_ptp_bc(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            # PTP instance PHC, if not disciplined_by_ts2phc, i.e. disciplined
+            # by PTP source, we further overwrites clockclass here. e.g.
+            # upstream ptp-instance (when ts2phc_source = generic),
+            # individual ptp-instance (when ts2phc_source = None or nmea)
             handle_ptp4l_g8275_fields(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
