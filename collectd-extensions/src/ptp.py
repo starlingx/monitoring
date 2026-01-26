@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2025 Wind River Systems, Inc.
+# Copyright (c) 2019-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -665,6 +665,39 @@ def read_instance_monitoring_config():
                 )
 
 
+class ConfigDict:
+    """ConfigParser-like object for ptp4l configuration with duplicate key support."""
+
+    def __init__(self, data):
+        if not isinstance(data, dict):
+            raise TypeError("ConfigDict requires a dictionary")
+        self._data = data
+
+    def sections(self):
+        return list(self._data.keys())
+
+    def has_section(self, section):
+        if not isinstance(section, str):
+            raise TypeError("Section name must be a string")
+        return section in self._data
+
+    def __getitem__(self, section):
+        if not isinstance(section, str):
+            raise TypeError("Section name must be a string")
+        if section not in self._data:
+            raise KeyError(f"Section '{section}' not found")
+        return self._data[section]
+
+    def get_unicast_master_tables(self):
+        """Return all unicast_master_table sections indexed by table_id"""
+        tables = {}
+        for section_name, section_data in self._data.items():
+            if section_name.startswith('unicast_master_table_'):
+                table_id = section_data.get('table_id', '0')
+                tables[table_id] = section_data
+        return tables
+
+
 class TimingInstance:
     """The purpose of TimingInstance is to track the config and state data of a ptp instance.
 
@@ -817,22 +850,55 @@ class TimingInstance:
         return config
 
     def parse_ptp4l_config(self):
-        # Not currently used
+        # Parse ptp4l configuration file with support for duplicate options and multiple sections
         # https://docs.python.org/3/library/configparser.html
         # You can access the parameters like so:
         # config['global']['parameter_name']
         # or
-        # config['ens0f0']['parameter_name']"""
-        config = configparser.ConfigParser(delimiters=' ')
-        config.read(self.config_file_path)
-        for item in config.sections():
+        # config['ens0f0']['parameter_name']
+        # For duplicate options, values are returned as lists
+        # For multiple unicast_master_table sections, they are indexed by table_id
+        # Refer to test_ptp_config_parser.py for usage examples
+        config_dict = {}
+        current_section = None
+        unicast_table_count = 0
+
+        with open(self.config_file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+
+                if line.startswith('[') and line.endswith(']'):
+                    section_name = line[1:-1]
+                    if section_name == 'unicast_master_table':
+                        # Handle multiple unicast_master_table sections
+                        current_section = f'unicast_master_table_{unicast_table_count}'
+                        unicast_table_count += 1
+                    else:
+                        current_section = section_name
+                    config_dict[current_section] = {}
+                elif current_section and ' ' in line:
+                    parts = line.split(' ', 1)
+                    if len(parts) == 2:
+                        key, value = parts
+                        if key in config_dict[current_section]:
+                            # Convert to list for multiple values
+                            if not isinstance(config_dict[current_section][key], list):
+                                config_dict[current_section][key] = [config_dict[current_section][key]]
+                            config_dict[current_section][key].append(value)
+                        else:
+                            config_dict[current_section][key] = value
+
+        for item in config_dict.keys():
             # unicast_master_table and global are special sections in
-            # ptp4l configs, and aren't interfaces. They are only used
-            # by ptp4l, and can be ignored by collectd.
-            ignore_list = ['global', 'unicast_master_table']
-            if item not in ignore_list:
+            # ptp4l configs, and aren't interfaces.
+            ignore_list = ['global']
+            ignore_prefixes = ['unicast_master_table']
+            if item not in ignore_list and not any(item.startswith(prefix) for prefix in ignore_prefixes):
                 self.interfaces.add(item)
-        return config
+
+        return ConfigDict(config_dict)
 
     def parse_phc2sys_config(self):
         config = configparser.ConfigParser(delimiters=' ')
@@ -1571,10 +1637,14 @@ def initialize_ptp4l_state_fields(instance):
         ctrl.ptp4l_current_utc_offset = ctrl.timing_instance.config['global']['utc_offset']
         collectd.info("%s Instance %s currentUtcOffset is initialized to %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
-    else:
-        # currentUtcOffset is not configured, use existing default
+    elif 'currentUtcOffset' in data.keys():
+        # currentUtcOffset is not configured, use value from query if available
         ctrl.ptp4l_current_utc_offset = data['currentUtcOffset']
         collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
+                      % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
+    else:
+        # currentUtcOffset not in config or query response, keep default value (37)
+        collectd.info("%s Instance %s currentUtcOffset not available, using default %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
 
 
