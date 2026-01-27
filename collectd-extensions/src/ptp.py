@@ -2057,10 +2057,8 @@ def handle_ptp4l_g8275_fields(instance):
             #
             # When PTP4l becomes slave (port-locked), upstream GM settings
             # reflected on PARENT_DATA_SET and TIME_PROPERTIES_DATA_SET.
-            # Manually need to set to GRANDMASTER_SETTINGS_NP.
-            new_clock_class = ctrl.ptp4l_clock_class
-            new_time_traceable = ctrl.ptp4l_time_traceable
-            new_freq_traceable = ctrl.ptp4l_frequency_traceable
+            # Do NOT overwrite GRANDMASTER_SETTINGS_NP when locked to upstream GM
+            # The upstream GM's announce messages will set the correct values
 
             # reset holdover_timestamp
             ctrl.holdover_timestamp[ctrl.interface] = None
@@ -3608,7 +3606,7 @@ def check_ptp_regular(instance, ctrl, conf_file):
         )
 
         collectd.info(f"{PLUGIN} {obj.hostname} {instance} base port {base_port} "
-                      f"eec {eec_status.value} pps {pps_status.value}")
+                      f"eec {eec_status.value} pps {pps_status.value} clock_locked={clock_locked}")
     elif obj.capabilities['ts2phc_source'] == 'generic':
         # Let's read the upstream PTP clock state
         #
