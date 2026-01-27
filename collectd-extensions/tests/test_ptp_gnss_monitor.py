@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025 Wind River Systems, Inc.
+# Copyright (c) 2025-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -15,6 +15,9 @@ from src import ptp_gnss_monitor as ptp_monitoring
 
 
 class TestPtpMonitoring(unittest.TestCase):
+    def setUp(self):
+        mock_collectd.reset_mock()
+
     def test_parse_monitoring_config(self):
         config_file_path = (
             "./tests/test_input_files/gnss-monitor-ptp.conf"
@@ -595,11 +598,11 @@ class TestPtpMonitoring(unittest.TestCase):
             msg=f"actual {data} not equal to expected {expected_data} ",
         )
 
-    def test_get_gps_data_by_session_with_garbase_data(self):
+    def test_get_gps_data_by_session_with_garbage_data(self):
         device_path = "/dev/gnss0"
         session = [
             {
-                "GARBASE-class": "VERSION",
+                "GARBAGE-class": "VERSION",
                 "release": "3.22",
                 "rev": "3.22",
                 "proto_major": 3,
