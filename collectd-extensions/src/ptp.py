@@ -398,7 +398,7 @@ class PTP_ctrl_object:
         self.ptp4l_prc_state = None
         self.ptp4l_ptp_source_state = None
         self.ptp4l_time_source = None
-        self.ptp4l_utc_offset_nanoseconds = None
+        self.ptp4l_utc_offset_nanoseconds = 37 * 1000000000
         self.ptp4l_announce_settings = {}
 
         # Alarm objects
@@ -567,6 +567,7 @@ def read_files_for_timing_instances():
                        (PLUGIN, "phc2sys"))
     else:
         for filename in filenames:
+            instance_phc2sys_source = None
             instance = TimingInstance(filename)
             collectd.info("ptpinstances = %s" % ptpinstances)
 
@@ -578,7 +579,7 @@ def read_files_for_timing_instances():
 
                 matches = re.search('-s ([^\'" \t]+)', service_options)
                 if matches:
-                    phc2sys_source = matches.group(1)
+                    phc2sys_source = instance_phc2sys_source = matches.group(1)
                 if phc2sys_source:
                     collectd.info(f"{PLUGIN} phc2sys {instance.instance_name} "
                                   f"source is {phc2sys_source}")
@@ -605,7 +606,11 @@ def read_files_for_timing_instances():
                 collectd.info("%s HA not enabled for instance %s, "
                               "using default monitoring"
                               % (PLUGIN, instance.instance_name))
-                create_interface_alarm_objects('dummy', instance.instance_name)
+                # Use instance_phc2sys_source from service options if available,
+                # otherwise use first interface
+                interface_to_use = instance_phc2sys_source if instance_phc2sys_source else (
+                    list(instance.interfaces)[0] if instance.interfaces else 'dummy')
+                create_interface_alarm_objects(interface_to_use, instance.instance_name)
                 ptpinstances[instance.instance_name].instance_type = \
                     PTP_INSTANCE_TYPE_PHC2SYS
                 ptpinstances[instance.instance_name].phc2sys_ha_enabled = False
@@ -2268,15 +2273,36 @@ def set_utc_offset(instance):
 
     utc_offset = ctrl.ptp4l_current_utc_offset
     utc_offset_valid = False
-    if ctrl.timing_instance.config.has_section('global') \
-            and 'domainNumber' in ctrl.timing_instance.config['global'].keys() \
-            and 'uds_address' in ctrl.timing_instance.config['global'].keys():
-        #
-        # sudo /usr/sbin/pmc -u -b 0 'GET TIME_PROPERTIES_DATA_SET'
-        #
-        data = subprocess.check_output(
-            [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
-                'GET TIME_PROPERTIES_DATA_SET']).decode()
+
+    cmd = None
+    #
+    # sudo /usr/sbin/pmc -u -b 0 'GET TIME_PROPERTIES_DATA_SET'
+    #
+
+    # If HA is enabled, use the uds_address of the active source
+    ha_enabled = "0"
+    if ctrl.timing_instance.config.has_section('global'):
+        ha_enabled = ctrl.timing_instance.config["global"].get("ha_enabled", "0")
+    if ha_enabled == "1":
+        # uds_address of active source, already set to ctrl.interface
+        uds_address = ctrl.timing_instance.config[ctrl.interface].get("ha_uds_address", None)
+        if not uds_address:
+            collectd.error("%s %s: ha_uds_address not found in config" %
+                           (PLUGIN, instance))
+            return
+        domain_number = ctrl.timing_instance.config["global"].get("domainNumber", "0")
+        cmd = [PLUGIN_STATUS_QUERY_EXEC, '-s', uds_address, '-d', domain_number, '-u', '-b', '0',
+               'GET TIME_PROPERTIES_DATA_SET']
+    else:
+        if ctrl.timing_instance.config.has_section('global') \
+                and 'domainNumber' in ctrl.timing_instance.config['global'].keys() \
+                and 'uds_address' in ctrl.timing_instance.config['global'].keys():
+
+            cmd = [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+                   'GET TIME_PROPERTIES_DATA_SET']
+
+    if cmd:
+        data = subprocess.check_output(cmd).decode()
         for line in data.split('\n'):
             if 'currentUtcOffset ' in line:
                 utc_offset = line.split()[1]
@@ -2562,6 +2588,30 @@ def check_time_drift(instance, gm_identity=None, master_offset=0):
                                  fault_offset,
                                  ctrl.monitoring_parameters["offset_threshold_minor_nsec"],
                                  ctrl.monitoring_parameters["offset_threshold_major_nsec"]))
+
+
+def check_phc2sys_time_drift(instance, ctrl, conf_file):
+    collectd.debug(f"{PLUGIN} check_phc2sys_time_drift {instance}")
+    # in case of HA, overwrite conf_file with socket_file of active source
+    socket = False
+    domain_number = ctrl.timing_instance.config["global"].get("domainNumber", "0")
+    ha_enabled = ctrl.timing_instance.config["global"].get("ha_enabled", "0")
+    if ha_enabled == "1":
+        # uds_address of active source
+        conf_file = ctrl.timing_instance.config[ctrl.interface].get("ha_uds_address", None)
+        if not conf_file:
+            collectd.error("%s %s: ha_uds_address not found in config" %
+                           (PLUGIN, instance))
+            return
+        socket = True
+
+    my_identity, gm_present, gm_identity, got_master_offset, master_offset = (
+        read_time_status_np(conf_file, is_socket=socket, domain_number=domain_number)
+    )
+    if got_master_offset:
+        check_time_drift(instance, gm_identity, master_offset)
+    else:
+        check_time_drift(instance, gm_identity)
 
 
 def is_service_running(ptp_service):
@@ -3262,6 +3312,9 @@ def read_func():
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
             process_phc2sys_ha(ctrl)
 
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS:
+            check_phc2sys_time_drift(instance, ctrl, conf_file)
+
         if ctrl.instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR:
             process_gnss_monitor(ctrl)
 
@@ -3387,6 +3440,8 @@ def process_phc2sys_ha(ctrl):
     if phc2sys_source_interface is not None:
         active_source_priority = ctrl.timing_instance.config[phc2sys_source_interface][
             'ha_priority']
+        # Update ctrl.interface with active clock source interface, to compute time drift later
+        ctrl.interface = phc2sys_source_interface
 
     collectd.info("%s phc2sys source clock is %s for instance %s" % (
         PLUGIN, phc2sys_source_interface, ctrl.timing_instance.instance_name))
@@ -3541,33 +3596,19 @@ def process_phc2sys_ha(ctrl):
                              phc2sys_source_interface))
 
 
-def check_ptp_regular(instance, ctrl, conf_file):
-    collectd.debug(f"{PLUGIN} check_ptp_regular {instance}")
-
-    # Let's read the port status information
-    #
-    # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
-    #
-    data = subprocess.check_output(
-        [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
-         'GET PORT_DATA_SET']).decode()
-
-    port_locked = False
-    obj.resp = data.split('\n')
-    for line in obj.resp:
-        if 'portState' in line:
-            collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
-            port_state = line.split()[1]
-            if port_state == 'SLAVE':
-                port_locked = True
-
+def read_time_status_np(conf_file, is_socket=False, domain_number="0"):
     # Let's read the clock info, Grand Master sig and skew
     #
     # sudo /usr/sbin/pmc -u -b 0 'GET TIME_STATUS_NP'
     #
-    data = subprocess.check_output(
-        [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
-         'GET TIME_STATUS_NP']).decode()
+    if is_socket:
+        cmd = [PLUGIN_STATUS_QUERY_EXEC, '-s', conf_file, '-d', domain_number, '-u', '-b', '0',
+               'GET TIME_STATUS_NP']
+    else:
+        cmd = [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+               'GET TIME_STATUS_NP']
+
+    data = subprocess.check_output(cmd).decode()
 
     got_master_offset = False
     master_offset = 0
@@ -3590,6 +3631,33 @@ def check_ptp_regular(instance, ctrl, conf_file):
         if 'gmIdentity' in line:
             collectd.debug("%s gmIdentity: %s" % (PLUGIN, line.split()[1]))
             gm_identity = line.split()[1]
+
+    return my_identity, gm_present, gm_identity, got_master_offset, master_offset
+
+
+def check_ptp_regular(instance, ctrl, conf_file):
+    collectd.debug(f"{PLUGIN} check_ptp_regular {instance}")
+
+    # Let's read the port status information
+    #
+    # sudo /usr/sbin/pmc -u -b 0 'GET PORT_DATA_SET'
+    #
+    data = subprocess.check_output(
+        [PLUGIN_STATUS_QUERY_EXEC, '-f', conf_file, '-u', '-b', '0',
+         'GET PORT_DATA_SET']).decode()
+
+    port_locked = False
+    obj.resp = data.split('\n')
+    for line in obj.resp:
+        if 'portState' in line:
+            collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
+            port_state = line.split()[1]
+            if port_state == 'SLAVE':
+                port_locked = True
+
+    my_identity, gm_present, gm_identity, got_master_offset, master_offset = (
+        read_time_status_np(conf_file)
+    )
 
     clock_locked = False
     if obj.capabilities['ts2phc_source'] == 'nmea':
