@@ -1532,7 +1532,7 @@ def query_pmc_indexed(instance, query_string, uds_address=None, query_action='GE
     for line in obj.resp:
         if 'sending' not in line:
             if query_string in line:
-                index = line.split(' ')[0]
+                index = line.lstrip().split(' ')[0]
                 query_results_dict[index] = {}
             else:
                 # match key value array pairs
@@ -3697,12 +3697,16 @@ def check_ptp_regular(instance, ctrl, conf_file):
             upstream_time_status = query_pmc_indexed(
                 upstream_instance, 'TIME_STATUS_NP'
             )
-            upstream_identity = next(iter(upstream_time_status))
-            upstream_gm_identity = upstream_time_status[upstream_identity].get(
-                'gmIdentity', None
-            )
+            # handles empty dictionaries gracefully without raising exceptions.
+            upstream_identity = next(iter(upstream_time_status), None)
+            upstream_gm_identity = None
+            if upstream_identity:
+                upstream_gm_identity = upstream_time_status[upstream_identity].get(
+                    'gmIdentity', None
+                )
 
-            clock_locked = (upstream_identity != upstream_gm_identity and
+            clock_locked = (upstream_identity and
+                            upstream_identity != upstream_gm_identity and
                             upstream_port_locked)
 
     # Handle case where this host is the Grand Master
