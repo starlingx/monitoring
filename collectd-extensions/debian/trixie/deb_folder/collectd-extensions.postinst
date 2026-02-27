@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+# Automatically added by dh_installtmpfiles/13.24.2
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	if [ -x "$(command -v systemd-tmpfiles)" ] && [ ! -f /.dockerenv ] && [ -d /run/systemd/system ]; then
+		systemd-tmpfiles ${DPKG_ROOT:+--root="$DPKG_ROOT"} --create collectd-extensions-tmpfiles.conf || true
+	fi
+fi
+# End automatically added section
