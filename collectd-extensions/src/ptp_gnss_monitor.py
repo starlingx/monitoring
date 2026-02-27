@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025 Wind River Systems, Inc.
+# Copyright (c) 2025-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -12,6 +12,7 @@
 import collectd
 import configparser
 from dataclasses import dataclass
+from dataclasses import field
 import gps
 import traceback
 
@@ -33,7 +34,7 @@ class GpsData:
     gpsd_running: int = 0
     lock_state: int = 0
     satellite_count: int = 0
-    signal_quality_db: SignalQualityDb = SignalQualityDb()
+    signal_quality_db: SignalQualityDb = field(default_factory=SignalQualityDb)
 
 
 def parse_gnss_monitor_config(config_file_path):

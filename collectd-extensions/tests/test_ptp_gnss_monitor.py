@@ -631,3 +631,45 @@ class TestPtpMonitoring(unittest.TestCase):
             expected_data,
             msg=f"actual {data} not equal to expected {expected_data} ",
         )
+
+    def test_gps_data_instance_isolation(self):
+        """Test that multiple GpsData instances are independent"""
+        # Create first instance
+        data1 = ptp_monitoring.GpsData(
+            gpsd_running=1,
+            lock_state=1,
+            satellite_count=5,
+            signal_quality_db=ptp_monitoring.SignalQualityDb(min=40.0, max=50.0, avg=45.0),
+        )
+
+        # Create second instance
+        data2 = ptp_monitoring.GpsData(
+            gpsd_running=1,
+            lock_state=0,
+            satellite_count=3,
+            signal_quality_db=ptp_monitoring.SignalQualityDb(min=30.0, max=40.0, avg=35.0),
+        )
+
+        # Verify initial values
+        self.assertEqual(data1.satellite_count, 5)
+        self.assertEqual(data2.satellite_count, 3)
+        self.assertEqual(data1.signal_quality_db.avg, 45.0)
+        self.assertEqual(data2.signal_quality_db.avg, 35.0)
+
+        # Modify first instance
+        data1.satellite_count = 10
+        data1.signal_quality_db.avg = 55.0
+
+        # Verify second instance is unaffected
+        self.assertEqual(
+            data2.satellite_count, 3,
+            "data2.satellite_count should remain unchanged"
+        )
+        self.assertEqual(
+            data2.signal_quality_db.avg, 35.0,
+            "data2.signal_quality_db.avg should remain unchanged"
+        )
+
+        # Verify first instance was modified
+        self.assertEqual(data1.satellite_count, 10)
+        self.assertEqual(data1.signal_quality_db.avg, 55.0)
