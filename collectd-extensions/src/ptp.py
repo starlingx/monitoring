@@ -3558,6 +3558,18 @@ def process_phc2sys_ha(ctrl):
             if clear_alarm(ctrl.phc2sys_clock_source_low_priority.eid) is True:
                 ctrl.phc2sys_clock_source_low_priority.raised = False
 
+    # Deferring to check the following alarms to the next cicle,
+    # because there is no selected source.
+    #
+    # Alarms:
+    #    * forced source selected
+    #    * phc2sys instance operating with lower priority source
+    if phc2sys_source_interface is None or active_source_priority is None:
+        collectd.info(f"{PLUGIN} Deferring to check 'source forced selection' and "
+                      f"'Phc2sys instance operating with lower priority source'"
+                      f"alarms.")
+        return
+
     # Check if phc2sys is force locked to a specific interface
     if active_source_priority == "254" or phc2sys_lock_state_forced == 'True':
         # raise clock source forced alarm
