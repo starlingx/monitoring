@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2019-2025 Wind River Systems, Inc.
+# Copyright (c) 2019-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -959,7 +959,8 @@ def pods_monitoring(cg_pods, obj, PLUGIN_DEBUG):
                 namespace = i.metadata.namespace
                 platform_label = False
                 # Check if platform label is present in namespace label or pod label
-                if ((namespace_labels[namespace].get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM) or
+                if ((namespace_labels.get(namespace, {})
+                        .get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM) or
                         (i.metadata.labels and
                          (i.metadata.labels.get(PLATFORM_LABEL_KEY) == GROUP_PLATFORM))):
                     platform_label = True
