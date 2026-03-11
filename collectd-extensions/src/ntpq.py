@@ -1,5 +1,5 @@
 ############################################################################
-# Copyright (c) 2018-2023 Wind River Systems, Inc.
+# Copyright (c) 2018-2023, 2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -76,7 +76,7 @@ api = fm_api.FaultAPIsV2()
 
 PLUGIN = 'NTP query plugin'
 PLUGIN_INTERVAL = 300          # audit interval in secs
-PLUGIN_CONF = '/etc/ntp.conf'
+PLUGIN_CONF = '/etc/ntp.conf' if pc.get_debian_codename() == 'bullseye' else '/etc/ntpsec/ntp.conf'
 PLUGIN_EXEC = '/usr/sbin/ntpq'
 PLUGIN_EXEC_DEBIAN = '/usr/bin/ntpq'
 PLUGIN_EXEC_OPTIONS = '-pn'
@@ -91,7 +91,7 @@ class NtpqObject(pc.PluginObject):
 
     alarm_raised = False            # True when the major alarm is asserted
 
-    server_list_conf = []           # list of servers in the /etc/ntp.conf file
+    server_list_conf = []           # list of servers in the ntp.conf file
     server_list_ntpq = []           # list of servers in the ntpq -np output
     unreachable_servers = []        # list of unreachable servers
     reachable_servers = []          # list of reachable servers

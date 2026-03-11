@@ -1003,3 +1003,15 @@ def pods_monitoring(cg_pods, obj, PLUGIN_DEBUG):
             pass
 
     return obj
+
+
+def get_debian_codename():
+    """Returns the Debian codename, e.g., 'bullseye', 'trixie'."""
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("VERSION_CODENAME="):
+                    return line.strip().split("=")[1]
+    except FileNotFoundError:
+        return None
+    return None
