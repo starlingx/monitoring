@@ -419,6 +419,9 @@ class PTP_ctrl_object:
 ptpinstances = {}
 ordered_instances = OrderedDict()
 
+# Track ethtool flow-type rule IDs per interface for PTP traffic blocking workaround
+ethtool_rule_ids = {}
+
 # Mapping of ptp interfaces to instances
 ptpinterfaces = {}
 
@@ -2724,6 +2727,95 @@ def get_dpll_state(base_port):
     return state, pin
 
 
+def block_ptp_traffic(instance_name, iface):
+    """Block incoming PTP traffic on an interface using ethtool.
+
+    ethtool NIC filters operate at the physical interface level. If iface
+    is a virtual/VLAN interface, resolve its physical parent first.
+    """
+    phys_iface = resolve_parent_interface(iface) or iface
+    try:
+        output = subprocess.check_output(
+            [ETHTOOL, '-N', phys_iface, 'flow-type', 'ether',
+             'proto', '0x88f7', 'action', '-1']).decode()
+        match = re.search(r'Added rule with ID (\d+)', output)
+        if match:
+            ethtool_rule_ids[iface] = match.group(1)
+            collectd.info("%s instance %s Blocked PTP traffic on %s, rule ID %s"
+                          % (PLUGIN, instance_name, phys_iface, ethtool_rule_ids[iface]))
+    except subprocess.CalledProcessError as exc:
+        collectd.error("%s instance %s Failed to block PTP traffic on %s: %s"
+                       % (PLUGIN, instance_name, phys_iface, exc))
+
+
+def unblock_ptp_traffic(instance_name, iface):
+    """Remove a previously added PTP traffic block rule on an interface.
+
+    ethtool NIC filters operate at the physical interface level. If iface
+    is a virtual/VLAN interface, resolve its physical parent first.
+    """
+    phys_iface = resolve_parent_interface(iface) or iface
+    rule_id = ethtool_rule_ids.pop(iface, None)
+    if rule_id:
+        try:
+            subprocess.check_call(
+                [ETHTOOL, '-N', phys_iface, 'delete', rule_id])
+            collectd.info("%s instance %s Unblocked PTP traffic on %s, deleted rule ID %s"
+                          % (PLUGIN, instance_name, phys_iface, rule_id))
+        except subprocess.CalledProcessError as exc:
+            collectd.error("%s instance %s Failed to unblock PTP traffic on %s: %s"
+                           % (PLUGIN, instance_name, phys_iface, exc))
+
+
+def restart_ptp4l_service(instance_name):
+    """Restart the ptp4l service for the given instance."""
+    ptp4l_service = PTP_INSTANCE_TYPE_PTP4L + '@' + instance_name + '.service'
+    try:
+        subprocess.check_call([SYSTEMCTL, 'restart', ptp4l_service])
+        collectd.info("%s Restarted %s" % (PLUGIN, ptp4l_service))
+    except subprocess.CalledProcessError as exc:
+        collectd.error("%s Failed to restart %s: %s"
+                       % (PLUGIN, ptp4l_service, exc))
+
+
+def workaround_for_stale_parent_data_set(
+        instance_name,
+        previous_clock_class,
+        new_clock_class,
+):
+    # Workaround for buggy linuxptp ptp4l parent_data_set in T-GM
+    # T-GM (-s nmea) node's PTP4l instances -- when connected to
+    # T-BC node's PTP4l instances that has clockclass 135/165, stucks
+    # with 135/165 clockclass on parent_data_set when announce message
+    # receieved earlier than setting "SET GRANDMASTER_SETTINGS_NP
+    # ClockClass 6/7" happens, and it don't get re-synced.
+    # As side effect, connected T-BC receives same announcement of
+    # clockclass of 135/165, and the portstate always stuck as master.
+    #
+    # As workaround, when the GRANDMASTER_SETTINGS_NP transitions from
+    # 248 -> 6, we are checking PARENT_DATA_SET has stale 135/165 clockclass
+    # if so, we do block incoming ptp traffic (instead of restarting
+    # connected T-BC ptp4l service) and restart ptp4l service.
+    # Restarting service again triggers 248-> 6 transition here, and
+    # then we unblock incoming ptp traffic.
+    if (
+        previous_clock_class == CLOCK_CLASS_248
+        and new_clock_class == CLOCK_CLASS_6
+    ):
+        ctrl = ptpinstances[instance_name]
+        data = query_pmc(instance_name, 'PARENT_DATA_SET', query_action='GET')
+        parent_clock_class = data.get('gm.ClockClass', CLOCK_CLASS_248)
+        if parent_clock_class in (CLOCK_CLASS_135, CLOCK_CLASS_165):
+            for iface in ctrl.timing_instance.interfaces:
+                # block ingress ptp traffic
+                block_ptp_traffic(instance_name, iface)
+            restart_ptp4l_service(instance_name)
+        else:
+            # unblock ingress ptp traffic
+            for iface in ctrl.timing_instance.interfaces:
+                unblock_ptp_traffic(instance_name, iface)
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -2864,6 +2956,13 @@ def check_clock_class(instance):
         data['timeTraceable'] = int(time_traceable)
         data['frequencyTraceable'] = int(frequency_traceable)
         write_ptp4l_gm_fields(instance, data)
+
+    # Workaround for buggy linuxptp ptp4l parent_data_set in T-GM
+    workaround_for_stale_parent_data_set(
+        instance,
+        current_clock_class,
+        new_clock_class
+    )
 
 
 def process_ptp_bc(instance):

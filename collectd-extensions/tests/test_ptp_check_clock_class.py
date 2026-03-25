@@ -131,6 +131,7 @@ class TestCheckClockClassSecondaryNIC(unittest.TestCase):
              patch('ptp.get_dpll_state') as mock_dpll, \
              patch('ptp.get_base_port') as mock_port, \
              patch('ptp.query_pmc') as mock_pmc, \
+             patch('ptp.workaround_for_stale_parent_data_set') as mock_workaround, \
              patch('ptp.timeutils') as mock_time:
 
             self._setup_common_mocks(mock_pmc, mock_port, mock_service, mock_gm)
