@@ -44,6 +44,7 @@ from glob import glob
 from oslo_utils import timeutils
 from functools import lru_cache
 from ptp_interface import Interface
+from ptp_interface import resolve_parent_interface
 import ptp_gnss_monitor as pm
 from cgu_handler import CguHandler
 from pynetlink import DeviceType
@@ -499,6 +500,8 @@ def compute_base_port(interface_name):
         interface = interfaces[interface_name]
         pci_slot = interface.get_pci_slot()
         family = interface.get_family()
+        collectd.info("%s compute_base_port: %s pci_slot=%s family=%s"
+                      % (PLUGIN, interface_name, pci_slot, family))
         if family == 'Granite Rapid-D':
             for base_port_name in base_ports:
                 if base_port_name in interfaces.keys():
@@ -506,13 +509,51 @@ def compute_base_port(interface_name):
                     if base_port_obj.get_family() == 'Granite Rapid-D':
                         base_port = base_port_name
                         break
-        else:
+        elif pci_slot:
             for base_port_name in base_ports:
                 if base_port_name in interfaces.keys():
                     base_port_obj = interfaces[base_port_name]
                     if base_port_obj.get_pci_slot() == pci_slot[:-1] + '0':
                         base_port = base_port_name
                         break
+        else:
+            # Virtual/VLAN interfaces have no PCI device entry. Resolve via
+            # the physical parent using sysfs lower_* symlinks, then retry
+            # base port matching using the parent's PCI slot and family.
+            parent = resolve_parent_interface(interface_name)
+            if parent:
+                create_interface(parent)
+                parent_iface = interfaces.get(parent)
+                if parent_iface:
+                    pci_slot = parent_iface.get_pci_slot()
+                    family = parent_iface.get_family()
+                    collectd.info("%s compute_base_port: %s parent %s "
+                                  "pci_slot=%s family=%s"
+                                  % (PLUGIN, interface_name, parent,
+                                     pci_slot, family))
+                    if family == 'Granite Rapid-D':
+                        for base_port_name in base_ports:
+                            if base_port_name in interfaces.keys():
+                                base_port_obj = interfaces[base_port_name]
+                                if base_port_obj.get_family() == 'Granite Rapid-D':
+                                    base_port = base_port_name
+                                    break
+                    elif pci_slot:
+                        for base_port_name in base_ports:
+                            if base_port_name in interfaces.keys():
+                                base_port_obj = interfaces[base_port_name]
+                                if base_port_obj.get_pci_slot() == pci_slot[:-1] + '0':
+                                    base_port = base_port_name
+                                    break
+            if not base_port:
+                collectd.info("%s compute_base_port: %s has no PCI slot and "
+                              "no resolvable physical parent"
+                              % (PLUGIN, interface_name))
+    else:
+        collectd.info("%s compute_base_port: %s not in interfaces dict"
+                      % (PLUGIN, interface_name))
+    collectd.info("%s compute_base_port: %s -> base_port=%s"
+                  % (PLUGIN, interface_name, base_port))
     return base_port
 
 # ts2phc_source_interfaces dictionary
@@ -1567,8 +1608,9 @@ def read_ptp4l_config():
                     collectd.info(f"{PLUGIN} ptp4l {instance_name} "
                                   f"interface {interface}")
                     ptp4l_instance_map[interface] = instance_name
-                    ptp4l_instance_map[get_base_port(interface)] = \
-                        instance_name
+                    base_port = get_base_port(interface)
+                    if base_port:
+                        ptp4l_instance_map[base_port] = instance_name
 
             # timestamping mode
             if instance.config.has_section('global'):
@@ -1587,6 +1629,8 @@ def initialize_ptp4l_state_fields(instance):
 
     # Determine if there is a ts2phc instance disciplining this NIC
     base_port = get_base_port(ctrl.interface)
+    collectd.info("%s initialize_ptp4l_state %s ctrl.interface=%s base_port=%s"
+                  % (PLUGIN, instance, ctrl.interface, base_port))
 
     mapped_ts2phc_instance = ts2phc_instance_map.get(base_port, None)
     # "-s generic" ts2phc instance's port has mapping to None primary_interface,
@@ -1793,7 +1837,8 @@ def read_ts2phc_config():
                     create_interface(interface)
                     base_port = get_base_port(interface)
                     # if interface is different than primary's
-                    if base_port != primary_interface:
+                    if base_port is not None \
+                            and base_port != primary_interface:
                         # In case of "-s generic", primary_interface is None.
                         ts2phc_source_interfaces[base_port] = primary_interface
                         ts2phc_instance_map[base_port] = instance_name
@@ -2693,6 +2738,8 @@ def check_clock_class(instance):
         collectd.warning(f"{PLUGIN} {instance} Interface {ctrl.interface} not found")
         return
     base_port = get_base_port(ctrl.interface)
+    collectd.info("%s check_clock_class %s ctrl.interface=%s base_port=%s"
+                  % (PLUGIN, instance, ctrl.interface, base_port))
     # Integrated Granite Rapid-D and Connorsville (E830) NICs are directly
     # connected to an external DPLL, hence they are always primary.
     primary_nic = None
@@ -3017,6 +3064,8 @@ def check_gnss_signal(instance):
 
     ctrl = ptpinstances[instance]
     base_port = get_base_port(ctrl.interface)
+    collectd.info("%s check_gnss_signal %s ctrl.interface=%s base_port=%s"
+                  % (PLUGIN, instance, ctrl.interface, base_port))
     state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
     collectd.info(f"{PLUGIN} gnss-monitor instance: {instance} "
                   f"device {ctrl.interface} status {state.value} pin %s"
@@ -3678,6 +3727,8 @@ def check_ptp_regular(instance, ctrl, conf_file):
         # Determine the base port of the NIC from the interface, and
         # get state for primary or secondary NIC.
         base_port = get_base_port(ctrl.interface)
+        collectd.info("%s check_ptp4l nmea path %s ctrl.interface=%s base_port=%s"
+                      % (PLUGIN, instance, ctrl.interface, base_port))
         pps_status, _ = get_netlink_dpll_status(base_port, DeviceType.PPS)
         eec_status, _ = get_netlink_dpll_status(base_port, DeviceType.EEC)
         clock_locked = any(

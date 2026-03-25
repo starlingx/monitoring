@@ -113,6 +113,28 @@ def read_uevent(interface):
     return uevent
 
 
+def resolve_parent_interface(interface_name):
+    """Resolve the physical parent of a virtual/VLAN interface via sysfs lower_* links.
+
+    The kernel exposes /sys/class/net/<name>/lower_<parent> symlinks for any
+    interface that is stacked on top of another (VLANs, MACVLANs, bonds, etc.).
+    Reading the symlink name directly gives the parent interface name without
+    any index scanning.
+
+    Returns the parent interface name, or None if the interface is already
+    physical (no lower_* links present).
+    """
+    lower_links = glob('/sys/class/net/%s/lower_*' % interface_name)
+    if not lower_links:
+        return None
+    # Take the first lower link - for VLAN/MACVLAN there is exactly one parent.
+    # The parent name is the suffix after 'lower_'.
+    parent = os.path.basename(lower_links[0])[len('lower_'):]
+    collectd.info("%s resolve_parent_interface: %s -> %s"
+                  % (PLUGIN, interface_name, parent))
+    return parent
+
+
 class Interface:
 
     """Class that stores interface data for PTP plugin"""
