@@ -2891,16 +2891,19 @@ def check_clock_class(instance):
 
     time_traceable = False
     frequency_traceable = False
+    current_utc_offset_valid = False
     new_clock_class = current_clock_class
     ctrl.ptp4l_prc_state = state
     if (is_ts2phc_running and state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]):
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
         frequency_traceable = True
+        current_utc_offset_valid = True
     elif is_ts2phc_running and state == CLOCK_STATE_HOLDOVER:
         new_clock_class = CLOCK_CLASS_7
         time_traceable = True
         frequency_traceable = True
+        current_utc_offset_valid = True
         holdover_timestamp = None
         # Get the holdover timestamp of the clock/ts2phc instance
         for key, ctrl_obj in ptpinstances.items():
@@ -2933,6 +2936,7 @@ def check_clock_class(instance):
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
                 frequency_traceable = False
+                current_utc_offset_valid = False
         else:
             # holdover_timestamp None means, source is on derived holdover-unstable state,
             # this is treated as unlocked.
@@ -2944,6 +2948,7 @@ def check_clock_class(instance):
             new_clock_class = CLOCK_CLASS_248
             time_traceable = False
             frequency_traceable = False
+            current_utc_offset_valid = False
 
     else:
         new_clock_class = CLOCK_CLASS_248
@@ -2955,6 +2960,7 @@ def check_clock_class(instance):
         data['clockClass'] = new_clock_class
         data['timeTraceable'] = int(time_traceable)
         data['frequencyTraceable'] = int(frequency_traceable)
+        data['currentUtcOffsetValid'] = int(current_utc_offset_valid)
         write_ptp4l_gm_fields(instance, data)
 
     # Workaround for buggy linuxptp ptp4l parent_data_set in T-GM
