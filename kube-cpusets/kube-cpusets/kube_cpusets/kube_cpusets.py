@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2020 Wind River Systems, Inc.
+# Copyright (c) 2020-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -8,7 +8,7 @@
 This tool gathers cpuset usage information for all kubernetes containers
 that are running on the current host.
 
-With kubernetes CPUManager policy 'none', the k8s-infra cpuset is used for
+With kubernetes CPUManager policy 'none', the k8sinfra cpuset is used for
 all pods. For policy 'static', pods get an exclusive cpuset in the case of
 QoS Guaranteed or using isolcpus, otherwise pods inherit DefaultCPUSet.
 
@@ -109,12 +109,12 @@ def get_online_cpuset():
 
 
 def get_k8sinfra_cpuset():
-    """Get cgroup k8s-infra cpuset from sys fs cgroup.
+    """Get cgroup k8sinfra cpuset from sys fs cgroup.
 
-       Reads sys fs cgroup k8s-infra cpuset.cpus file containing comma
+       Reads sys fs cgroup k8sinfra cpuset.cpus file containing comma
        separated ranges and convert to an expanded set of integers.
     """
-    filename = '/sys/fs/cgroup/cpuset/k8s-infra/cpuset.cpus'
+    filename = '/sys/fs/cgroup/cpuset/k8sinfra/cpuset.cpus'
     cpuset = cpuset_from_cpulist_file(filename)
     return cpuset
 
@@ -312,7 +312,7 @@ def gather_info_and_display():
 
         # Determine cpuset group mapping
         if cpus is None:
-            group = 'k8s-infra'
+            group = 'k8sinfra'
         else:
             if cpuset.issubset(platform_cpuset):
                 group = 'platform'

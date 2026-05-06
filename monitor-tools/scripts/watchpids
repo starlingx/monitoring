@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 ########################################################################
 #
-# Copyright (c) 2015-2024 Wind River Systems, Inc.
+# Copyright (c) 2015-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -403,7 +403,7 @@ sub find_matching_cgroup_procs
 sub read_cgroup_procs
 {
   (local *::tids, local *::cgroup_procs_match) = @_;
-  
+
   my $tid = ();
 
   # reset scheduling hi-water-marks by writing '0' to each task
@@ -602,7 +602,7 @@ sub read_sched
     $stat_valid = 1;
     close($fh);
 
-    #cat /proc/1/task/1/cgroup 
+    #cat /proc/1/task/1/cgroup
     #12:cpu,cpuacct:/init.scope
     #11:pids:/init.scope
     #10:hugetlb:/
@@ -618,7 +618,7 @@ sub read_sched
     #0::/init.scope
 
     # Extract the pod id:
-    # /k8s-infra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
+    # /k8sinfra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
     # Extract *.service or *.scope name:
     # /system.slice/acpid.service
     # /system.slice/system-ceph.slice/ceph-mds.scope

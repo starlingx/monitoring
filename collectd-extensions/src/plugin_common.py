@@ -55,8 +55,8 @@ ONE_HUNDRED = 100
 
 # cgroup definitions
 CGROUP_ROOT = '/sys/fs/cgroup'
-K8S_ROOT = 'k8s-infra'
-K8S_ROOT_STX = 'k8s-infra-stx'
+K8S_ROOT = 'k8sinfra'
+K8S_ROOT_STX = 'k8sinfra_stx'
 KUBEPODS = 'kubepods'
 
 # High level grouping categories

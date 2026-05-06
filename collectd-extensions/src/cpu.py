@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2025 Wind River Systems, Inc.
+# Copyright (c) 2018-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -339,7 +339,7 @@ def get_cpuacct():
     cpuwait[pc.GROUP_OVERALL][pc.GROUP_OVERHEAD] = wait
 
     # Walk the first level cgroups and get cpuacct usage
-    # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
+    # (e.g., docker, k8sinfra, user.slice, system.slice, machine.slice)
     dir_list = next(os.walk(CPUACCT))[1]
     for name in dir_list:
         if any(name.endswith(x) for x in exclude_types):

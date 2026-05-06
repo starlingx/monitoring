@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018-2025 Wind River Systems, Inc.
+# Copyright (c) 2018-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -269,7 +269,7 @@ def get_platform_memory():
     memory[pc.GROUP_OVERALL][pc.GROUP_TOTAL] = m.get('rss_MiB', 0.0)
 
     # Walk the first level cgroups and get memory usage
-    # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
+    # (e.g., docker, k8sinfra, user.slice, system.slice, machine.slice)
     dir_list = next(os.walk(MEMCONT))[1]
     for name in dir_list:
         if any(name.endswith(x) for x in ['.mount', '.scope']):
@@ -554,7 +554,7 @@ def get_platform_memory_per_process():
                                   'name': str(name)}
 
     # Walk the first level cgroups and get the pids
-    # (e.g., docker, k8s-infra, user.slice, system.slice, machine.slice)
+    # (e.g., docker, k8sinfra, user.slice, system.slice, machine.slice)
     if os.path.exists(os.path.join(MEMCONT)):
         starting_dir = next(os.walk(MEMCONT))[1]
         for directory in starting_dir:

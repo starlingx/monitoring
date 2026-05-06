@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 ########################################################################
 #
-# Copyright (c) 2015-2025 Wind River Systems, Inc.
+# Copyright (c) 2015-2026 Wind River Systems, Inc.
 #
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -1173,7 +1173,7 @@ sub read_sched
     #0::/init.scope
 
     # Extract the pod id:
-    # /k8s-infra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
+    # /k8sinfra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
     # Extract *.service or *.scope name:
     # /system.slice/acpid.service
     # /system.slice/system-ceph.slice/ceph-mds.scope
