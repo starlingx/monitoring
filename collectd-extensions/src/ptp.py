@@ -379,6 +379,12 @@ class PTP_ctrl_object:
         self.prtc_present = False
         # disciplined by ts2phc either nmea or generic
         self.disciplined_by_ts2phc = False
+        # Derived ptp4l instance: shares base_port with a reference ptp4l
+        # instance (different domainNumber, same NIC/PHC). Clock quality
+        # is forwarded from reference. Locked on first slave port observation
+        # or ts2phc port ownership detection.
+        self.is_derived_instance = None  # None=undetermined, True/False=locked
+        self.reference_ptp4l_instance = None
         self.interface_list = []
         self.clock_ports = {}
         # placeholder for instance's monitoring section parameters
@@ -570,6 +576,9 @@ timing_instance_list = []
 
 # interface:ptp_instance_name map
 ptp4l_instance_map = {}
+
+# base_port to list of ptp4l instance names sharing that base_port
+base_port_to_ptp4l_instances = {}
 
 
 def read_gnss_monitor_ptp_config():
@@ -1613,7 +1622,16 @@ def read_ptp4l_config():
                     ptp4l_instance_map[interface] = instance_name
                     base_port = get_base_port(interface)
                     if base_port:
-                        ptp4l_instance_map[base_port] = instance_name
+                        # Only set base_port mapping if not already claimed
+                        # by another ptp4l instance on the same NIC.
+                        if base_port not in ptp4l_instance_map:
+                            ptp4l_instance_map[base_port] = instance_name
+                        # Track all ptp4l instances sharing same base_port
+                        if base_port not in base_port_to_ptp4l_instances:
+                            base_port_to_ptp4l_instances[base_port] = []
+                        if instance_name not in base_port_to_ptp4l_instances[base_port]:
+                            base_port_to_ptp4l_instances[base_port].append(
+                                instance_name)
 
             # timestamping mode
             if instance.config.has_section('global'):
@@ -1833,6 +1851,7 @@ def read_ts2phc_config():
                 # ALARM_CAUSE__PROCESS still need to be tracked for ts2phc service
                 create_interface_alarm_objects(
                     DUMMY_INTERFACE, instance_name, PTP_INSTANCE_TYPE_TS2PHC)
+                ptpinstances[instance_name].timing_instance = instance
 
             # secondary interfaces
             if instance.interfaces:
@@ -2971,6 +2990,256 @@ def check_clock_class(instance):
     )
 
 
+def _resolve_reference_derived_roles():
+    """Resolve reference/derived roles for all ptp4l instances sharing a base_port.
+
+    Called before the main processing loop each cycle. Once roles are locked
+    (permanent), reorders ordered_instances so derived instances follow their
+    reference, ensuring reference writes GM settings before derived reads them.
+    """
+    needs_reorder = False
+    for instance_name, ctrl in list(ordered_instances.items()):
+        if ctrl.instance_type != PTP_INSTANCE_TYPE_PTP4L:
+            continue
+        if ctrl.is_derived_instance is not None:
+            continue  # already locked
+        base_port = get_base_port(ctrl.interface)
+        if not base_port or len(base_port_to_ptp4l_instances.get(base_port, [])) < 2:
+            continue
+        if _try_lock_reference_derived(instance_name, ctrl, base_port):
+            needs_reorder = True
+
+    if needs_reorder:
+        reordered = OrderedDict()
+        derived_instances = []
+        for name, ctrl in ordered_instances.items():
+            if ctrl.is_derived_instance:
+                derived_instances.append((name, ctrl))
+            else:
+                reordered[name] = ctrl
+        for name, ctrl in derived_instances:
+            reordered[name] = ctrl
+        ordered_instances.clear()
+        ordered_instances.update(reordered)
+        collectd.info(
+            f"{PLUGIN} Reordered instances: {list(ordered_instances.keys())}")
+
+
+def _lock_derived_instance(instance, ctrl, reference_instance):
+    """Lock this instance as derived, with reference_instance as its reference.
+
+    Once locked, the role never changes for the ptp4l instance lifecycle.
+    """
+    ctrl.is_derived_instance = True
+    ctrl.reference_ptp4l_instance = reference_instance
+    collectd.info(f"{PLUGIN} Instance {instance} locked as derived "
+                  f"(reference: {reference_instance})")
+
+
+def _try_lock_reference_derived(instance, ctrl, base_port):
+    """Attempt to lock reference/derived roles for instances sharing base_port.
+
+    Called at runtime. Locks roles on first observation of a slave port
+    on any sibling, or ts2phc port ownership (ptp4l instance's interface
+    listed in ts2phc config). Once locked, never re-evaluated.
+
+    Returns True if this instance is confirmed derived (locked or just locked now).
+    Returns False if this instance is reference or roles not yet determined.
+    """
+    if ctrl.is_derived_instance is True:
+        return True
+    if ctrl.is_derived_instance is False:
+        return False
+
+    # is_derived_instance is None — not yet determined
+    siblings = base_port_to_ptp4l_instances.get(base_port, [])
+    if len(siblings) < 2:
+        ctrl.is_derived_instance = False
+        return False
+
+    # Check if I have a slave port — if so, I am reference
+    my_port_data = query_pmc_indexed(instance, 'PORT_DATA_SET', query_action='GET')
+    if my_port_data and any(
+        pds.get('portState') == 'SLAVE'
+        for pds in my_port_data.values()
+        if len(pds) >= 10
+    ):
+        ctrl.is_derived_instance = False
+        # Lock siblings as derived
+        for sibling in siblings:
+            if sibling == instance:
+                continue
+            sibling_ctrl = ptpinstances.get(sibling)
+            if sibling_ctrl and sibling_ctrl.is_derived_instance is None:
+                _lock_derived_instance(sibling, sibling_ctrl, instance)
+        ptp4l_instance_map[base_port] = instance
+        collectd.info(f"{PLUGIN} Instance {instance} locked as reference "
+                      f"(has slave port, base_port {base_port})")
+        return False
+
+    # Check if any sibling has a slave port — if so, I am derived
+    for sibling in siblings:
+        if sibling == instance:
+            continue
+        sibling_ctrl = ptpinstances.get(sibling)
+        if not sibling_ctrl:
+            continue
+        sibling_port_data = query_pmc_indexed(
+            sibling, 'PORT_DATA_SET', query_action='GET')
+        if sibling_port_data and any(
+            pds.get('portState') == 'SLAVE'
+            for pds in sibling_port_data.values()
+            if len(pds) >= 10
+        ):
+            # Lock the sibling as reference
+            if sibling_ctrl.is_derived_instance is None:
+                sibling_ctrl.is_derived_instance = False
+                ptp4l_instance_map[base_port] = sibling
+                collectd.info(f"{PLUGIN} Instance {sibling} locked as reference "
+                              f"(has slave port, base_port {base_port})")
+            # Lock all other siblings as derived
+            for other in siblings:
+                if other == sibling:
+                    continue
+                other_ctrl = ptpinstances.get(other)
+                if other_ctrl and other_ctrl.is_derived_instance is None:
+                    _lock_derived_instance(other, other_ctrl, sibling)
+            return True
+
+    # Check if I own a port listed in ts2phc config — if so, I am reference
+    ts2phc_instance_name = ts2phc_instance_map.get(base_port, None)
+    if ts2phc_instance_name:
+        ts2phc_ctrl = ptpinstances.get(ts2phc_instance_name)
+        if ts2phc_ctrl and ts2phc_ctrl.timing_instance:
+            ts2phc_interfaces = ts2phc_ctrl.timing_instance.interfaces
+            if ctrl.timing_instance.interfaces & ts2phc_interfaces:
+                ctrl.is_derived_instance = False
+                # Lock siblings as derived
+                for sibling in siblings:
+                    if sibling == instance:
+                        continue
+                    sibling_ctrl = ptpinstances.get(sibling)
+                    if sibling_ctrl and sibling_ctrl.is_derived_instance is None:
+                        _lock_derived_instance(sibling, sibling_ctrl, instance)
+                ptp4l_instance_map[base_port] = instance
+                collectd.info(f"{PLUGIN} Instance {instance} locked as reference "
+                              f"(owns ts2phc port, base_port {base_port})")
+                return False
+
+            # Check if any sibling owns a port in ts2phc config — if so, I am derived
+            for sibling in siblings:
+                if sibling == instance:
+                    continue
+                sibling_ctrl = ptpinstances.get(sibling)
+                if not sibling_ctrl or not sibling_ctrl.timing_instance:
+                    continue
+                if sibling_ctrl.timing_instance.interfaces & ts2phc_interfaces:
+                    # Lock the sibling as reference
+                    if sibling_ctrl.is_derived_instance is None:
+                        sibling_ctrl.is_derived_instance = False
+                        ptp4l_instance_map[base_port] = sibling
+                        collectd.info(f"{PLUGIN} Instance {sibling} locked as reference "
+                                      f"(owns ts2phc port, base_port {base_port})")
+                    # Lock all other siblings as derived
+                    for other in siblings:
+                        if other == sibling:
+                            continue
+                        other_ctrl = ptpinstances.get(other)
+                        if other_ctrl and other_ctrl.is_derived_instance is None:
+                            _lock_derived_instance(other, other_ctrl, sibling)
+                    return True
+
+    # No slave port observed yet on any sibling — defer
+    return False
+
+
+def process_ptp4l_derived(instance):
+    """Forward clock quality from reference ptp4l instance to derived instance.
+
+    Used when two ptp4l instances share the same base_port/PHC with different
+    domainNumbers (e.g., PTS domain 44 and FTS domain 24 on same E825 NIC).
+    The derived instance's PHC is already disciplined (same hardware clock),
+    but clock quality parameters must be forwarded from the reference.
+    Since both instances share the same physical clock, holdover state is
+    already resolved by the reference — derived simply copies its properties.
+    """
+    collectd.debug(f"{PLUGIN} process_ptp4l_derived {instance}")
+    ctrl = ptpinstances[instance]
+    reference_instance = ctrl.reference_ptp4l_instance
+
+    if not reference_instance:
+        return
+
+    reference_ctrl = ptpinstances.get(reference_instance)
+    if not reference_ctrl:
+        collectd.info(f"{PLUGIN} {instance} reference instance "
+                      f"{reference_instance} not found")
+        return
+
+    # Query reference's parent data set and time properties
+    reference_parent_data = query_pmc(reference_instance,
+                                      'PARENT_DATA_SET',
+                                      query_action='GET')
+    if len(reference_parent_data) < 10:
+        collectd.info(f"{PLUGIN} failed to query reference {reference_instance} "
+                      f"parent data, response: {reference_parent_data}")
+        return
+
+    reference_time_properties = query_pmc(reference_instance,
+                                          'TIME_PROPERTIES_DATA_SET',
+                                          query_action='GET')
+    if len(reference_time_properties) < 8:
+        collectd.info(f"{PLUGIN} failed to query reference {reference_instance} "
+                      f"time properties, response: {reference_time_properties}")
+        return
+
+    current_data = query_pmc(instance,
+                             'GRANDMASTER_SETTINGS_NP',
+                             query_action='GET')
+    if len(current_data) < 11:
+        collectd.info(f"{PLUGIN} failed to query {instance} GM settings NP, "
+                      f"response: {current_data}")
+        return
+
+    # Build new GM data directly from reference's clock properties.
+    # Same PHC — holdover state already resolved by reference instance.
+    new_data = {}
+    if 'gm.ClockClass' in reference_parent_data:
+        new_data['clockClass'] = reference_parent_data['gm.ClockClass']
+    if 'gm.ClockAccuracy' in reference_parent_data:
+        new_data['clockAccuracy'] = reference_parent_data['gm.ClockAccuracy']
+    if 'gm.OffsetScaledLogVariance' in reference_parent_data:
+        new_data['offsetScaledLogVariance'] = \
+            reference_parent_data['gm.OffsetScaledLogVariance']
+    if 'currentUtcOffset' in reference_time_properties:
+        new_data['currentUtcOffset'] = \
+            reference_time_properties['currentUtcOffset']
+    if 'leap61' in current_data:
+        new_data['leap61'] = current_data['leap61']
+    if 'leap59' in current_data:
+        new_data['leap59'] = current_data['leap59']
+    if 'currentUtcOffsetValid' in reference_time_properties:
+        new_data['currentUtcOffsetValid'] = \
+            reference_time_properties['currentUtcOffsetValid']
+    if 'ptpTimescale' in reference_time_properties:
+        new_data['ptpTimescale'] = reference_time_properties['ptpTimescale']
+    if 'timeTraceable' in reference_time_properties:
+        new_data['timeTraceable'] = \
+            reference_time_properties['timeTraceable']
+    if 'frequencyTraceable' in reference_time_properties:
+        new_data['frequencyTraceable'] = \
+            reference_time_properties['frequencyTraceable']
+    if 'timeSource' in reference_time_properties:
+        new_data['timeSource'] = reference_time_properties['timeSource']
+
+    # Write updated GM settings if changed
+    fields = ['clockClass', 'clockAccuracy', 'offsetScaledLogVariance',
+              'currentUtcOffset', 'currentUtcOffsetValid', 'ptpTimescale',
+              'timeTraceable', 'frequencyTraceable', 'timeSource']
+    if any(new_data.get(field) != current_data.get(field) for field in fields):
+        write_ptp4l_gm_fields(instance, new_data)
+
+
 def process_ptp_bc(instance):
     collectd.debug(f"{PLUGIN} process_ptp_bc {instance}")
     ctrl = ptpinstances[instance]
@@ -3329,6 +3598,7 @@ def read_func():
     cgu_dict = cgu_handler.cgu_output_to_dict()
     for clock_id, info in cgu_dict.items():
         collectd.info(f"{PLUGIN} DPLL clock_id: {clock_id} info: {info}")
+    _resolve_reference_derived_roles()
     for instance_name, ctrl in ordered_instances.items():
         collectd.info("%s Instance: %s Instance type: %s"
                       % (PLUGIN, instance_name, ctrl.instance_type))
@@ -3450,18 +3720,23 @@ def read_func():
             # Removed redundant call to check_time_drift()
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
-            if ctrl.disciplined_by_ts2phc:
+            if ctrl.disciplined_by_ts2phc and not ctrl.is_derived_instance:
                 if obj.capabilities['ts2phc_source'] == 'nmea':
                     check_clock_class(instance)
                 elif obj.capabilities['ts2phc_source'] == 'generic':
                     process_ptp_bc(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            # Derived ptp4l instance: forward clock quality from reference
+            if ctrl.is_derived_instance:
+                process_ptp4l_derived(instance)
+
             # PTP instance PHC, if not disciplined_by_ts2phc, i.e. disciplined
             # by PTP source, we further overwrites clockclass here. e.g.
             # upstream ptp-instance (when ts2phc_source = generic),
             # individual ptp-instance (when ts2phc_source = None or nmea)
-            handle_ptp4l_g8275_fields(instance)
+            if not ctrl.is_derived_instance:
+                handle_ptp4l_g8275_fields(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
             process_phc2sys_ha(ctrl)
@@ -3876,6 +4151,21 @@ def check_ptp_regular(instance, ctrl, conf_file):
             clock_locked = (upstream_identity and
                             upstream_identity != upstream_gm_identity and
                             upstream_port_locked)
+
+    # Derived instance without ts2phc: check reference's slave port
+    if not clock_locked and ctrl.is_derived_instance:
+        reference_instance = ctrl.reference_ptp4l_instance
+        if reference_instance:
+            ref_port_data = query_pmc_indexed(
+                reference_instance, 'PORT_DATA_SET', query_action='GET')
+            clock_locked = any(
+                pds.get('portState') == 'SLAVE'
+                for pds in ref_port_data.values()
+                if len(pds) >= 10
+            )
+            collectd.info(f"{PLUGIN} {instance} derived instance, "
+                          f"reference {reference_instance} "
+                          f"clock_locked={clock_locked}")
 
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.
