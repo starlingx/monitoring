@@ -51,6 +51,7 @@ from pynetlink import DeviceType
 from pynetlink import LockStatus
 from pynetlink import PinState
 from pynetlink import PinType
+import time
 
 debug = False
 
@@ -82,6 +83,10 @@ PLUGIN_CONF_TIMESTAMPING = 'time_stamping'
 
 # dummy interface name
 DUMMY_INTERFACE = 'dummy'
+
+NANOSECONDS_IN_A_SECOND = 1000000000
+NTP_EPOCH_OFFSET = 2208988800
+leap_seconds_offset = None
 
 
 def _get_os_release():
@@ -405,7 +410,7 @@ class PTP_ctrl_object:
         self.ptp4l_prc_state = None
         self.ptp4l_ptp_source_state = None
         self.ptp4l_time_source = None
-        self.ptp4l_utc_offset_nanoseconds = 37 * 1000000000
+        self.ptp4l_utc_offset_nanoseconds = 37 * NANOSECONDS_IN_A_SECOND
         self.ptp4l_announce_settings = {}
 
         # Alarm objects
@@ -1705,15 +1710,29 @@ def initialize_ptp4l_state_fields(instance):
     if ctrl.timing_instance.config.has_section('global') and \
        'utc_offset' in ctrl.timing_instance.config['global'].keys():
         ctrl.ptp4l_current_utc_offset = ctrl.timing_instance.config['global']['utc_offset']
+        ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s currentUtcOffset is initialized to %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
+    elif ctrl.prtc_present and leap_seconds_offset is not None:
+        ctrl.ptp4l_current_utc_offset = leap_seconds_offset
+        ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
+        collectd.info("%s Instance %s currentUtcOffset is not specified, GrandMaster detected, "
+                      "initializing to %s from leap seconds file"
+                      % (PLUGIN, instance, str(leap_seconds_offset)))
     elif 'currentUtcOffset' in data.keys():
         # currentUtcOffset is not configured, use value from query if available
         ctrl.ptp4l_current_utc_offset = data['currentUtcOffset']
+        ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
+    elif leap_seconds_offset is not None:
+        ctrl.ptp4l_current_utc_offset = leap_seconds_offset
+        ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
+        collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
+                      "from leap seconds file"
+                      % (PLUGIN, instance, str(leap_seconds_offset)))
     else:
-        # currentUtcOffset not in config or query response, keep default value (37)
+        # currentUtcOffset not in config, query response or leap seconds file, keep default value (37)
         collectd.info("%s Instance %s currentUtcOffset not available, using default %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
 
@@ -1791,6 +1810,26 @@ def read_ts2phc_config():
             primary_interface = None
             is_alarm_objects_created = False
             if instance.config.has_section('global'):
+                leap_seconds_file = instance.config['global'].get('leapfile', None)
+                if leap_seconds_file:
+                    global leap_seconds_offset
+                    # leap_seconds_offset is global, so if there is more than one instance of
+                    # ts2phc with a valid leapfile, the last instance's value will be persistent
+                    leap_seconds_offset = get_latest_offset_from_leapfile(leap_seconds_file)
+                    if leap_seconds_offset is not None:
+                        collectd.info(
+                            "%s ts2phc instance %s utc offset "
+                            "set to %d from leapfile %s" %
+                            (PLUGIN, instance_name, leap_seconds_offset, leap_seconds_file))
+                    else:
+                        collectd.error(
+                            "%s ts2phc instance %s failed to parse "
+                            "leapfile %s" %
+                            (PLUGIN, instance_name, leap_seconds_file))
+                else:
+                    collectd.info("%s ts2phc instance %s has no leap_seconds file" %
+                                  (PLUGIN, instance_name))
+
                 # primary interface
                 nmea_mask = instance.config['global'].get('ts2phc.nmea_serialport', None)
                 nmea = prune_reconfigured_suffix(nmea_mask)
@@ -2179,6 +2218,16 @@ def handle_ptp4l_g8275_fields(instance):
             ctrl.ptp4l_announce_settings['frequencyTraceable'] = new_freq_traceable
             ctrl.ptp4l_frequency_traceable = new_freq_traceable
 
+    if ctrl.prtc_present and leap_seconds_offset is not None:
+        if ctrl.ptp4l_current_utc_offset != leap_seconds_offset or \
+           data_grandmaster_settings['currentUtcOffset'] != leap_seconds_offset:
+            collectd.info("%s Updating UTC offset fields for instance %s" %
+                          (PLUGIN, instance))
+            ctrl.ptp4l_current_utc_offset = leap_seconds_offset
+            ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
+            ctrl.ptp4l_announce_settings['currentUtcOffset'] = leap_seconds_offset
+            ctrl.ptp4l_announce_settings['currentUtcOffsetValid'] = 1
+
     gm_settings_to_write = OrderedDict(data_grandmaster_settings)
     gm_settings_to_write.update(ctrl.ptp4l_announce_settings)
     if data_grandmaster_settings != gm_settings_to_write:
@@ -2317,12 +2366,51 @@ def check_phc2sys_offset():
             offset = _get_phc2sys_command_line_option(
                 phc2sysinstance, pidfile_path, '-O')
             if offset is not None:
-                offset = abs(int(offset)) * 1000000000
+                offset = abs(int(offset)) * NANOSECONDS_IN_A_SECOND
             found_disciplined += 1
     if found_disciplined > 1:
         collectd.error(
             "%s Found more then one phc2sys instance disciplining the clock" % PLUGIN)
     return offset
+
+
+# The file is read once during read_ts2phc_config(). If an operator deploys a new leapfile
+# before a scheduled leap second, the entry is correctly ignored (future timestamp). 
+# Once the leap second occurs and the timestamp becomes valid, collectd still holds
+# the old value, so a patch with a new leapfile needs to perform a service restart.
+def get_latest_offset_from_leapfile(filepath):
+    """Parse a leap-seconds.list file and return the latest TAI-UTC offset.
+
+    The leap-seconds.list file contains data lines with the format:
+      <NTP_timestamp>  <TAI-UTC_offset>  # <date_comment>
+
+    Returns the TAI-UTC offset (int) from the entry with the highest
+    NTP timestamp, or None if the file cannot be parsed.
+    """
+    latest_offset = None
+    now_ntp = int(time.time()) + NTP_EPOCH_OFFSET
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip blank lines, comment lines, and special markers
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        timestamp = int(parts[0])
+                        offset = int(parts[1])
+                        if timestamp <= now_ntp:
+                            latest_offset = offset
+                    except ValueError:
+                        continue
+    except (IOError, OSError) as e:
+        collectd.error("%s failed to read leap seconds file %s (%s)" %
+                       (PLUGIN, filepath, str(e)))
+        return None
+
+    return latest_offset
 
 
 def set_utc_offset(instance):
@@ -2376,16 +2464,23 @@ def set_utc_offset(instance):
             if 'currentUtcOffsetValid ' in line:
                 utc_offset_valid = bool(int(line.split()[1]))
         if not utc_offset_valid:
-            utc_offset = ctrl.ptp4l_current_utc_offset
-            if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                collectd.warning("%s currentUtcOffsetValid is %s, "
-                                 "using the default currentUtcOffset %s"
-                                 % (PLUGIN, utc_offset_valid, utc_offset))
+            if leap_seconds_offset is not None:
+                utc_offset = leap_seconds_offset
+                if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                    collectd.warning("%s currentUtcOffsetValid is %s, "
+                                     "using the default currentUtcOffset %s from leapfile" %
+                                     (PLUGIN, utc_offset_valid, utc_offset))
+            else:
+                utc_offset = ctrl.ptp4l_current_utc_offset
+                if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
+                    collectd.warning("%s currentUtcOffsetValid is %s, "
+                                     "using the default currentUtcOffset %s" % 
+                                     (PLUGIN, utc_offset_valid, utc_offset))
             ctrl.log_throttle_count += 1
 
     if ctrl.ptp4l_current_utc_offset != int(utc_offset):
         ctrl.ptp4l_current_utc_offset = int(utc_offset)
-        ctrl.ptp4l_utc_offset_nanoseconds = abs(int(utc_offset)) * 1000000000
+        ctrl.ptp4l_utc_offset_nanoseconds = abs(int(utc_offset)) * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s utcOffset updated to %s" %
                       (PLUGIN, instance, utc_offset))
 
