@@ -30,6 +30,7 @@
 #
 ############################################################################
 import os
+import json
 from collections import OrderedDict
 import socket
 import collectd
@@ -389,6 +390,7 @@ class PTP_ctrl_object:
         # is forwarded from reference. Locked on first slave port observation
         # or ts2phc port ownership detection.
         self.is_derived_instance = None  # None=undetermined, True/False=locked
+        self.is_managed_by_dpll_mgr = False
         self.reference_ptp4l_instance = None
         self.interface_list = []
         self.clock_ports = {}
@@ -726,6 +728,47 @@ def read_instance_monitoring_config():
                     f"{PLUGIN} PTP instance {ptp_instance_name}'s monitoring_parameters: "
                     f"{ptpinstances[ptp_instance_name].monitoring_parameters}"
                 )
+
+
+def read_dpll_mgr_config():
+    """Read dpll-mgr config and set ctrl.is_managed_by_dpll_mgr flag."""
+    filenames = glob(PTPINSTANCE_PATH + 'dpll-mgr-*.json')
+    if not filenames:
+        return
+
+    # Collect UDS addresses from dpll-mgr channels
+    managed_uds_paths = set()
+    for filename in filenames:
+        try:
+            with open(filename, 'r') as f:
+                config = json.load(f)
+            channels = config.get('channels', {})
+            for channel_name, channel_config in channels.items():
+                if isinstance(channel_config, dict):
+                    uds = channel_config.get('call_channel', '')
+                    if uds.startswith('uds:'):
+                        uds = uds[4:]
+                    if uds:
+                        managed_uds_paths.add(uds)
+        except (json.JSONDecodeError, IOError) as exc:
+            collectd.warning("%s Failed to parse dpll-mgr config %s: %s"
+                             % (PLUGIN, filename, exc))
+
+    if not managed_uds_paths:
+        return
+
+    # Match UDS paths to ptp4l instance names
+    for instance_name, ctrl in ptpinstances.items():
+        if ctrl.instance_type != PTP_INSTANCE_TYPE_PTP4L:
+            continue
+        config = ctrl.timing_instance.config
+        if config.has_section('global'):
+            uds = config['global'].get('uds_address')
+            if uds and uds in managed_uds_paths:
+                if config['global'].get('free_running') == '1':
+                    ctrl.is_managed_by_dpll_mgr = True
+                    collectd.info("%s Instance %s managed by dpll-mgr (uds=%s)"
+                                  % (PLUGIN, instance_name, uds))
 
 
 class ConfigDict:
@@ -1989,6 +2032,9 @@ def init_func():
         # and set per instance's monitoring_parameters
         read_instance_monitoring_config()
 
+        # Detect ptp4l instances managed by dpll-mgr
+        read_dpll_mgr_config()
+
         for key, ctrl in ptpinstances.items():
             collectd.info("%s instance: %s type: %s found" %
                           (PLUGIN, key, ctrl.instance_type))
@@ -2238,8 +2284,15 @@ def handle_ptp4l_g8275_fields(instance):
 
 def write_ptp4l_gm_fields(instance, gm_fields_dict):
     """update the pmc GRANDMASTER_SETTINGS_NP values"""
-    collectd.debug(f"{PLUGIN} write_ptp4l_gm_fields: {instance}")
     ctrl = ptpinstances[instance]
+
+    # Skip GM write for instances managed by dpll-mgr + free_running
+    if ctrl.is_managed_by_dpll_mgr:
+        collectd.info("%s %s managed by dpll-mgr + free_running=1,"
+                      " skipping GM write" % (PLUGIN, instance))
+        return
+
+    collectd.debug(f"{PLUGIN} write_ptp4l_gm_fields: {instance}")
     conf_file = (PTPINSTANCE_PATH + ctrl.instance_type +
                  '-' + instance + '.conf')
     parameters = ' '.join("{} {}".format(*i) for i in gm_fields_dict.items())
@@ -3815,7 +3868,8 @@ def read_func():
             # Removed redundant call to check_time_drift()
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
-            if ctrl.disciplined_by_ts2phc and not ctrl.is_derived_instance:
+            if ctrl.disciplined_by_ts2phc and not ctrl.is_derived_instance \
+               and not ctrl.is_managed_by_dpll_mgr:
                 if obj.capabilities['ts2phc_source'] == 'nmea':
                     check_clock_class(instance)
                 elif obj.capabilities['ts2phc_source'] == 'generic':
@@ -3823,14 +3877,15 @@ def read_func():
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
             # Derived ptp4l instance: forward clock quality from reference
-            if ctrl.is_derived_instance:
+            if ctrl.is_derived_instance and not ctrl.is_managed_by_dpll_mgr:
                 process_ptp4l_derived(instance)
 
             # PTP instance PHC, if not disciplined_by_ts2phc, i.e. disciplined
             # by PTP source, we further overwrites clockclass here. e.g.
             # upstream ptp-instance (when ts2phc_source = generic),
             # individual ptp-instance (when ts2phc_source = None or nmea)
-            if not ctrl.is_derived_instance:
+            if not ctrl.is_derived_instance \
+               and not ctrl.is_managed_by_dpll_mgr:
                 handle_ptp4l_g8275_fields(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS and ctrl.phc2sys_ha_enabled is True:
