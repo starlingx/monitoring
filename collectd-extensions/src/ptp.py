@@ -3468,7 +3468,14 @@ def check_clock_class(instance):
     frequency_traceable = False
     current_utc_offset_valid = False
     new_clock_class = current_clock_class
-    ctrl.ptp4l_prc_state = state
+    if is_ts2phc_running:
+        ctrl.ptp4l_prc_state = state
+    else:
+        # When ts2phc is not running, the clock is effectively in freerun
+        # regardless of DPLL hardware state. Setting prc_state to UNLOCKED
+        # ensures handle_ptp4l_g8275_fields() applies degraded clockAccuracy
+        # (0xFE) and offsetScaledLogVariance (0xFFFF) per G.8275.1 Table V.2.
+        ctrl.ptp4l_prc_state = CLOCK_STATE_UNLOCKED
     if (is_ts2phc_running and state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]):
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
