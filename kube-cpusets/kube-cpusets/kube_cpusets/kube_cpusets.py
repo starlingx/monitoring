@@ -113,8 +113,21 @@ def get_k8sinfra_cpuset():
 
        Reads sys fs cgroup k8sinfra cpuset.cpus file containing comma
        separated ranges and convert to an expanded set of integers.
+
+       v1: /sys/fs/cgroup/cpuset/k8sinfra/cpuset.cpus
+       v2: /sys/fs/cgroup/k8sinfra.slice/cpuset.cpus.effective
     """
-    filename = '/sys/fs/cgroup/cpuset/k8sinfra/cpuset.cpus'
+    try:
+        cgroup_v2 = (subprocess.check_output(
+            ["stat", "-fc", "%T", "/sys/fs/cgroup"],
+            text=True).strip() == "cgroup2fs")
+    except Exception:
+        cgroup_v2 = False
+
+    if cgroup_v2:
+        filename = '/sys/fs/cgroup/k8sinfra.slice/cpuset.cpus.effective'
+    else:
+        filename = '/sys/fs/cgroup/cpuset/k8sinfra/cpuset.cpus'
     cpuset = cpuset_from_cpulist_file(filename)
     return cpuset
 
