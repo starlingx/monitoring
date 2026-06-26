@@ -37,7 +37,7 @@ PLUGIN_NUMA = '4K numa memory usage'
 PLUGIN_DEBUG = 'DEBUG memory'
 
 # Memory cgroup controller
-MEMCONT = pc.CGROUP_ROOT + '/memory'
+MEMCONT = pc.cgroup_controller_path('memory')
 MEMORY_STAT = 'memory.stat'
 MEMORY_PIDS = 'cgroup.procs'
 
@@ -174,8 +174,13 @@ def get_cgroup_memory(path):
     """Get memory usage in MiB for a specific cgroup path.
 
     This represents the aggregate usage for child cgroups.
+    NOTE(ajaiswal): v2 'anon' does not include child cgroup aggregation;
+    follow-up changes required hierarchical memory accounting.
 
     Returns dictionary containing entries: 'rss_MiB', 'rss_huge_MiB'.
+
+    v1: reads memory.stat total_rss (bytes)
+    v2: reads memory.stat anon (bytes, equivalent of total_rss)
     """
 
     memory = {}
@@ -190,12 +195,18 @@ def get_cgroup_memory(path):
                     k = match.group(1)
                     v = match.group(2)
                     m[k] = v
-    except IOError:
+    except (IOError, OSError):
         # Silently ignore IO errors. It is likely the cgroup disappeared.
         pass
 
     # Calculate RSS usage in MiB
-    memory['rss_MiB'] = float(m.get('total_rss', 0)) / float(pc.Mi)
+    # v2 uses 'anon' instead of 'total_rss'
+    if pc.CGROUP_V2:
+        rss = m.get('anon', 0)
+    else:
+        # cgroup v1
+        rss = m.get('total_rss', 0)
+    memory['rss_MiB'] = float(rss) / float(pc.Mi)
 
     return memory
 
@@ -283,7 +294,7 @@ def get_platform_memory():
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
     paths = ['/'.join([MEMCONT, pc.K8S_ROOT, pc.KUBEPODS]),
-             '/'.join([MEMCONT, pc.K8S_ROOT_STX, pc.KUBEPODS])]
+             '/'.join([MEMCONT, pc.K8S_ROOT_STX, pc.KUBEPODS_STX])]
     for path in paths:
         if not os.path.isdir(path):
             continue
@@ -558,7 +569,7 @@ def get_platform_memory_per_process():
     if os.path.exists(os.path.join(MEMCONT)):
         starting_dir = next(os.walk(MEMCONT))[1]
         for directory in starting_dir:
-            if directory not in [str(pc.K8S_ROOT), str(pc.K8S_ROOT_STX)]:
+            if directory not in [pc.K8S_ROOT, pc.K8S_ROOT_STX]:
                 cg_path = '/'.join([MEMCONT, directory])
                 paths = get_cgroups_procs_paths(cg_path)
                 for path in paths:

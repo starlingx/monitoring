@@ -46,7 +46,7 @@ CPUINFO = '/proc/cpuinfo'
 SCHEDSTAT = '/proc/schedstat'
 
 # cpuacct cgroup controller
-CPUACCT = pc.CGROUP_ROOT + '/cpuacct'
+CPUACCT = pc.cgroup_controller_path('cpuacct')
 CPUACCT_USAGE = 'cpuacct.usage'
 CPUACCT_USAGE_PERCPU = 'cpuacct.usage_percpu'
 CPU_STAT = 'cpu.stat'
@@ -244,32 +244,54 @@ def get_cgroup_cpuacct(path, cpulist=None):
     when cpulist is specified.
 
     Returns cumulative usage in nanoseconds.
+
+    v1: reads cpuacct.usage (ns) or cpuacct.usage_percpu
+    v2: reads cpu.stat usage_usec (us, converted to ns)
+
+    Limitation:
+    per-cpu breakdown not available on v2
     """
 
     acct = 0
 
-    if not cpulist:
-        # Get the aggregate value for all cpus
-        fstat = '/'.join([path, CPUACCT_USAGE])
+    if pc.CGROUP_V2:
+        # v2: read usage_usec from cpu.stat, convert to nanoseconds
+        # NOTE: optimized to reduce CPU cost of parsing; uses binary
+        # read and partition to avoid iterator/split/decode overhead.
+        fstat = '/'.join([path, CPU_STAT])
         try:
-            with open(fstat, 'r') as f:
-                line = f.readline().rstrip()
-                acct = int(line)
-        except IOError:
-            # Silently ignore IO errors. It is likely the cgroup disappeared.
+            with open(fstat, 'rb') as f:
+                for line in f:
+                    if line.startswith(b'usage_usec'):
+                        _, _, val = line.partition(b' ')
+                        acct = int(val) * 1000
+                        break
+        except (IOError, OSError):
             pass
     else:
-        # Get the aggregate value for specified cpus
-        fstat = '/'.join([path, CPUACCT_USAGE_PERCPU])
-        try:
-            with open(fstat, 'r') as f:
-                line = f.readline().rstrip()
-                acct_percpu = list(map(int, line.split()))
-                for cpu in cpulist:
-                    acct += acct_percpu[cpu]
-        except IOError:
-            # Silently ignore IO errors. It is likely the cgroup disappeared.
-            pass
+        # v1: read cpuacct.usage (nanoseconds)
+        if not cpulist:
+            # Get the aggregate value for all cpus
+            fstat = '/'.join([path, CPUACCT_USAGE])
+            try:
+                with open(fstat, 'r') as f:
+                    line = f.readline().rstrip()
+                    acct = int(line)
+            except IOError:
+                # Silently ignore IO errors. It is likely the cgroup disappeared.
+                pass
+        else:
+            # Get the aggregate value for specified cpus
+            fstat = '/'.join([path, CPUACCT_USAGE_PERCPU])
+            try:
+                with open(fstat, 'r') as f:
+                    line = f.readline().rstrip()
+                    acct_percpu = list(map(int, line.split()))
+                    for cpu in cpulist:
+                        acct += int(acct_percpu[cpu])
+            except IOError:
+                # Silently ignore IO errors. It is likely the cgroup disappeared.
+                pass
 
     return acct
 
@@ -414,7 +436,7 @@ def get_cpuacct():
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
     paths = ['/'.join([CPUACCT, pc.K8S_ROOT, pc.KUBEPODS]),
-             '/'.join([CPUACCT, pc.K8S_ROOT_STX, pc.KUBEPODS])]
+             '/'.join([CPUACCT, pc.K8S_ROOT_STX, pc.KUBEPODS_STX])]
     for path in paths:
         if not os.path.isdir(path):
             continue

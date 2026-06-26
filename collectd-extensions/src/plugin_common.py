@@ -55,9 +55,49 @@ ONE_HUNDRED = 100
 
 # cgroup definitions
 CGROUP_ROOT = '/sys/fs/cgroup'
-K8S_ROOT = 'k8sinfra'
-K8S_ROOT_STX = 'k8sinfra_stx'
-KUBEPODS = 'kubepods'
+
+# Detect cgroup version: v2 has no per-controller subdirectories.
+# For v2, drop cgroup controller directory (unified hierarchy).
+try:
+    CGROUP_V2 = (
+        subprocess.check_output(
+            ["stat", "-fc", "%T", CGROUP_ROOT],
+            text=True
+        ).strip() == "cgroup2fs"
+    )
+except (subprocess.CalledProcessError, OSError):
+    CGROUP_V2 = False
+
+# Cgroup path names based on version:
+#   v1 (per-controller): /sys/fs/cgroup/<controller>/k8sinfra/kubepods
+#   v2 (unified):        /sys/fs/cgroup/k8sinfra.slice/k8sinfra-kubepods.slice
+if CGROUP_V2:
+    K8S_ROOT = 'k8sinfra.slice'
+    K8S_ROOT_STX = 'k8sinfra_stx.slice'
+    KUBEPODS = 'k8sinfra-kubepods.slice'
+    KUBEPODS_STX = 'k8sinfra_stx-kubepods.slice'
+else:
+    K8S_ROOT = 'k8sinfra'
+    K8S_ROOT_STX = 'k8sinfra_stx'
+    KUBEPODS = 'kubepods'
+    KUBEPODS_STX = 'kubepods'
+
+
+def cgroup_controller_path(controller, cgroup_v2=None):
+    """Return base path for a cgroup controller based on version.
+
+    v1 (per-controller):
+      /sys/fs/cgroup/<controller>
+
+    v2 (unified):
+      /sys/fs/cgroup
+    """
+    if cgroup_v2 is None:
+        cgroup_v2 = CGROUP_V2
+    if cgroup_v2:
+        return CGROUP_ROOT
+    return os.path.join(CGROUP_ROOT, controller)
+
 
 # High level grouping categories
 GROUP_OVERALL = 'overall'
