@@ -2219,8 +2219,11 @@ def handle_ptp4l_g8275_fields(instance):
             ctrl.ptp4l_frequency_traceable = new_freq_traceable
 
     if ctrl.prtc_present and leap_seconds_offset is not None:
-        if ctrl.ptp4l_current_utc_offset != leap_seconds_offset or \
-           data_grandmaster_settings['currentUtcOffset'] != leap_seconds_offset:
+        leap_seconds_offset_differs = (
+            'currentUtcOffset' in data_grandmaster_settings.keys() and
+            data_grandmaster_settings['currentUtcOffset'] != leap_seconds_offset
+        )
+        if ctrl.ptp4l_current_utc_offset != leap_seconds_offset or leap_seconds_offset_differs:
             collectd.info("%s Updating UTC offset fields for instance %s" %
                           (PLUGIN, instance))
             ctrl.ptp4l_current_utc_offset = leap_seconds_offset
