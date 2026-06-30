@@ -3591,7 +3591,11 @@ def check_gnss_signal(instance):
     base_port = get_base_port(ctrl.interface)
     collectd.info("%s check_gnss_signal %s ctrl.interface=%s base_port=%s"
                   % (PLUGIN, instance, ctrl.interface, base_port))
-    state, pin = get_netlink_dpll_status(base_port, DeviceType.PPS)
+    # Use combined EEC+PPS state (worst-of) to stay consistent with
+    # check_clock_class() which also uses get_dpll_state(). Previously
+    # only PPS was queried here, causing holdover_timestamp to be
+    # incorrectly cleared when PPS=LOCKED_HO_ACQ but EEC=HOLDOVER.
+    state, pin = get_dpll_state(base_port)
     collectd.info(f"{PLUGIN} gnss-monitor instance: {instance} "
                   f"device {ctrl.interface} status {state.value} pin %s"
                   % (pin.pin_board_label if pin else "unknown"))
@@ -3623,16 +3627,17 @@ def check_1pps_signal(instance):
         if len(pin_function) == 0:
             # No pins are configured for the secondary NIC
             # It checks for alarm with the state of SMA1, SMA2 or GNSS-1PPS pins.
-            state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
-            if state in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
-                state, pin = get_netlink_dpll_status(interface, DeviceType.EEC)
+            # Use combined EEC+PPS state (worst-of) to stay consistent
+            # with check_clock_class().
+            state, pin = get_dpll_state(interface)
             collectd.info(f"{PLUGIN} Monitoring instance {instance} "
                           f"device {ctrl.interface} status {state.value} pin %s"
                           % (pin.pin_board_label if pin else "unknown"))
             check_gnss_alarm(instance, alarm_obj, ctrl.interface, state)
         else:
             # Pins are configured, check GNSS then SMA
-            state, pin = get_netlink_dpll_status(interface, DeviceType.PPS)
+            # First, check combined EEC+PPS DPLL state of GNSS
+            state, pin = get_dpll_state(interface)
             if state not in [CLOCK_STATE_INVALID, CLOCK_STATE_UNLOCKED]:
                 # NIC has a GNSS connection and it takes priority over SMA1/SMA2
                 collectd.info(f"{PLUGIN} Monitoring instance {instance} "
