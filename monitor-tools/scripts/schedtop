@@ -744,7 +744,7 @@ sub track_watched_tids
         $::tids_w{$tid} = $pid;
         printf "watching: tid=%7d, cgroup=%s, comm=%s, cmdline=%.40s\n", $tid, $cgroup, $comm, $cmdline;
       }
-      if ((defined $comm) && ($comm =~ /^\Q$cmd\E/)) {
+      if ((defined $comm) && ($cmd !~ /^\d+$/) && ($comm =~ /^\Q$cmd\E/)) {
         $::tids_w{$tid} = $pid;
         printf "watching: tid=%7d, cgroup=%s, comm=%s, cmdline=%.40s\n", $tid, $cgroup, $comm, $cmdline;
       }
@@ -771,12 +771,23 @@ sub find_matching_cgroup_procs
 {
   (local *::cgroup_procs_match, local *::arg_watch_cgroup) = @_;
 
-  # Find all cgroup.procs paths for the pids cgroup controller
-  File::Find::find(\&wanted_cgroup_procs, '/sys/fs/cgroup/pids');
+  # Find all cgroup.procs paths for the pids cgroup controller.
+  # On cgroup v2 (unified hierarchy), per-controller directories do not
+  # exist; walk /sys/fs/cgroup instead.
+  my $cgroup_base = '/sys/fs/cgroup/pids';
+  if (open(my $st, '-|', 'stat', '-fc', '%T', '/sys/fs/cgroup')) {
+    my $fs_type = <$st>;
+    close($st);
+    chomp $fs_type if defined $fs_type;
+    if (defined $fs_type && $fs_type eq 'cgroup2fs') {
+      $cgroup_base = '/sys/fs/cgroup';
+    }
+  }
+  File::Find::find(\&wanted_cgroup_procs, $cgroup_base);
 
   foreach my $file (@::cgroup_procs_paths) {
     foreach my $cg (@::arg_watch_cgroup) {
-      if ($file =~ /\Q$cg\E(\.service|\.scope)/) {
+      if ($file =~ /\Q$cg\E(\.service|\.scope|\.slice)/) {
         push(@::cgroup_procs_match, $file);
       } elsif ($file =~ /kubepods\/\w+\/\Q$cg\E/) {
         push(@::cgroup_procs_match, $file);
@@ -1172,8 +1183,17 @@ sub read_sched
     #1:name=systemd:/init.scope
     #0::/init.scope
 
-    # Extract the pod id:
-    # /k8sinfra/kubepods/burstable/pode84531c2-0bb1-45f8-b27f-e779b858552d/fdeaea0e577a525a3d9e41655ee05dd9b4edf17ce4b1bf95803cae1518f43ca2
+    # Extract the pod id or service name from /proc/<pid>/task/<tid>/cgroup.
+    # Only the unique identifier portion is displayed in output.
+    #
+    # v1 example (cat /proc/<pid>/task/<tid>/cgroup):
+    # 13:devices:/k8sinfra_stx/kubepods/burstable/podb0a96d18add452b7866dbe9c87310f7e/3756615b2bc3d92...
+    # 12:cpu,cpuacct:/k8sinfra_stx/kubepods/burstable/podb0a96d18add452b7866dbe9c87310f7e/3756615b2bc...
+    # 1:name=systemd:/k8sinfra_stx/kubepods/burstable/podb0a96d18add452b7866dbe9c87310f7e/3756615b2b...
+    #
+    # v2 example (cat /proc/<pid>/task/<tid>/cgroup):
+    # 0::/k8sinfra_stx.slice/k8sinfra_stx-kubepods.slice/k8sinfra_stx-kubepods-besteffort.slice/k8sinfra_stx-kubepods-besteffort-pod7772e24df6912109eb7a9e19e4b41c18.slice/cri-containerd-1b95402e6cf2...scope
+    #
     # Extract *.service or *.scope name:
     # /system.slice/acpid.service
     # /system.slice/system-ceph.slice/ceph-mds.scope
@@ -1182,9 +1202,23 @@ sub read_sched
     $file = '/proc/' . $pid . '/task/' . $tid . '/cgroup';
     open($fh, $file) || next;
     LOOP_CGROUP: while (<$fh>) {
+      # v2: 0::/ is the only line on unified hierarchy — match first
+      if (/^0::(.+)/) {
+        $_ = $1;
+        if (/(pod[a-z0-9_-]+)\.slice/) {
+          $cgroup = $1;
+        } elsif (/\/([a-zA-Z0-9_-@:]+)\.\w+$/) {
+          $cgroup = $1;
+        } else {
+          $cgroup = '-'; # '-' looks prettier than '/'
+        }
+        $cgroup_valid = 1;
+        last LOOP_CGROUP;
+      }
+      # v1 fallback: cpu,cpuacct/pids lines appear early in the file
       if (/^\d+:(pids|cpu,cpuacct):(.*)/) {
         $_ = $2;
-        if (/kubepods\/\w+\/(pod[a-z0-9-]+)\/\w+$/) {
+        if (/kubepods\/(?:\w+\/)?(pod[a-z0-9-]+)\/\w+$/) {
           $cgroup = $1;
         } elsif (/\/([a-zA-Z0-9_-@:]+)\.\w+$/) {
           $cgroup = $1;
