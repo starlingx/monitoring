@@ -18,6 +18,9 @@ State-to-QL mapping:
 import collectd
 import socket
 import struct
+import configparser
+from glob import glob
+import re
 
 from fm_api import constants as fm_constants
 from fm_api import fm_api
@@ -34,6 +37,11 @@ PLUGIN_READ_INTERVAL = 5
 # Instantiate the common plugin control object
 obj = pc.PluginObject(PLUGIN, "")
 
+
+# Config files
+PTPINSTANCE_PATH = '/etc/linuxptp/ptpinstance/'
+PTPINSTANCE_SYNCE4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'synce4l-*.conf'
+PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE = PTPINSTANCE_PATH + "instance-monitoring.conf"
 
 # FM Alarm
 PLUGIN_ALARMID = '100.119'
@@ -60,18 +68,106 @@ class SynceController:
         self._last_ql = None
         self._alarm_raised = False
         self._alarm_severity = None
+        self.instance_name = None
         self._config_logged = False
 
-        # Config values — remain None until configured
+        # Default instance-monitoring.conf config values
+        # - required
         self.socket_path = None
         self.device = None
         self.interface = None
+        self.clock_id = None
+        # - optional
         self.source = 'GNSS'
         self.holdover_ql = 0x04
         self.freerun_ql = 0x0f
 
     def config(self):
-        pass
+        """Auto-discover from instance-monitoring.conf."""
+
+        filenames = glob(PTPINSTANCE_SYNCE4L_CONF_FILE_PATTERN)
+        if len(filenames) == 0:
+            collectd.info(f"{PLUGIN} No synce4l conf file configured")
+            return
+
+        # Find first synce4l config with a matching monitoring section
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read(PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE)
+
+        if not config.sections():
+            collectd.info(f"{PLUGIN} {PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE} "
+                          f"not found or has no sections")
+            return
+
+        filename = None
+        for f in sorted(filenames):
+            try:
+                name = re.search(r'synce4l-(.*?)\.conf', f).group(1)
+            except AttributeError:
+                continue
+            if name in config.sections():
+                self.instance_name = name
+                filename = f
+                break  # single instance supported
+
+        if not filename:
+            collectd.warning(f"{PLUGIN} no synce4l instance has a matching section in "
+                             f"{PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE}")
+            return
+
+        # Log additional instances that won't be monitored (single-instance limitation)
+        ignored = [re.search(r'synce4l-(.*?)\.conf', f).group(1)
+                   for f in sorted(filenames)
+                   if f != filename and re.search(r'synce4l-(.*?)\.conf', f)]
+        if ignored:
+            collectd.info(f"{PLUGIN} ignoring additional synce4l instances "
+                          f"(single-instance limitation): {ignored}")
+
+        # Parse clock_id from synce4l config file (device section is [<name>])
+        synce_config = configparser.ConfigParser(delimiters=' ')
+        try:
+            synce_config.read(filename)
+            device_section = f'<{self.instance_name}>'
+            if synce_config.has_option(device_section, 'clock_id'):
+                self.clock_id = int(synce_config[device_section]['clock_id'])
+        except Exception as e:
+            collectd.warning(f"{PLUGIN} failed to parse clock_id from {filename}: {e}")
+
+        self._load_monitoring_config(self.instance_name, config)
+
+        if self.clock_id is None:
+            collectd.warning(f"{PLUGIN} clock_id not found in {filename}; "
+                             f"DPLL matching will be unavailable")
+
+    def _load_monitoring_config(self, instance_name, config):
+        """Read synce monitoring params from instance-monitoring.conf."""
+
+        if instance_name not in config.sections():
+            collectd.warning(f"{PLUGIN} section [{instance_name}] not found "
+                             f"in {PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE}")
+            return
+
+        section = config[instance_name]
+        self.device = instance_name
+        collectd.info(f"{PLUGIN} config found: device={self.device}")
+
+        if 'smc_socket_path' in section:
+            self.socket_path = section['smc_socket_path']
+            collectd.info(f"{PLUGIN} config found: socket_path={self.socket_path}")
+        if 'source' in section:
+            self.source = section['source'].split(',')[0]
+            collectd.info(f"{PLUGIN} config found: source={self.source}")
+        if 'interface' in section:
+            self.interface = section['interface']
+            collectd.info(f"{PLUGIN} config found: interface={self.interface}")
+        if 'holdover_ql' in section:
+            self.holdover_ql = int(section['holdover_ql'], 0)
+            collectd.info(f"{PLUGIN} config found: holdover_ql={self.holdover_ql}")
+        if 'freerun_ql' in section:
+            self.freerun_ql = int(section['freerun_ql'], 0)
+            collectd.info(f"{PLUGIN} config found: freerun_ql={self.freerun_ql}")
+
+        collectd.info(f"{PLUGIN} loaded monitoring config for [{instance_name}]")
 
     def init(self):
         if obj.config_complete() is False:
@@ -98,7 +194,7 @@ class SynceController:
 
     def read(self):
         if not all([self._dpll, self.socket_path, self.device,
-                    self.interface]):
+                    self.interface, self.clock_id]):
             if not self._config_logged:
                 collectd.info(f"{PLUGIN} disabled: incomplete config")
                 self._config_logged = True
@@ -127,11 +223,11 @@ class SynceController:
             self._raise_alarm(status)
 
     def _get_dpll_status(self):
-        """Get EEC DPLL lock status (first EEC device)."""
+        """Get EEC DPLL lock status for our clock_id."""
         try:
             devices = self._dpll.get_all_devices()
             for d in devices:
-                if d.dev_type == DeviceType.EEC:
+                if d.dev_type == DeviceType.EEC and d.dev_clock_id == self.clock_id:
                     return d.lock_status
             return None
         except Exception as e:
@@ -237,6 +333,7 @@ _ctrl = SynceController()
 
 
 def init_func():
+    collectd.info(f"{PLUGIN} init called")
     _ctrl.config()
     _ctrl.init()
 

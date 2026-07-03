@@ -9,6 +9,7 @@
 import os
 import sys
 import unittest
+import configparser
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -56,10 +57,12 @@ class TestSynceController(unittest.TestCase):
 
     def setUp(self):
         self.ctrl = synce.SynceController()
-        # Provide required config so read() guard passes
+        # Set required config values for tests
         self.ctrl.socket_path = '/tmp/synce4l_socket_synce1'
         self.ctrl.device = 'synce1'
         self.ctrl.interface = 'eno8303'
+        self.ctrl.clock_id = 12345678
+        self.ctrl._dpll = MagicMock()
         synce.obj.base_eid = 'host=controller-0.synce'
         self.ctrl._alarm_eid = 'host=controller-0.synce.interface=eno8303.synce=source-loss'
         synce.fm_api.Fault.reset_mock()
@@ -109,7 +112,6 @@ class TestSynceController(unittest.TestCase):
 
     def test_read_no_change_skips_set(self):
         """If QL hasn't changed, don't re-send."""
-        self.ctrl._dpll = MagicMock()
         self.ctrl._last_ql = 0x0f
         self.ctrl._get_dpll_status = MagicMock(
             return_value=MockLockStatus.UNLOCKED)
@@ -119,7 +121,6 @@ class TestSynceController(unittest.TestCase):
 
     def test_read_state_change_triggers_set(self):
         """State change triggers SET_QL."""
-        self.ctrl._dpll = MagicMock()
         self.ctrl._last_ql = None  # was pass-through
         self.ctrl._get_dpll_status = MagicMock(
             return_value=MockLockStatus.HOLDOVER)
@@ -182,37 +183,100 @@ class TestSynceController(unittest.TestCase):
         self.ctrl._clear_alarm()
         self.ctrl._api.clear_fault.assert_not_called()
 
-    def test_dpll_status_returns_first_eec(self):
-        """_get_dpll_status returns the first EEC device found."""
-        mock_pps = MagicMock()
-        mock_pps.dev_type = MockDeviceType.PPS
-        mock_pps.lock_status = MockLockStatus.UNLOCKED
+    def test_dpll_status_matches_by_clock_id(self):
+        """_get_dpll_status finds EEC device matching clock_id."""
+        mock_dev1 = MagicMock()
+        mock_dev1.dev_type = MockDeviceType.EEC
+        mock_dev1.dev_clock_id = 99999
+        mock_dev1.lock_status = MockLockStatus.LOCKED
 
-        mock_eec = MagicMock()
-        mock_eec.dev_type = MockDeviceType.EEC
-        mock_eec.lock_status = MockLockStatus.HOLDOVER
+        mock_dev2 = MagicMock()
+        mock_dev2.dev_type = MockDeviceType.EEC
+        mock_dev2.dev_clock_id = 12345678
+        mock_dev2.lock_status = MockLockStatus.HOLDOVER
 
         self.ctrl._dpll = MagicMock()
-        self.ctrl._dpll.get_all_devices.return_value = [mock_pps, mock_eec]
+        self.ctrl._dpll.get_all_devices.return_value = [mock_dev1, mock_dev2]
 
         result = self.ctrl._get_dpll_status()
         self.assertEqual(result, MockLockStatus.HOLDOVER)
 
-    def test_dpll_status_skips_non_eec(self):
-        """_get_dpll_status returns None if no EEC device present."""
-        mock_pps = MagicMock()
-        mock_pps.dev_type = MockDeviceType.PPS
-        mock_pps.lock_status = MockLockStatus.LOCKED
+    def test_dpll_status_returns_none_if_no_clock_id_match(self):
+        """_get_dpll_status returns None if no EEC matches clock_id."""
+        self.ctrl.clock_id = 99999999
+
+        mock_dev = MagicMock()
+        mock_dev.dev_type = MockDeviceType.EEC
+        mock_dev.dev_clock_id = 12345678
+        mock_dev.lock_status = MockLockStatus.LOCKED
 
         self.ctrl._dpll = MagicMock()
-        self.ctrl._dpll.get_all_devices.return_value = [mock_pps]
+        self.ctrl._dpll.get_all_devices.return_value = [mock_dev]
 
         result = self.ctrl._get_dpll_status()
         self.assertIsNone(result)
 
+    def test_read_skips_when_clock_id_missing(self):
+        """read() bails out if clock_id is not set."""
+        self.ctrl.clock_id = None
+        self.ctrl._get_dpll_status = MagicMock()
+        self.ctrl.read()
+        self.ctrl._get_dpll_status.assert_not_called()
+
+    def test_read_skips_when_dpll_is_none(self):
+        """read() bails out if _dpll is None (no EEC hardware)."""
+        self.ctrl._dpll = None
+        self.ctrl._get_dpll_status = MagicMock()
+        self.ctrl.read()
+        self.ctrl._get_dpll_status.assert_not_called()
+
+    def test_init_disables_if_no_eec_device(self):
+        """init() sets _dpll to None if no EEC device found."""
+        mock_pps = MagicMock()
+        mock_pps.dev_type = MockDeviceType.PPS
+
+        mock_dpll = MagicMock()
+        mock_dpll.get_all_devices.return_value = [mock_pps]
+
+        with patch('synce.NetlinkDPLL', return_value=mock_dpll):
+            with patch('synce.fm_api.FaultAPIs'):
+                self.ctrl.init()
+
+        self.assertIsNone(self.ctrl._dpll)
+
+    def test_load_monitoring_config(self):
+        """_load_monitoring_config sets values from config section."""
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string(
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+            "source GNSS\n"
+            "holdover_ql 0x04\n"
+            "freerun_ql 0x0f\n"
+        )
+        self.ctrl._load_monitoring_config('synce1', config)
+
+        self.assertEqual(self.ctrl.device, 'synce1')
+        self.assertEqual(self.ctrl.socket_path, '/tmp/synce4l_socket_synce1')
+        self.assertEqual(self.ctrl.interface, 'eno8303')
+        self.assertEqual(self.ctrl.source, 'GNSS')
+        self.assertEqual(self.ctrl.holdover_ql, 0x04)
+        self.assertEqual(self.ctrl.freerun_ql, 0x0f)
+
+    def test_load_monitoring_config_missing_section(self):
+        """_load_monitoring_config handles missing section gracefully."""
+        ctrl = synce.SynceController()
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string("[other]\ninterface eth0\n")
+        ctrl._load_monitoring_config('synce1', config)
+
+        # Values remain None (not set)
+        self.assertIsNone(ctrl.device)
+        self.assertIsNone(ctrl.socket_path)
+
     def test_read_recovery_clears_ql_and_alarm(self):
         """DPLL returns to LOCKED: QL override cleared, alarm cleared."""
-        self.ctrl._dpll = MagicMock()
         self.ctrl._last_ql = 0x04  # was in holdover
         self.ctrl._alarm_raised = True
         self.ctrl._alarm_severity = 'major'
@@ -226,7 +290,6 @@ class TestSynceController(unittest.TestCase):
 
     def test_set_ql_failure_still_raises_alarm(self):
         """Alarm raised even when SET_QL socket fails (retry on next read)."""
-        self.ctrl._dpll = MagicMock()
         self.ctrl._last_ql = None
         self.ctrl._api = MagicMock()
         self.ctrl._api.set_fault.return_value = 'uuid-fail'
@@ -240,20 +303,121 @@ class TestSynceController(unittest.TestCase):
         self.ctrl._api.set_fault.assert_called_once()
         self.assertTrue(self.ctrl._alarm_raised)
 
-    def test_read_guard_incomplete_config(self):
-        """read() returns early with one-time log when config is incomplete."""
-        ctrl = synce.SynceController()
-        # Leave socket_path/device/interface as None (unconfigured)
-        ctrl._dpll = MagicMock()  # init ran, but no config
-        ctrl._get_dpll_status = MagicMock()
+    def test_config_no_synce4l_files(self):
+        """Early return when no synce4l-*.conf files exist."""
+        with patch('synce.glob', return_value=[]):
+            ctrl = synce.SynceController()
+            ctrl.config()
+            self.assertIsNone(ctrl.instance_name)
 
-        ctrl.read()
-        ctrl._get_dpll_status.assert_not_called()
-        self.assertTrue(ctrl._config_logged)
+    def test_config_empty_monitoring_conf(self):
+        """Early return when instance-monitoring.conf has no sections."""
+        def fake_read(self_cfg, filename):
+            pass  # simulate missing or empty file
 
-        # Second call: still skips, no duplicate log
-        ctrl.read()
-        ctrl._get_dpll_status.assert_not_called()
+        with patch('synce.glob', return_value=['/etc/linuxptp/ptpinstance/synce4l-synce1.conf']):
+            with patch.object(configparser.ConfigParser, 'read', fake_read):
+                ctrl = synce.SynceController()
+                ctrl.config()
+
+        self.assertIsNone(ctrl.instance_name)
+        self.assertIsNone(ctrl.socket_path)
+
+    def test_config_clock_id_missing_logs_warning(self):
+        """Warning logged when clock_id not found in synce4l config."""
+        fake_synce_conf = (
+            "[<synce1>]\n"
+            "# no clock_id here\n"
+        )
+        fake_monitoring_conf = (
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+        )
+
+        def fake_read(self_cfg, filename):
+            if 'instance-monitoring' in filename:
+                self_cfg.read_string(fake_monitoring_conf)
+            else:
+                self_cfg.read_string(fake_synce_conf)
+
+        import collectd as mock_collectd
+        mock_collectd.warning.reset_mock()
+
+        with patch('synce.glob', return_value=['/etc/linuxptp/ptpinstance/synce4l-synce1.conf']):
+            with patch.object(configparser.ConfigParser, 'read', fake_read):
+                ctrl = synce.SynceController()
+                ctrl.config()
+
+        self.assertIsNone(ctrl.clock_id)
+        # Verify warning was logged about missing clock_id
+        warning_calls = [str(c) for c in mock_collectd.warning.call_args_list]
+        self.assertTrue(any('clock_id' in c for c in warning_calls))
+
+    def test_config_ignores_extra_instances(self):
+        """Logs ignored instances when multiple synce4l configs exist."""
+        fake_synce_conf = (
+            "[<synce1>]\n"
+            "clock_id 12345\n"
+        )
+        fake_monitoring_conf = (
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+        )
+
+        def fake_read(self_cfg, filename):
+            if 'instance-monitoring' in filename:
+                self_cfg.read_string(fake_monitoring_conf)
+            else:
+                self_cfg.read_string(fake_synce_conf)
+
+        import collectd as mock_collectd
+        mock_collectd.info.reset_mock()
+
+        with patch('synce.glob', return_value=[
+            '/etc/linuxptp/ptpinstance/synce4l-synce1.conf',
+            '/etc/linuxptp/ptpinstance/synce4l-synce2.conf',
+        ]):
+            with patch.object(configparser.ConfigParser, 'read', fake_read):
+                ctrl = synce.SynceController()
+                ctrl.config()
+
+        self.assertEqual(ctrl.instance_name, 'synce1')
+        # Verify info log about ignored instances
+        info_calls = [str(c) for c in mock_collectd.info.call_args_list]
+        self.assertTrue(any('ignoring' in c.lower() for c in info_calls))
+
+    def test_config_happy_path(self):
+        """Discovers instance, loads clock_id + monitoring params."""
+        fake_synce_conf = (
+            "[<synce1>]\n"
+            "clock_id 12345\n"
+        )
+        fake_monitoring_conf = (
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+            "source GNSS\n"
+            "holdover_ql 0x04\n"
+            "freerun_ql 0x0f\n"
+        )
+
+        def fake_read(self_cfg, filename):
+            if 'instance-monitoring' in filename:
+                self_cfg.read_string(fake_monitoring_conf)
+            else:
+                self_cfg.read_string(fake_synce_conf)
+
+        with patch('synce.glob', return_value=['/etc/linuxptp/ptpinstance/synce4l-synce1.conf']):
+            with patch.object(configparser.ConfigParser, 'read', fake_read):
+                ctrl = synce.SynceController()
+                ctrl.config()
+
+        self.assertEqual(ctrl.instance_name, 'synce1')
+        self.assertEqual(ctrl.clock_id, 12345)
+        self.assertEqual(ctrl.socket_path, '/tmp/synce4l_socket_synce1')
+        self.assertEqual(ctrl.interface, 'eno8303')
 
 
 if __name__ == '__main__':
