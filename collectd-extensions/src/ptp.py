@@ -86,7 +86,14 @@ DUMMY_INTERFACE = 'dummy'
 
 NANOSECONDS_IN_A_SECOND = 1000000000
 NTP_EPOCH_OFFSET = 2208988800
-leap_seconds_offset = None
+leap_seconds_file = None
+
+# Leap second flag management constants (seconds)
+LEAP_BEFORE_EVENT = 12 * 3600   # 12 hours before the event
+LEAP_AFTER_EVENT = 6 * 3600   # 6 hours after the event
+
+# Leap-seconds file parse cache (mtime-based)
+_leapfile_cache = {'filepath': None, 'mtime': 0, 'result': (None, None)}
 
 
 def _get_os_release():
@@ -412,6 +419,9 @@ class PTP_ctrl_object:
         self.ptp4l_time_source = None
         self.ptp4l_utc_offset_nanoseconds = 37 * NANOSECONDS_IN_A_SECOND
         self.ptp4l_announce_settings = {}
+
+        # Leap second state tracking (for state-transition logging)
+        self._previous_leap_state = None
 
         # Alarm objects
         self.nolock_alarm_object = None
@@ -1713,24 +1723,24 @@ def initialize_ptp4l_state_fields(instance):
         ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s currentUtcOffset is initialized to %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
-    elif ctrl.prtc_present and leap_seconds_offset is not None:
-        ctrl.ptp4l_current_utc_offset = leap_seconds_offset
+    elif ctrl.prtc_present and (leapfile_offset := get_leap_seconds_offset()) is not None:
+        ctrl.ptp4l_current_utc_offset = leapfile_offset
         ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s currentUtcOffset is not specified, GrandMaster detected, "
                       "initializing to %s from leap seconds file"
-                      % (PLUGIN, instance, str(leap_seconds_offset)))
+                      % (PLUGIN, instance, str(leapfile_offset)))
     elif 'currentUtcOffset' in data.keys():
         # currentUtcOffset is not configured, use value from query if available
         ctrl.ptp4l_current_utc_offset = data['currentUtcOffset']
         ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
         collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
                       % (PLUGIN, instance, str(ctrl.ptp4l_current_utc_offset)))
-    elif leap_seconds_offset is not None:
-        ctrl.ptp4l_current_utc_offset = leap_seconds_offset
+    elif (leapfile_offset := get_leap_seconds_offset()) is not None:
+        ctrl.ptp4l_current_utc_offset = leapfile_offset
         ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
-        collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s"
+        collectd.info("%s Instance %s currentUtcOffset is not specified, initializing to %s "
                       "from leap seconds file"
-                      % (PLUGIN, instance, str(leap_seconds_offset)))
+                      % (PLUGIN, instance, str(leapfile_offset)))
     else:
         # currentUtcOffset not in config, query response or leap seconds file, keep default value (37)
         collectd.info("%s Instance %s currentUtcOffset not available, using default %s"
@@ -1810,12 +1820,11 @@ def read_ts2phc_config():
             primary_interface = None
             is_alarm_objects_created = False
             if instance.config.has_section('global'):
+                global leap_seconds_file
                 leap_seconds_file = instance.config['global'].get('leapfile', None)
                 if leap_seconds_file:
-                    global leap_seconds_offset
-                    # leap_seconds_offset is global, so if there is more than one instance of
-                    # ts2phc with a valid leapfile, the last instance's value will be persistent
-                    leap_seconds_offset = get_latest_offset_from_leapfile(leap_seconds_file)
+                    # Validate that the leapfile is parseable at startup
+                    leap_seconds_offset = get_leap_seconds_offset()
                     if leap_seconds_offset is not None:
                         collectd.info(
                             "%s ts2phc instance %s utc offset "
@@ -2218,18 +2227,57 @@ def handle_ptp4l_g8275_fields(instance):
             ctrl.ptp4l_announce_settings['frequencyTraceable'] = new_freq_traceable
             ctrl.ptp4l_frequency_traceable = new_freq_traceable
 
-    if ctrl.prtc_present and leap_seconds_offset is not None:
-        leap_seconds_offset_differs = (
-            'currentUtcOffset' in data_grandmaster_settings.keys() and
-            data_grandmaster_settings['currentUtcOffset'] != leap_seconds_offset
-        )
-        if ctrl.ptp4l_current_utc_offset != leap_seconds_offset or leap_seconds_offset_differs:
-            collectd.info("%s Updating UTC offset fields for instance %s" %
-                          (PLUGIN, instance))
+    if ctrl.prtc_present and (leap_seconds_offset := get_leap_seconds_offset()) is not None:
+        # Check if the offset from the leapfile differs from current
+        if ctrl.ptp4l_current_utc_offset != leap_seconds_offset:
+            collectd.info(
+                "%s Instance %s currentUtcOffset updated from %d to %d "
+                "from leap seconds file" %
+                (PLUGIN, instance, ctrl.ptp4l_current_utc_offset,
+                 leap_seconds_offset))
             ctrl.ptp4l_current_utc_offset = leap_seconds_offset
-            ctrl.ptp4l_utc_offset_nanoseconds = ctrl.ptp4l_current_utc_offset * NANOSECONDS_IN_A_SECOND
+            ctrl.ptp4l_utc_offset_nanoseconds = leap_seconds_offset * NANOSECONDS_IN_A_SECOND
             ctrl.ptp4l_announce_settings['currentUtcOffset'] = leap_seconds_offset
             ctrl.ptp4l_announce_settings['currentUtcOffsetValid'] = 1
+
+        # Leap second flag management for T-GM mode
+        # NOTE: This function is only called for non-derived instances
+        # (derived instances go through process_ptp4l_derived instead).
+        # Only apply when disciplined by ts2phc (T-GM) and DPLL is locked or holdover
+        if ctrl.disciplined_by_ts2phc and obj.capabilities['ts2phc_source'] == 'nmea' and \
+                ctrl.ptp4l_prc_state in [
+                CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ, CLOCK_STATE_HOLDOVER]:
+            leap_result = get_leap_flags_for_gm(ctrl)
+            if leap_result is not None:
+                new_leap61 = leap_result['leap61']
+                new_leap59 = leap_result['leap59']
+                if (ctrl.ptp4l_announce_settings.get('leap61') != new_leap61 or
+                        ctrl.ptp4l_announce_settings.get('leap59') != new_leap59):
+                    collectd.info("%s instance %s leap flags changed: "
+                                  "leap61=%d leap59=%d" %
+                                  (PLUGIN, instance, new_leap61, new_leap59))
+                ctrl.ptp4l_announce_settings['leap61'] = new_leap61
+                ctrl.ptp4l_announce_settings['leap59'] = new_leap59
+            else:
+                # No leap event, file expired, or file missing — clear flags (safe default)
+                if (ctrl.ptp4l_announce_settings.get('leap61', 0) != 0 or
+                        ctrl.ptp4l_announce_settings.get('leap59', 0) != 0):
+                    collectd.info("%s instance %s no leap event, clearing flags" %
+                                  (PLUGIN, instance))
+                ctrl.ptp4l_announce_settings['leap61'] = 0
+                ctrl.ptp4l_announce_settings['leap59'] = 0
+        elif not ctrl.disciplined_by_ts2phc:
+            # Non-T-GM: don't touch leap flags (they come from upstream)
+            pass
+        else:
+            # T-GM but DPLL not locked/holdover — clear flags for safety
+            if (ctrl.ptp4l_announce_settings.get('leap61', 0) != 0 or
+                    ctrl.ptp4l_announce_settings.get('leap59', 0) != 0):
+                collectd.info("%s instance %s DPLL not locked/holdover "
+                              "(state=%s), clearing leap flags" %
+                              (PLUGIN, instance, str(ctrl.ptp4l_prc_state)))
+            ctrl.ptp4l_announce_settings['leap61'] = 0
+            ctrl.ptp4l_announce_settings['leap59'] = 0
 
     gm_settings_to_write = OrderedDict(data_grandmaster_settings)
     gm_settings_to_write.update(ctrl.ptp4l_announce_settings)
@@ -2381,39 +2429,288 @@ def check_phc2sys_offset():
 # before a scheduled leap second, the entry is correctly ignored (future timestamp). 
 # Once the leap second occurs and the timestamp becomes valid, collectd still holds
 # the old value, so a patch with a new leapfile needs to perform a service restart.
-def get_latest_offset_from_leapfile(filepath):
-    """Parse a leap-seconds.list file and return the latest TAI-UTC offset.
 
-    The leap-seconds.list file contains data lines with the format:
-      <NTP_timestamp>  <TAI-UTC_offset>  # <date_comment>
 
-    Returns the TAI-UTC offset (int) from the entry with the highest
-    NTP timestamp, or None if the file cannot be parsed.
+def parse_leapfile(filepath):
+    """Parse a leap-seconds.list file into structured data.
+
+    The leap-seconds.list file contains:
+      - Comment lines starting with '#'
+      - A special '#@' line with the file expiration NTP timestamp
+      - Data lines: <NTP_timestamp> <TAI-UTC_offset> [# comment]
+
+    Each data line indicates that at the given NTP timestamp, the TAI-UTC
+    offset changes to the given value.
+
+    Uses mtime-based caching to avoid redundant file I/O — the file only
+    changes on package update (once every 6 months at most).
+
+    Returns:
+        tuple: (expiration_ntp, entries) where entries is a sorted list of
+               (ntp_timestamp, tai_utc_offset) tuples.
+        Returns (None, None) on error.
     """
-    latest_offset = None
-    now_ntp = int(time.time()) + NTP_EPOCH_OFFSET
+    global _leapfile_cache
+
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        return None, None
+
+    if (filepath == _leapfile_cache['filepath'] and
+            mtime == _leapfile_cache['mtime']):
+        return _leapfile_cache['result']
+
+    expiration_ntp = None
+    entries = []
+
     try:
         with open(filepath, 'r') as f:
             for line in f:
                 line = line.strip()
-                # Skip blank lines, comment lines, and special markers
-                if not line or line.startswith('#'):
+                if not line:
+                    continue
+                if line.startswith('#@'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            expiration_ntp = int(parts[1])
+                        except ValueError:
+                            pass
+                    continue
+                if line.startswith('#'):
                     continue
                 parts = line.split()
                 if len(parts) >= 2:
                     try:
-                        timestamp = int(parts[0])
-                        offset = int(parts[1])
-                        if timestamp <= now_ntp:
-                            latest_offset = offset
+                        entries.append((int(parts[0]), int(parts[1])))
                     except ValueError:
                         continue
     except (IOError, OSError) as e:
         collectd.error("%s failed to read leap seconds file %s (%s)" %
                        (PLUGIN, filepath, str(e)))
+        return None, None
+
+    if not entries:
+        collectd.error("%s leap seconds file %s has no valid entries" %
+                       (PLUGIN, filepath))
+        return None, None
+
+    entries.sort(key=lambda x: x[0])
+
+    _leapfile_cache = {'filepath': filepath, 'mtime': mtime,
+                       'result': (expiration_ntp, entries)}
+    return expiration_ntp, entries
+
+
+def _find_relevant_leap_event(entries, now_ntp):
+    """Find a relevant leap event relative to the current time.
+
+    Looks for the next future leap event or a recent past event still
+    within the post-leap observation window.
+
+    A leap event is relevant if:
+      - It is in the future (upcoming leap second), or
+      - It occurred recently (within 2 * LEAP_AFTER_EVENT seconds) so that
+        both during_leap and post_leap states can be properly detected
+        and logged by get_leapfile_state().
+
+    The wider window (2x) ensures that after the 6-hour flag-active period,
+    get_leapfile_state() can still reach the 'post_leap' branch for one
+    observation cycle before the event becomes fully irrelevant.
+
+    Returns a dict with event details, or None.
+    """
+
+    # Look for first future event
+    for i, (timestamp, offset) in enumerate(entries):
+        if timestamp > now_ntp:
+            offset_before = entries[i - 1][1] if i > 0 else (offset - 1)
+            return {
+                'ntp_timestamp': timestamp,
+                'offset_after': offset,
+                'offset_before': offset_before,
+                'is_positive': offset > offset_before,
+            }
+
+    # No future event — check if most recent is within post-leap
+    # observation window (2 * LEAP_AFTER_EVENT covers both the 6h
+    # flag-active period and the subsequent post_leap transition)
+    if len(entries) >= 2:
+        last_ts, last_offset = entries[-1]
+        if last_ts <= now_ntp and (now_ntp - last_ts) <= 2 * LEAP_AFTER_EVENT:
+            offset_before = entries[-2][1]
+            return {
+                'ntp_timestamp': last_ts,
+                'offset_after': last_offset,
+                'offset_before': offset_before,
+                'is_positive': last_offset > offset_before,
+            }
+
+    return None
+
+
+def get_leapfile_state(filepath):
+    """Interpret the leap-seconds file relative to current time.
+
+    Single entry point that reads and evaluates the leapfile in one pass.
+    Computes the settled TAI-UTC offset and leap flag state.
+
+    The current_offset returned is the "settled" offset — only entries
+    whose timestamp is at least LEAP_AFTER_EVENT seconds in the past
+    are considered valid. This ensures the new offset is not adopted
+    until the post-leap window (6 hours) has fully elapsed.
+
+    Per IEEE 1588 / ITU-T G.8275.1:
+    - leap61 or leap59 must be set at least 12 hours before the leap second
+    - The flag must be cleared at least 6 hours after the leap second
+    - currentUtcOffset must be updated only after the 6-hour window
+
+    Returns a dict:
+        'current_offset': int — the settled TAI-UTC offset
+        'leap61': 0 or 1
+        'leap59': 0 or 1
+        'state': 'no_leap' | 'pre_leap' | 'during_leap' | 'post_leap'
+        'offset_after': int — offset that becomes valid after post-leap window
+                        (None if no relevant leap event)
+
+    Returns None if the file is missing, expired, or unparseable.
+    """
+    expiration_ntp, entries = parse_leapfile(filepath)
+    if entries is None:
         return None
 
-    return latest_offset
+    now_ntp = int(time.time()) + NTP_EPOCH_OFFSET
+
+    # Check expiration
+    if expiration_ntp is not None and now_ntp > expiration_ntp:
+        collectd.warning("%s leap-seconds file %s has expired, "
+                         "leap flags will not be set" % (PLUGIN, filepath))
+        return None
+
+    # Determine the settled offset: only entries that are at least
+    # LEAP_AFTER_EVENT seconds in the past are considered valid.
+    # This ensures we don't adopt a new offset until 6 hours after
+    # the leap event.
+    current_offset = None
+    for timestamp, offset in entries:
+        if timestamp <= now_ntp - LEAP_AFTER_EVENT:
+            current_offset = offset
+
+    if current_offset is None:
+        # No entry has settled yet — shouldn't happen with real files
+        # since the first entry is from 1972, but handle gracefully
+        collectd.warning("%s no settled offset in leap-seconds file %s" %
+                         (PLUGIN, filepath))
+        return None
+
+    # Find the relevant leap event (future or recent past)
+    leap_event = _find_relevant_leap_event(entries, now_ntp)
+
+    result = {
+        'current_offset': current_offset,
+        'leap61': 0,
+        'leap59': 0,
+        'state': 'no_leap',
+        'offset_after': None,
+    }
+
+    if leap_event is None:
+        return result
+
+    result['offset_after'] = leap_event['offset_after']
+    time_to_event = leap_event['ntp_timestamp'] - now_ntp
+
+    if time_to_event > LEAP_BEFORE_EVENT:
+        # Too early — no flags needed yet
+        result['state'] = 'no_leap'
+    elif time_to_event > 0:
+        # Within 12 hours before the event — set the flag
+        result['state'] = 'pre_leap'
+        if leap_event['is_positive']:
+            result['leap61'] = 1
+        else:
+            result['leap59'] = 1
+    elif -time_to_event <= LEAP_AFTER_EVENT:
+        # Within 6 hours after the event — flags still set,
+        # old offset still valid (current_offset reflects this)
+        result['state'] = 'during_leap'
+        if leap_event['is_positive']:
+            result['leap61'] = 1
+        else:
+            result['leap59'] = 1
+    else:
+        # Past the 6-hour window — flags cleared, new offset now valid
+        # (current_offset already reflects this due to the settled filter)
+        result['state'] = 'post_leap'
+
+    collectd.debug(
+        "%s get_leapfile_state: filepath=%s state=%s current_offset=%s "
+        "leap61=%d leap59=%d offset_after=%s" %
+        (PLUGIN, filepath, result['state'], result['current_offset'],
+         result['leap61'], result['leap59'], result['offset_after']))
+
+    return result
+
+
+def get_leap_seconds_offset():
+    """Return the current settled TAI-UTC offset from the leap-seconds file.
+
+    The returned offset respects the LEAP_AFTER_EVENT window — a new offset
+    from a leap event is not returned until 6 hours after the event.
+
+    Returns:
+        int or None: The current leap seconds offset, or None if unavailable.
+    """
+    if leap_seconds_file is None:
+        return None
+
+    state = get_leapfile_state(leap_seconds_file)
+    if state is None:
+        return None
+
+    return state['current_offset']
+
+
+def get_leap_flags_for_gm(ctrl):
+    """Evaluate leap flags for T-GM mode, with state-transition logging.
+
+    Re-reads the leap-seconds file on each call to handle:
+    - File updates without service restart
+    - Service restart during a leap window (re-evaluates from current time)
+
+    Returns the leapfile state dict from get_leapfile_state(), or None
+    if not applicable.
+    """
+    if leap_seconds_file is None:
+        return None
+
+    result = get_leapfile_state(leap_seconds_file)
+    if result is None:
+        return None
+
+    # Log state transitions (per-instance tracking via ctrl)
+    current_state = result['state']
+    previous_state = getattr(ctrl, '_previous_leap_state', None)
+    if previous_state != current_state:
+        if current_state == 'pre_leap':
+            flag_name = 'leap61' if result['leap61'] else 'leap59'
+            collectd.info("%s Leap second flag %s SET" %
+                          (PLUGIN, flag_name))
+        elif current_state == 'during_leap':
+            flag_name = 'leap61' if result['leap61'] else 'leap59'
+            collectd.info("%s Leap second occurred, flag %s still set" %
+                          (PLUGIN, flag_name))
+        elif current_state == 'post_leap':
+            collectd.info("%s Leap second flags CLEARED, "
+                          "currentUtcOffset updated to %s" %
+                          (PLUGIN, result['offset_after']))
+        elif current_state == 'no_leap' and previous_state is not None:
+            collectd.info("%s Leap second event window ended, "
+                          "normal operation" % PLUGIN)
+        ctrl._previous_leap_state = current_state
+
+    return result
 
 
 def set_utc_offset(instance):
@@ -2467,12 +2764,14 @@ def set_utc_offset(instance):
             if 'currentUtcOffsetValid ' in line:
                 utc_offset_valid = bool(int(line.split()[1]))
         if not utc_offset_valid:
-            if leap_seconds_offset is not None:
-                utc_offset = leap_seconds_offset
+            if (leapfile_offset := get_leap_seconds_offset()) is not None \
+                    and int(utc_offset) != leapfile_offset:
                 if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
-                    collectd.warning("%s currentUtcOffsetValid is %s, "
-                                     "using the default currentUtcOffset %s from leapfile" %
-                                     (PLUGIN, utc_offset_valid, utc_offset))
+                    collectd.warning("%s Instance %s currentUtcOffset updated from %s to %s "
+                                     "from leapfile (currentUtcOffsetValid is %s)" %
+                                     (PLUGIN, instance, utc_offset, leapfile_offset,
+                                      utc_offset_valid))
+                utc_offset = leapfile_offset
             else:
                 utc_offset = ctrl.ptp4l_current_utc_offset
                 if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
