@@ -68,7 +68,8 @@ class TestSynceController(unittest.TestCase):
         synce.fm_api.Fault.reset_mock()
 
     def test_status_to_ql_locked_returns_none(self):
-        """Locked state = pass-through (no override)."""
+        """Locked state with SyncE source = pass-through (no override)."""
+        self.ctrl.source = 'SYNCE'
         self.assertIsNone(self.ctrl._status_to_ql(MockLockStatus.LOCKED))
         self.assertIsNone(
             self.ctrl._status_to_ql(MockLockStatus.LOCKED_AND_HOLDOVER))
@@ -116,8 +117,9 @@ class TestSynceController(unittest.TestCase):
         self.ctrl._get_dpll_status = MagicMock(
             return_value=MockLockStatus.UNLOCKED)
         with patch.object(self.ctrl, '_set_ql') as mock_set:
-            self.ctrl.read()
-            mock_set.assert_not_called()
+            with patch.object(self.ctrl, '_raise_alarm'):
+                self.ctrl.read()
+                mock_set.assert_not_called()
 
     def test_read_state_change_triggers_set(self):
         """State change triggers SET_QL."""
@@ -276,15 +278,16 @@ class TestSynceController(unittest.TestCase):
         self.assertIsNone(ctrl.socket_path)
 
     def test_read_recovery_clears_ql_and_alarm(self):
-        """DPLL returns to LOCKED: QL override cleared, alarm cleared."""
+        """DPLL returns to LOCKED: QL set to static_ql, alarm cleared."""
         self.ctrl._last_ql = 0x04  # was in holdover
         self.ctrl._alarm_raised = True
         self.ctrl._alarm_severity = 'major'
         self.ctrl._api = MagicMock()
         self.ctrl._get_dpll_status = MagicMock(
             return_value=MockLockStatus.LOCKED)
-        self.ctrl.read()
-        self.assertIsNone(self.ctrl._last_ql)
+        with patch.object(self.ctrl, '_set_ql', return_value=True):
+            self.ctrl.read()
+        self.assertEqual(self.ctrl._last_ql, 0x02)  # static_ql (GNSS source)
         self.ctrl._api.clear_fault.assert_called_once()
         self.assertFalse(self.ctrl._alarm_raised)
 
@@ -418,6 +421,101 @@ class TestSynceController(unittest.TestCase):
         self.assertEqual(ctrl.clock_id, 12345)
         self.assertEqual(ctrl.socket_path, '/tmp/synce4l_socket_synce1')
         self.assertEqual(ctrl.interface, 'eno8303')
+
+    def test_status_to_ql_locked_gnss_returns_static_ql(self):
+        """Locked with GNSS source returns static_ql."""
+        self.ctrl.source = 'GNSS'
+        self.assertEqual(self.ctrl._status_to_ql(MockLockStatus.LOCKED),
+                         0x02)
+        self.assertEqual(
+            self.ctrl._status_to_ql(MockLockStatus.LOCKED_AND_HOLDOVER),
+            0x02)
+
+    def test_status_to_ql_locked_gnss_custom_static_ql(self):
+        """Locked with GNSS source returns custom static_ql."""
+        self.ctrl.source = 'GNSS'
+        self.ctrl.static_ql = 0x04
+        self.assertEqual(self.ctrl._status_to_ql(MockLockStatus.LOCKED),
+                         0x04)
+
+    def test_read_locked_gnss_sets_static_ql_no_alarm(self):
+        """LOCKED + GNSS sets static_ql and clears alarm."""
+        self.ctrl.source = 'GNSS'
+        self.ctrl._last_ql = None
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.LOCKED)
+        with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+            with patch.object(self.ctrl, '_clear_alarm') as mock_clear:
+                with patch.object(self.ctrl, '_raise_alarm') as mock_raise:
+                    self.ctrl.read()
+                    mock_set.assert_called_once_with(0x02)
+                    mock_clear.assert_called_once()
+                    mock_raise.assert_not_called()
+
+    def test_read_locked_synce_passthrough_no_alarm(self):
+        """LOCKED + SyncE source = pass-through, no SET_QL."""
+        self.ctrl.source = 'SYNCE'
+        self.ctrl._last_ql = 0x04  # was previously overriding
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.LOCKED)
+        with patch.object(self.ctrl, '_set_ql') as mock_set:
+            with patch.object(self.ctrl, '_clear_alarm') as mock_clear:
+                self.ctrl.read()
+                mock_set.assert_not_called()
+                mock_clear.assert_called_once()
+                self.assertIsNone(self.ctrl._last_ql)
+
+    def test_read_holdover_after_static_ql_raises_alarm(self):
+        """Transition from LOCKED/GNSS to HOLDOVER raises alarm."""
+        self.ctrl.source = 'GNSS'
+        self.ctrl._last_ql = 0x02  # was static_ql
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+            with patch.object(self.ctrl, '_raise_alarm') as mock_raise:
+                self.ctrl.read()
+                mock_set.assert_called_once_with(0x04)
+                mock_raise.assert_called_once_with(MockLockStatus.HOLDOVER)
+
+    def test_read_recovery_from_holdover_to_locked_gnss(self):
+        """Recovery from HOLDOVER to LOCKED/GNSS clears alarm."""
+        self.ctrl.source = 'GNSS'
+        self.ctrl._last_ql = 0x04  # was holdover_ql
+        self.ctrl._alarm_raised = True
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.LOCKED)
+        with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+            with patch.object(self.ctrl, '_clear_alarm') as mock_clear:
+                with patch.object(self.ctrl, '_raise_alarm') as mock_raise:
+                    self.ctrl.read()
+                    mock_set.assert_called_once_with(0x02)
+                    mock_clear.assert_called_once()
+                    mock_raise.assert_not_called()
+
+    def test_load_monitoring_config_reads_static_ql(self):
+        """_load_monitoring_config parses static_ql from config."""
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string(
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+            "source GNSS\n"
+            "static_ql 0x04\n"
+        )
+        self.ctrl._load_monitoring_config('synce1', config)
+        self.assertEqual(self.ctrl.static_ql, 0x04)
+
+    def test_load_monitoring_config_static_ql_default(self):
+        """static_ql remains default when not in config."""
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string(
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+        )
+        ctrl = synce.SynceController()
+        ctrl._load_monitoring_config('synce1', config)
+        self.assertEqual(ctrl.static_ql, 0x02)
 
 
 if __name__ == '__main__':

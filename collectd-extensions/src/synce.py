@@ -81,6 +81,7 @@ class SynceController:
         self.source = 'GNSS'
         self.holdover_ql = 0x04
         self.freerun_ql = 0x0f
+        self.static_ql = 0x02  # PRC — advertised when locked, no incoming SyncE
 
     def config(self):
         """Auto-discover from instance-monitoring.conf."""
@@ -166,6 +167,9 @@ class SynceController:
         if 'freerun_ql' in section:
             self.freerun_ql = int(section['freerun_ql'], 0)
             collectd.info(f"{PLUGIN} config found: freerun_ql={self.freerun_ql}")
+        if 'static_ql' in section:
+            self.static_ql = int(section['static_ql'], 0)
+            collectd.info(f"{PLUGIN} config found: static_ql={self.static_ql}")
 
         collectd.info(f"{PLUGIN} loaded monitoring config for [{instance_name}]")
 
@@ -207,9 +211,10 @@ class SynceController:
 
         ql = self._status_to_ql(status)
         if ql is None:
-            # locked - pass-through, no override
+            # locked with SyncE source - pass-through, no override
             if self._last_ql is not None:
-                collectd.info(f"{PLUGIN} DPLL locked, clearing QL override")
+                collectd.info(f"{PLUGIN} DPLL locked (SyncE source), "
+                              f"clearing QL override")
                 self._last_ql = None
             self._clear_alarm()
             return
@@ -220,6 +225,11 @@ class SynceController:
                           f"setting QL=0x{ql:02x}")
             if self._set_ql(ql):
                 self._last_ql = ql
+
+        # Alarm only for degraded states (holdover/freerun), not static_ql
+        if status in (LockStatus.LOCKED, LockStatus.LOCKED_AND_HOLDOVER):
+            self._clear_alarm()
+        else:
             self._raise_alarm(status)
 
     def _get_dpll_status(self):
@@ -237,7 +247,11 @@ class SynceController:
     def _status_to_ql(self, status):
         """Map DPLL lock status to QL value. None = pass-through."""
         if status in (LockStatus.LOCKED, LockStatus.LOCKED_AND_HOLDOVER):
-            return None  # pass-through
+            # If source is SyncE, pass-through (let synce4l use incoming QL)
+            # Otherwise, advertise static_ql (locked to GNSS/PTP, no incoming SyncE)
+            if self.source.upper() == 'SYNCE':
+                return None
+            return self.static_ql
         elif status == LockStatus.HOLDOVER:
             return self.holdover_ql
         else:
