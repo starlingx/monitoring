@@ -127,6 +127,13 @@ PTPINSTANCE_TS2PHC_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'ts2phc-*.conf'
 PTPINSTANCE_GNSS_MONITOR_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "gnss-monitor-*.conf"
 PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE_PATTERN = PTPINSTANCE_PATH + "instance-monitoring.conf"
 
+# dpll-mgr status file (written by dpll-mgr on state transitions)
+DPLL_MGR_STATUS_FILE = '/var/run/dpll_mgr/status.json'
+DPLL_MGR_FORMAT_VERSION = 1
+
+# dpll-mgr instance name discovered during init (singleton per host)
+_dpll_mgr_instance_name = None
+
 
 def _get_ptp_options_path():
     os_type = _get_os_release()
@@ -147,6 +154,7 @@ PTP_INSTANCE_TYPE_PHC2SYS = 'phc2sys'
 PTP_INSTANCE_TYPE_TS2PHC = 'ts2phc'
 PTP_INSTANCE_TYPE_CLOCK = 'clock'
 PTP_INSTANCE_TYPE_GNSS_MONITOR = "gnss-monitor"
+PTP_INSTANCE_TYPE_DPLL_MGR = 'dpll-mgr'
 
 # Tools used by plugin
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -200,6 +208,9 @@ ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION = 24
 ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS = 30
 ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT = 31
 ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB = 32
+
+# dpll-mgr Alarm codes
+ALARM_CAUSE__DPLL_MGR_HOLDOVER = 40
 
 # Run Phase
 RUN_PHASE__INIT = 0
@@ -736,6 +747,13 @@ def read_dpll_mgr_config():
     if not filenames:
         return
 
+    # Extract dpll-mgr instance name (singleton per host)
+    global _dpll_mgr_instance_name
+    filename = filenames[0]
+    basename = os.path.basename(filename)
+    if basename.startswith('dpll-mgr-') and basename.endswith('.json'):
+        _dpll_mgr_instance_name = basename[len('dpll-mgr-'):-len('.json')]
+
     # Collect UDS addresses from dpll-mgr channels
     managed_uds_paths = set()
     for filename in filenames:
@@ -769,6 +787,60 @@ def read_dpll_mgr_config():
                     ctrl.is_managed_by_dpll_mgr = True
                     collectd.info("%s Instance %s managed by dpll-mgr (uds=%s)"
                                   % (PLUGIN, instance_name, uds))
+
+    # Register dpll-mgr instance in ptpinstances for process monitoring
+    if _dpll_mgr_instance_name and _dpll_mgr_instance_name not in ptpinstances:
+        # Create alarm objects first (create_interface_alarm_objects checks
+        # ptpinstances — must be called before adding to ptpinstances)
+        create_interface_alarm_objects(
+            'dpll-mgr', _dpll_mgr_instance_name, PTP_INSTANCE_TYPE_DPLL_MGR)
+        # Now the ctrl object is in ptpinstances (created inside the function)
+        collectd.info("%s Registered dpll-mgr instance %s for "
+                      "process monitoring" % (PLUGIN, _dpll_mgr_instance_name))
+
+
+class AptsMgrStatus:
+    """Reader for dpll-mgr /var/run/dpll_mgr/status.json with mtime caching.
+
+    Used by collectd to monitor dpll-mgr managed instances. Reads the JSON
+    status file written by dpll-mgr on state transitions. Caches parsed data
+    and only re-reads when file mtime changes.
+    """
+
+    def __init__(self):
+        self._cache = None
+        self._mtime = 0
+
+    def read(self):
+        """Read status.json, using cache if file unchanged.
+
+        Returns:
+            dict: Parsed status data, or None if file missing/invalid.
+        """
+        try:
+            mtime = os.path.getmtime(DPLL_MGR_STATUS_FILE)
+            if mtime == self._mtime and self._cache is not None:
+                return self._cache
+            with open(DPLL_MGR_STATUS_FILE, 'r') as f:
+                data = json.load(f)
+            if data.get('format_version') != DPLL_MGR_FORMAT_VERSION:
+                collectd.warning(
+                    "%s dpll-mgr status.json unknown format_version: %s"
+                    % (PLUGIN, data.get('format_version')))
+                return None
+            self._cache = data
+            self._mtime = mtime
+            return data
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, OSError) as exc:
+            collectd.warning(
+                "%s Failed to read dpll-mgr status: %s" % (PLUGIN, exc))
+            return None
+
+
+# Module-level dpll-mgr status reader instance
+_dpll_mgr_status = AptsMgrStatus()
 
 
 class ConfigDict:
@@ -1340,6 +1412,17 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
         ALARM_OBJ_LIST.append(o)
         ctrl.nolock_alarm_object = o
+
+        o = PTP_alarm_object(instance)
+        o.alarm = ALARM_CAUSE__DPLL_MGR_HOLDOVER
+        o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
+        o.reason = obj.hostname
+        o.reason += ' DPLL holdover — timing reference lost'
+        o.repair = 'Check GNSS antenna connection and PTP network'
+        o.eid = obj.base_eid + '.instance=' + instance + '.ptp=holdover'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
+        ALARM_OBJ_LIST.append(o)
+        ctrl.holdover_alarm_object = o
 
         o = PTP_alarm_object(interface)
         # Ts2phc allows only a single GNSS source, create a single alarm obj for it
@@ -3677,6 +3760,108 @@ def check_1pps_signal(instance):
 #              check
 #
 #####################################################################
+
+
+def _check_dpll_mgr_state():
+    """Check dpll-mgr status.json and raise/clear holdover alarms.
+
+    Called once per audit cycle from read_func(). Reads the status file
+    written by dpll-mgr and raises appropriate alarms based on lock status.
+    Only acts if dpll-mgr managed instances exist on this host.
+    """
+    # Use the dpll-mgr instance registered in ptpinstances
+    if _dpll_mgr_instance_name is None:
+        return  # No dpll-mgr on this host
+
+    dpll_mgr_instance = _dpll_mgr_instance_name
+    ctrl = ptpinstances.get(dpll_mgr_instance)
+    if ctrl is None:
+        return
+
+    # Skip status check if process alarm is raised (file is stale)
+    if ctrl.process_alarm_object.raised is True:
+        return
+
+    status = _dpll_mgr_status.read()
+    if status is None:
+        return  # No status file — dpll-mgr may not have started yet
+
+    lock = status.get('dpll_lock_status')
+    ever_locked = status.get('ever_locked', False)
+
+    # Log dpll-mgr service and state (same pattern as other PTP instances)
+    dpll_mgr_service = "dpll-mgr@" + dpll_mgr_instance + ".service"
+    is_running = is_service_running(dpll_mgr_service)
+    collectd.info("%s PTP service %s admin state:enabled running:%s"
+                  % (PLUGIN, dpll_mgr_service, is_running))
+    collectd.info("%s dpll-mgr %s lock_status=%s current_master=%s "
+                  "previous_master=%s"
+                  % (PLUGIN, dpll_mgr_instance, lock,
+                     status.get('current_master', '?'),
+                     status.get('previous_master', '?')))
+    collectd.info("%s dpll-mgr %s in_holdover=%s holdover_level=%s "
+                  "holdover_duration_s=%s"
+                  % (PLUGIN, dpll_mgr_instance,
+                     status.get('in_holdover', '?'),
+                     status.get('holdover_level', '?'),
+                     status.get('holdover_duration_s', '?')))
+    collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s"
+                  % (PLUGIN, dpll_mgr_instance,
+                     status.get('gearshift', {}).get('ptp_bh', '-'),
+                     status.get('gearshift', {}).get('ts2_0', '-')))
+    collectd.info("%s dpll-mgr %s phase_offset_ns=%s drift_rate_ns_per_s=%s"
+                  % (PLUGIN, dpll_mgr_instance,
+                     status.get('phase_offset_ns', '?'),
+                     status.get('drift_rate_ns_per_s', '?')))
+    collectd.info("%s dpll-mgr %s ptp_port_state=%s connected_pin=%s "
+                  "ever_locked=%s operation_mode=%s"
+                  % (PLUGIN, dpll_mgr_instance,
+                     status.get('ptp_port_state', '?'),
+                     status.get('connected_pin', '?'),
+                     ever_locked,
+                     status.get('operation_mode', '?')))
+
+    if lock == 'holdover':
+        # Raise holdover alarm
+        ho_obj = ctrl.holdover_alarm_object
+        if ho_obj.raised is False:
+            collectd.info("%s dpll-mgr holdover detected for %s "
+                          "(master=%s, level=%s)"
+                          % (PLUGIN, dpll_mgr_instance,
+                             status.get('current_master'),
+                             status.get('holdover_level')))
+            if raise_alarm(ALARM_CAUSE__DPLL_MGR_HOLDOVER,
+                           dpll_mgr_instance) is True:
+                ho_obj.raised = True
+        # Clear no-lock if it was raised before holdover
+        if ctrl.nolock_alarm_object.raised is True:
+            if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
+                ctrl.nolock_alarm_object.raised = False
+
+    elif lock == 'unlocked' and ever_locked:
+        # Only alarm after first lock achieved (boot grace)
+        if ctrl.nolock_alarm_object.raised is False:
+            collectd.info("%s dpll-mgr unlocked (loss of lock) for %s"
+                          % (PLUGIN, dpll_mgr_instance))
+            if raise_alarm(ALARM_CAUSE__NO_LOCK,
+                           dpll_mgr_instance) is True:
+                ctrl.nolock_alarm_object.raised = True
+
+    elif lock in ('locked', 'locked_ho_acq'):
+        # Clear both holdover and no-lock alarms on recovery
+        ho_obj = ctrl.holdover_alarm_object
+        if ho_obj.raised is True:
+            if clear_alarm(ho_obj.eid) is True:
+                ho_obj.raised = False
+                collectd.info("%s dpll-mgr holdover cleared for %s"
+                              % (PLUGIN, dpll_mgr_instance))
+        if ctrl.nolock_alarm_object.raised is True:
+            if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
+                ctrl.nolock_alarm_object.raised = False
+                collectd.info("%s dpll-mgr lock recovered for %s"
+                              % (PLUGIN, dpll_mgr_instance))
+
+
 def read_func():
     if obj.virtual is True:
         return 0
@@ -3812,7 +3997,8 @@ def read_func():
                         in [PTP_INSTANCE_TYPE_PTP4L,
                             PTP_INSTANCE_TYPE_PHC2SYS,
                             PTP_INSTANCE_TYPE_TS2PHC,
-                            PTP_INSTANCE_TYPE_GNSS_MONITOR]:
+                            PTP_INSTANCE_TYPE_GNSS_MONITOR,
+                            PTP_INSTANCE_TYPE_DPLL_MGR]:
                     # If the process is not running, raise the process alarm
                     if ctrl.process_alarm_object.raised is False:
                         collectd.error("%s PTP service %s enabled but not running" %
@@ -3904,6 +4090,10 @@ def read_func():
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR:
             process_gnss_monitor(ctrl)
+
+    # dpll-mgr state monitoring: read status.json and raise/clear alarms
+    # for managed instances. Done once per audit cycle (not per-instance).
+    _check_dpll_mgr_state()
 
     return 0
 
