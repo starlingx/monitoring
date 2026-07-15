@@ -52,6 +52,12 @@ override_dh_install:
 	install -m 700 ovs_interface.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 	install -m 700 service_res.py $(LOCAL_PYTHON_EXTENSIONS_DIR)
 
+	# troubleshoot tools
+	install -m 755 -d $(LOCAL_PYTHON_EXTENSIONS_DIR)/troubleshoot
+	install -m 700 troubleshoot/dpll_pin_control.py $(LOCAL_PYTHON_EXTENSIONS_DIR)/troubleshoot
+	install -m 700 troubleshoot/dpll_pin_info.py $(LOCAL_PYTHON_EXTENSIONS_DIR)/troubleshoot
+	install -m 644 troubleshoot/output_dpll_pin_info.txt $(LOCAL_PYTHON_EXTENSIONS_DIR)/troubleshoot
+
 	# collectd plugin conf files into /etc/collectd.d/starlingx
 	install -m 600 python_plugins.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
 	install -m 600 cpu.conf $(LOCAL_STARLINGX_PLUGIN_DIR)
