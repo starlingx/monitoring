@@ -3917,6 +3917,11 @@ def read_func():
                         else:
                             collectd.info("%s cleared startup alarm '%s'" %
                                           (PLUGIN, alarm.entity_instance_id))
+                    elif instance[0] == 'synce':
+                        # synce alarms are managed by the synce plugin;
+                        # do not clear them from the ptp plugin audit.
+                        collectd.debug("%s skipping synce alarm '%s'" %
+                                       (PLUGIN, alarm.entity_instance_id))
                     else:
 
                         if clear_alarm(eid) is False:
