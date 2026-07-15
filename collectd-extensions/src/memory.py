@@ -200,11 +200,13 @@ def get_cgroup_memory(path):
         pass
 
     # Calculate RSS usage in MiB
-    # v2 uses 'anon' instead of 'total_rss'
+    # v1: 'total_rss' includes child cgroup aggregation natively
+    #     (kernel sums recursively).
+    # v2: 'anon' only reports the local cgroup's memory — child
+    #     aggregation is not automatic. This is a limitation in v2.
     if pc.CGROUP_V2:
         rss = m.get('anon', 0)
     else:
-        # cgroup v1
         rss = m.get('total_rss', 0)
     memory['rss_MiB'] = float(rss) / float(pc.Mi)
 

@@ -28,7 +28,22 @@ import prettytable
 
 # Constants
 MEMINFO = '/proc/meminfo'
-MEMPATH = '/sys/fs/cgroup/memory/'
+CGROUP_ROOT = '/sys/fs/cgroup'
+
+# Detect cgroup version
+try:
+    CGROUP_V2 = (subprocess.check_output(
+        ["stat", "-fc", "%T", "/sys/fs/cgroup"],
+        text=True).strip() == "cgroup2fs")
+except (subprocess.CalledProcessError, OSError):
+    CGROUP_V2 = False
+
+if CGROUP_V2:
+    MEMPATH = CGROUP_ROOT + '/'
+    MEM_STAT_FIELD = 'anon'
+else:
+    MEMPATH = CGROUP_ROOT + '/memory/'
+    MEM_STAT_FIELD = 'total_rss'
 BYTES_IN_MEBIBYTE = 1048576
 KBYTE = 1024
 DECIMAL_DIGITS = 2
@@ -48,7 +63,7 @@ K8S_NAMESPACE_ADDON = ['monitor', 'openstack']
 
 # Used commands
 AWK_CMD = ["awk", "$2>0{print$0}"]
-GREP_CMD = ["grep", "-rs", "total_rss"]
+GREP_CMD = ["grep", "-rs", MEM_STAT_FIELD]
 
 # logger
 LOG = logging.getLogger(__name__)
@@ -346,8 +361,8 @@ def sys_service_memory():
         return 1
 
     for line in output.split("\n"):
-        service = line.split("memory.stat:total_rss ")[0]
-        rss_mem = line.split("memory.stat:total_rss ")[-1]
+        service = line.split("memory.stat:" + MEM_STAT_FIELD + " ")[0]
+        rss_mem = line.split("memory.stat:" + MEM_STAT_FIELD + " ")[-1]
         p_table.add_row(
             [service,
              mem_to_mebibytes(rss_mem),
