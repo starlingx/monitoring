@@ -1,0 +1,240 @@
+sudo python dpll_pin_info.py
+Password:
+Querying DPLL pin info via Netlink API (pynetlink)...
+
+========================================================================
+DPLL DEVICES
+========================================================================
+  ID= 0  clock=0xdb58ac2420dccb0f  type=eec   lock=locked-ho-acq   module=zl3073x
+  ID= 1  clock=0xdb58ac2420dccb0f  type=pps   lock=locked-ho-acq   module=zl3073x
+  ID= 2  clock=0x102e00ffff033950  type=eec   lock=locked          module=ice  PCI=0000:6c:00.0 (8 ports)
+
+========================================================================
+CGU DPLL PINS
+========================================================================
+
+  INPUTS:
+    ○ pin= 0 dev=0 [ETH01_SDP_TIMESYNC_2          ] EEC  (disconnected)
+    ○ pin= 0 dev=1 [ETH01_SDP_TIMESYNC_2          ] PPS  (disconnected)
+    ○ pin= 1 dev=0 [ETH01_SDP_TIMESYNC_0          ] EEC  (disconnected)
+    ○ pin= 1 dev=1 [ETH01_SDP_TIMESYNC_0          ] PPS  (disconnected)
+    ○ pin= 2 dev=0 [CLK_78M125_NAC0_SYNCE0        ] EEC  (disconnected)
+    ○ pin= 2 dev=1 [CLK_78M125_NAC0_SYNCE0        ] PPS  (disconnected)
+    ○ pin= 3 dev=0 [CLK_78M125_NAC0_SYNCE1        ] EEC  (disconnected)
+    ○ pin= 3 dev=1 [CLK_78M125_NAC0_SYNCE1        ] PPS  (disconnected)
+    ○ pin= 4 dev=0 [GNSS_10M_IN                   ] EEC  (disconnected)
+    ○ pin= 4 dev=1 [GNSS_10M_IN                   ] PPS  (disconnected)
+    ○ pin= 5 dev=0 [1EPPS_IN                      ] EEC  (disconnected)
+    ○ pin= 5 dev=1 [1EPPS_IN                      ] PPS  (disconnected)
+    ○ pin= 6 dev=0 [(none)                        ] EEC  (disconnected)
+    ○ pin= 6 dev=1 [(none)                        ] PPS  (disconnected)
+    ● pin= 7 dev=0 [GNSS_1PPS_IN                  ] EEC  (connected)
+    ● pin= 7 dev=1 [GNSS_1PPS_IN                  ] PPS  (connected)
+    ○ pin= 8 dev=0 [(none)                        ] EEC  (disconnected)
+    ○ pin= 8 dev=1 [(none)                        ] PPS  (disconnected)
+
+  OUTPUTS:
+    ● pin= 9 dev=0 [156M25_NAC0_CLKREF_SYNC       ] EEC  (connected)
+    ● pin=10 dev=0 [156M25_NAC0_TIMEREF_SYNC      ] EEC  (connected)
+    ● pin=11 dev=0 [(none)                        ] EEC  (connected)
+    ● pin=12 dev=0 [1PPS_OUT_SW_P                 ] EEC  (connected)
+    ● pin=13 dev=0 [(none)                        ] EEC  (connected)
+    ● pin=14 dev=0 [SYNC_25M                      ] EEC  (connected)
+    ● pin=15 dev=1 [(none)                        ] PPS  (connected)
+    ● pin=16 dev=1 [1PPS_OUT_SW_N                 ] PPS  (connected)
+    ● pin=17 dev=1 [EXT_10M_OUT_M2_SW             ] PPS  (connected)
+    ● pin=18 dev=1 [(none)                        ] PPS  (connected)
+    ● pin=19 dev=1 [1EPPS_OUT_SW                  ] PPS  (connected)
+    ● pin=20 dev=1 [EPPS_10M_ADD_IN_CARD_SYNC     ] PPS  (connected)
+    ● pin=21 dev=1 [(none)                        ] PPS  (connected)
+    ● pin=22 dev=1 [(none)                        ] PPS  (connected)
+    ● pin=23 dev=1 [ETH01_SDP_TIMESYNC_3          ] PPS  (connected)
+    ● pin=24 dev=1 [ETH01_SDP_TIMESYNC_1          ] PPS  (connected)
+
+========================================================================
+NIC DPLL PINS
+========================================================================
+
+   NIC clock=0x102e00ffff033950 PCI=0000:6c:00.0 ifaces=enp108s0f0,enp108s0f1,enp108s0f2,enp108s0f3,enp108s0f4,enp108s0f5,enp108s0f6,enp108s0f7
+     OUTPUTS:
+       ● pin=26 dev=2 [MAC-PHY-CLK] (connected)
+       ● pin=27 dev=2 [1588-TIME_REF] (connected)
+     INPUTS:
+       ● pin=25 dev=2 [1588-TIME_SYNC] (connected)
+
+========================================================================
+NIC DISCOVERY
+========================================================================
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  OBSERVED FACTS (directly read from system)                      │
+  └──────────────────────────────────────────────────────────────────┘
+
+  Interface        PCI            FW                             Source
+  ───────────────  ─────────────  ─────────────────────────────  ──────────
+  eno8303          0000:1b:00.0   4.03 0x80008111 1.3881.0       ethtool -i
+  eno8703          0000:13:00.0   4.03 0x80008113 1.3881.0       ethtool -i
+  enp108s0f0       0000:6c:00.0   1.12 0x80018116 1.3881.0       ethtool -i
+
+  NIC Type (derived from PCI Device ID via uevent):
+    eno8303          PCI_ID=8086:0x579E FW=4.03 0x80008111 1 → E825-C
+    eno8703          PCI_ID=8086:0x579E FW=4.03 0x80008113 1 → E825-C
+    enp108s0f0       PCI_ID=8086:0x12D3 FW=1.12 0x80018116 1 → E830 (Connorsville)
+
+  CGU Mode (from dmesg 'ice XXXX: PF is configured in ... mode'):
+    eno8303          0000:1b:00.0  → secondary
+    eno8703          0000:13:00.0  → primary
+
+  tspll_cfg sysfs (/sys/class/net/<iface>/device/tspll_cfg):
+    eno8303          NOT AVAILABLE (file missing or empty)
+    eno8703          PRESENT: SW conf: 156.25 MHz TIME_REF
+TSPLL: 156.25 MHz TIME_REF
+    enp108s0f0       NOT AVAILABLE (file missing or empty)
+
+  PTP Hardware Clock (ethtool -T):
+    eno8303          PTP HW clock: YES
+    eno8703          PTP HW clock: YES
+    enp108s0f0       PTP HW clock: YES
+
+  Pin Status per port (Netlink DPLL vs PTP sysfs):
+    Netlink = authoritative (active signal state from driver)
+    Sysfs   = configured function (intent, not proof of signal)
+
+    eno8303 (E825-C, 0000:1b:00.0)
+      Pin                  Netlink DPLL                        PTP sysfs
+      ───────────────────  ──────────────────────────────────  ─────────────────────────
+      (no netlink data)
+      1PPS                 (no netlink pin)                    1PPS=disabled
+      SDP0                 (no netlink pin)                    SDP0=disabled
+      SDP1                 (no netlink pin)                    SDP1=input
+      SDP2                 (no netlink pin)                    SDP2=disabled
+      SDP3                 (no netlink pin)                    SDP3=disabled
+      TIME_SYNC            (no netlink pin)                    TIME_SYNC=disabled
+
+    eno8703 (E825-C, 0000:13:00.0)
+      Pin                  Netlink DPLL                        PTP sysfs
+      ───────────────────  ──────────────────────────────────  ─────────────────────────
+      (no netlink data)
+      1PPS                 (no netlink pin)                    1PPS=disabled
+      SDP0                 (no netlink pin)                    SDP0=disabled
+      SDP1                 (no netlink pin)                    SDP1=input
+      SDP2                 (no netlink pin)                    SDP2=disabled
+      SDP3                 (no netlink pin)                    SDP3=disabled
+      TIME_SYNC            (no netlink pin)                    TIME_SYNC=disabled
+      TIMEREF              (not a DPLL pin)                    tspll_cfg=SW conf: 156.25 MHz TIME_REF
+TSPLL: 156.25 MHz TIME_REF
+
+    enp108s0f0 (E830, 0000:6c:00.0)
+      Pin                  Netlink DPLL                        PTP sysfs
+      ───────────────────  ──────────────────────────────────  ─────────────────────────
+      1588-TIME_SYNC       in state=connected                  SDP1=input
+      MAC-PHY-CLK          out state=connected
+      1588-TIME_REF        out state=connected                 SDP0=disabled
+      1PPS                 (no netlink pin)                    1PPS=disabled
+      SDP2                 (no netlink pin)                    SDP2=disabled
+      SDP3                 (no netlink pin)                    SDP3=disabled
+
+
+========================================================================
+PLATFORM TOPOLOGY DIAGRAM
+========================================================================
+
+    ┌───────────────────────────────────────────────────────────┐
+    │  GNSS Receiver                                           │
+    │  Input: GNSS_1PPS_IN                                       │
+    └──────────────────────────┬────────────────────────────────┘
+                               │
+                               ▼ 1PPS
+    ┌───────────────────────────────────────────────────────────┐
+    │  Shared DPLL: zl3073x                                      │
+    │  clock: 0xdb58ac2420dccb0f                              │
+    │  EEC lock: locked-ho-acq                                 │
+    │  PPS lock: locked-ho-acq                                 │
+    │                                                           │
+    │  Input Source Selection:                                   │
+    │    ★ ACTIVE: GNSS_1PPS_IN                               │
+    │                                                           │
+    │    Priority  Pin  Label                     State          │
+    │    ────────  ───  ────────────────────────── ─────────────  │
+    │  ►        0    7  GNSS_1PPS_IN               connected     │
+    │           2    6  (none)                     disconnected  │
+    │           3    5  1EPPS_IN                   disconnected  │
+    │          10    2  CLK_78M125_NAC0_SYNCE0     disconnected  │
+    │          11    3  CLK_78M125_NAC0_SYNCE1     disconnected  │
+    │          14    0  ETH01_SDP_TIMESYNC_2       disconnected  │
+    │          14    1  ETH01_SDP_TIMESYNC_0       disconnected  │
+    │          14    4  GNSS_10M_IN                disconnected  │
+    │          14    8  (none)                     disconnected  │
+    │                                                           │
+    │  Outputs (connected):                                      │
+    │    156M25_NAC0_CLKREF_SYNC                                │
+    │    156M25_NAC0_TIMEREF_SYNC                               │
+    │    (unnamed)                                              │
+    │    1PPS_OUT_SW_P                                          │
+    │    (unnamed)                                              │
+    │    SYNC_25M                                               │
+    │    (unnamed)                                              │
+    │    1PPS_OUT_SW_N                                          │
+    │    EXT_10M_OUT_M2_SW                                      │
+    │    (unnamed)                                              │
+    │    1EPPS_OUT_SW                                           │
+    │    EPPS_10M_ADD_IN_CARD_SYNC                              │
+    │    (unnamed)                                              │
+    │    (unnamed)                                              │
+    │    ETH01_SDP_TIMESYNC_3                                   │
+    │    ETH01_SDP_TIMESYNC_1                                   │
+    │                                                           │
+    │  Inputs (connected):                                       │
+    │    GNSS_1PPS_IN                                           │
+    │    GNSS_1PPS_IN                                           │
+    └───────┬───────────────────────────────────┬───────────────┘
+            │                                   │
+            ▼                                   ▼
+    ┌──────────────────────────────┐    ┌──────────────────────────────┐
+    │  E825-C NIC(s) (ice)          │    │  E830 NIC(s) (ice)           │
+    │                              │    │                              │
+    │  eno8303 / 0000:1b:00.0      │    │  enp108s0f0 / 0000:6c:00.0   │
+    │  ✗ Output pin (not seen)     │    │  ✓ PTP HW clock present      │
+    │  ✗ Input pin (not seen)      │    │  ✓ SDP1 in  ◄── CGU (1PPS)   │
+    │                              │    │  ✗ Freq ref (not seen)       │
+    │  eno8703 / 0000:13:00.0      │    │                              │
+    │  ✗ Output pin (not seen)     │    │                              │
+    │  ✗ Input pin (not seen)      │    │                              │
+    │  ✓ tspll_cfg present         │    │                              │
+    │                              │    │                              │
+    └──────────────────────────────┘    └──────────────────────────────┘
+
+  ─── Connection evidence ───
+  ✓ = Confirmed via DPLL netlink pin state or sysfs
+  ✗ = Not seen in software; may need board schematic confirmation
+
+========================================================================
+PIN LABEL LEGEND
+========================================================================
+
+  ZL3073x CGU Input pins (NIC feeds CGU):
+    ETH0x_SDP_TIMESYNC_0 + _2 = same physical NIC SDP0 wire (two DPLL engines)
+    CLK_78M125_NACx_SYNCEn    = NIC SyncE recovered clock
+    GNSS_1PPS_IN              = GNSS receiver 1PPS
+
+  ZL3073x CGU Output pins (CGU feeds NIC):
+    ETH0x_SDP_TIMESYNC_1 + _3 = same physical NIC SDP1 wire (two DPLL engines)
+    156M25_NACx_CLKREF_SYNC   = 156.25MHz clock reference to NIC
+    156M25_NACx_TIMEREF_SYNC  = 156.25MHz time reference to NIC
+    1PPS_OUT_SW_P/N           = 1PPS output to E830 (board-level)
+
+  E825-C NIC pins (ice driver):
+    1588-TIME_REF  = NIC SDP0 output → CGU (1PPS)
+    1588-TIME_SYNC = NIC SDP1 input  ← CGU (1PPS)
+    TIMEREF        = 156.25MHz frequency reference ← CGU
+    MAC-PHY-CLK    = NIC PHY clock output (SyncE TX)
+
+  E830 NIC pins (ice driver):
+    SDP1 input ← receives 1PPS from CGU
+    ts2phc synchronizes E830 PHC from this 1PPS signal
+
+  Physical wiring (same signal, multiple DPLL registrations):
+    NIC SDP0 pin = CGU TIMESYNC_0 + TIMESYNC_2 (one wire, two CGU inputs)
+    NIC SDP1 pin = CGU TIMESYNC_1 + TIMESYNC_3 (one wire, two CGU outputs)
+
+
