@@ -196,6 +196,7 @@ ALARM_CAUSE__UNSUPPORTED_SW = 5
 ALARM_CAUSE__UNSUPPORTED_LEGACY = 6
 ALARM_CAUSE__GNSS_SIGNAL_LOSS = 7
 ALARM_CAUSE__1PPS_SIGNAL_LOSS = 8
+ALARM_CAUSE__TSPLL_CFG_MISMATCH = 9
 
 # Phc2sys HA Alarm codes
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_SELECTION_CHANGE = 20
@@ -1524,6 +1525,19 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
             o.eid = obj.base_eid + '.phc2sys=' + instance + '.interface=' + interface + \
                 '.phc2sys=source-clock-no-prc-lock'
             o.cause = fm_constants.ALARM_PROBABLE_CAUSE_29  # loss-of-signal
+            ALARM_OBJ_LIST.append(o)
+
+            o = PTP_alarm_object(interface)
+            o.alarm = ALARM_CAUSE__TSPLL_CFG_MISMATCH
+            o.severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+            o.reason = obj.hostname
+            o.reason += ' tspll_cfg active state does not match configured value;'
+            o.reason += ' NIC frequency reference may be incorrect'
+            o.repair = 'Check that the NIC interface supports tspll_cfg (primary E825 NIC).'
+            o.repair += ' If using TIME_REF mode, verify CGU/tspll_cfg sysfs is available'
+            o.repair += ' and the requested frequency and clock source were applied successfully.'
+            o.eid = obj.base_eid + '.interface=' + interface + '.ptp=tspll-cfg-mismatch'
+            o.cause = fm_constants.ALARM_PROBABLE_CAUSE_7  # config error
             ALARM_OBJ_LIST.append(o)
 
             o = PTP_alarm_object(interface)
@@ -3691,6 +3705,137 @@ def check_gnss_signal(instance):
         ctrl.log_throttle_count += 1
 
 
+# Maps symbolic tspll_cfg config name -> (tspll_freq, clk_src) matching ptpinstance.pp
+_TSPLL_CFG_MAP = {
+    'default': (4, 0),
+    'osc_25': (0, 0),
+    'osc_122.88': (1, 0),
+    'osc_125': (2, 0),
+    'osc_153.6': (3, 0),
+    'osc_156.25': (4, 0),
+    'osc_245.76': (5, 0),
+    'timeref_25': (0, 1),
+    'timeref_122.88': (1, 1),
+    'timeref_125': (2, 1),
+    'timeref_153.6': (3, 1),
+    'timeref_156.25': (4, 1),
+    'timeref_245.76': (5, 1),
+}
+
+# Maps tspll_freq index -> frequency string as reported in sysfs
+_TSPLL_FREQ_STR = {
+    0: '25',
+    1: '122.88',
+    2: '125',
+    3: '153.6',
+    4: '156.25',
+    5: '245.76',
+}
+
+
+def _parse_tspll_cfg_sysfs(content):
+    """Parse tspll_cfg sysfs content into (freq_str, clk_src) from the TSPLL line.
+
+    Sysfs format (two lines, we use the TSPLL line as the authoritative active state):
+      SW conf: 156.25 MHz TIME_REF
+      TSPLL: 156.25 MHz TIME_REF
+
+    Returns (freq_str, clk_src) e.g. ('156.25', 1) or ('156.25', 0), or None on parse error.
+    clk_src: 1 = TIME_REF, 0 = TCXO
+    """
+    for line in content.splitlines():
+        if not line.startswith('TSPLL:'):
+            continue
+        # e.g. "TSPLL: 156.25 MHz TIME_REF"
+        parts = line.split()
+        # parts: ['TSPLL:', '156.25', 'MHz', 'TIME_REF' or 'TCXO']
+        if len(parts) < 4:
+            return None
+        freq_str = parts[1]
+        clk_src = 1 if parts[3] == 'TIME_REF' else 0
+        return (freq_str, clk_src)
+    return None
+
+
+def check_tspll_cfg(instance):
+    """Check tspll_cfg sysfs matches the configured value; raise alarm on mismatch.
+
+    Compares both frequency and clock source (TIME_REF vs TCXO) against the
+    symbolic value stored in clock-conf.conf (e.g. timeref_156.25, osc_125).
+    Secondary E825 NICs without tspll_cfg sysfs raise an alarm when a tspll_cfg
+    value is configured, as the configuration could not be applied.
+    Raises/clears a separate alarm per interface.
+    """
+    ctrl = ptpinstances[instance]
+
+    for interface, params in ctrl.clock_ports.items():
+        alarm_obj = get_alarm_object(ALARM_CAUSE__TSPLL_CFG_MISMATCH, interface)
+        if alarm_obj is None:
+            continue
+
+        configured = params.get('tspll_cfg')
+        if not configured:
+            if alarm_obj.raised:
+                if clear_alarm(alarm_obj.eid) is True:
+                    alarm_obj.raised = False
+            continue
+
+        expected = _TSPLL_CFG_MAP.get(configured)
+        if expected is None:
+            collectd.warning(f"{PLUGIN} {interface} unknown tspll_cfg value '{configured}'")
+            continue
+        expected_freq, expected_clk_src = expected
+        expected_freq_str = _TSPLL_FREQ_STR.get(expected_freq)
+
+        tspll_path = f'/sys/class/net/{interface}/device/tspll_cfg'
+        if not os.path.exists(tspll_path):
+            mismatch_detail = (
+                f"{interface}: configured={configured}"
+                f" but tspll_cfg sysfs not available (secondary NIC)"
+            )
+            collectd.warning(f"{PLUGIN} tspll_cfg mismatch: {mismatch_detail}")
+            if not alarm_obj.raised:
+                alarm_obj.reason += f' [{mismatch_detail}]'
+                if raise_alarm(ALARM_CAUSE__TSPLL_CFG_MISMATCH, interface,
+                               alarm_object=alarm_obj) is True:
+                    alarm_obj.raised = True
+            continue
+
+        try:
+            with open(tspll_path, 'r') as f:
+                content = f.read()
+        except OSError as e:
+            collectd.warning(f"{PLUGIN} {interface} tspll_cfg read failed: {e}")
+            continue
+
+        actual = _parse_tspll_cfg_sysfs(content)
+        if actual is None:
+            collectd.warning(
+                f"{PLUGIN} {interface} tspll_cfg sysfs unparseable: {content!r}")
+            continue
+        actual_freq_str, actual_clk_src = actual
+
+        if (round(float(actual_freq_str), 2) != round(float(expected_freq_str), 2)
+                or actual_clk_src != expected_clk_src):
+            expected_src = 'TIME_REF' if expected_clk_src == 1 else 'TCXO'
+            actual_src = 'TIME_REF' if actual_clk_src == 1 else 'TCXO'
+            mismatch_detail = (
+                f"{interface}: configured={configured}"
+                f" (freq={expected_freq_str} MHz {expected_src})"
+                f" actual=(freq={actual_freq_str} MHz {actual_src})"
+            )
+            collectd.warning(f"{PLUGIN} tspll_cfg mismatch: {mismatch_detail}")
+            if not alarm_obj.raised:
+                alarm_obj.reason += f' [{mismatch_detail}]'
+                if raise_alarm(ALARM_CAUSE__TSPLL_CFG_MISMATCH, interface,
+                               alarm_object=alarm_obj) is True:
+                    alarm_obj.raised = True
+        else:
+            if alarm_obj.raised:
+                if clear_alarm(alarm_obj.eid) is True:
+                    alarm_obj.raised = False
+
+
 def check_1pps_signal(instance):
     """check 1PPS signal and manage alarms"""
     collectd.debug(f"{PLUGIN} check_1pps_signal: {instance}")
@@ -4059,6 +4204,9 @@ def read_func():
                 check_gnss_signal(instance)
             if ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
                 check_1pps_signal(instance)
+
+        if ctrl.instance_type == PTP_INSTANCE_TYPE_CLOCK:
+            check_tspll_cfg(instance)
 
         # Check time drift and manage PTP clock class if any ts2phc
         # source is configured, and instance type is PTP4l.
