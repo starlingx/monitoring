@@ -133,6 +133,7 @@ DPLL_MGR_FORMAT_VERSION = 1
 
 # dpll-mgr instance name discovered during init (singleton per host)
 _dpll_mgr_instance_name = None
+_dpll_mgr_holdover_level = -1  # Last-seen holdover level
 
 
 def _get_ptp_options_path():
@@ -211,6 +212,14 @@ ALARM_CAUSE__GNSS_MONITOR_SIGNAL_QUALITY_DB = 32
 
 # dpll-mgr Alarm codes
 ALARM_CAUSE__DPLL_MGR_HOLDOVER = 40
+
+# dpll-mgr holdover tier to FM severity mapping
+DPLL_MGR_HOLDOVER_SEVERITY = {
+    0: fm_constants.FM_ALARM_SEVERITY_WARNING,   # ho_0
+    1: fm_constants.FM_ALARM_SEVERITY_MINOR,     # ho_1
+    2: fm_constants.FM_ALARM_SEVERITY_MAJOR,     # ho_2
+    3: fm_constants.FM_ALARM_SEVERITY_CRITICAL,  # ho_3
+}
 
 # Run Phase
 RUN_PHASE__INIT = 0
@@ -3767,8 +3776,11 @@ def _check_dpll_mgr_state():
 
     Called once per audit cycle from read_func(). Reads the status file
     written by dpll-mgr and raises appropriate alarms based on lock status.
+    Holdover alarms escalate in severity as holdover progresses through tiers.
     Only acts if dpll-mgr managed instances exist on this host.
     """
+    global _dpll_mgr_holdover_level
+
     # Use the dpll-mgr instance registered in ptpinstances
     if _dpll_mgr_instance_name is None:
         return  # No dpll-mgr on this host
@@ -3788,6 +3800,8 @@ def _check_dpll_mgr_state():
 
     lock = status.get('dpll_lock_status')
     ever_locked = status.get('ever_locked', False)
+    holdover_level = status.get('holdover_level', -1)
+    holdover_duration_s = status.get('holdover_duration_s', 0)
 
     # Log dpll-mgr service and state (same pattern as other PTP instances)
     dpll_mgr_service = "dpll-mgr@" + dpll_mgr_instance + ".service"
@@ -3800,11 +3814,12 @@ def _check_dpll_mgr_state():
                      status.get('current_master', '?'),
                      status.get('previous_master', '?')))
     collectd.info("%s dpll-mgr %s in_holdover=%s holdover_level=%s "
-                  "holdover_duration_s=%s"
+                  "holdover_duration_s=%s clock_class=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('in_holdover', '?'),
                      status.get('holdover_level', '?'),
-                     status.get('holdover_duration_s', '?')))
+                     status.get('holdover_duration_s', '?'),
+                     status.get('clock_class', '?')))
     collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('gearshift', {}).get('ptp_bh', '-'),
@@ -3822,17 +3837,37 @@ def _check_dpll_mgr_state():
                      status.get('operation_mode', '?')))
 
     if lock == 'holdover':
-        # Raise holdover alarm
         ho_obj = ctrl.holdover_alarm_object
-        if ho_obj.raised is False:
-            collectd.info("%s dpll-mgr holdover detected for %s "
-                          "(master=%s, level=%s)"
-                          % (PLUGIN, dpll_mgr_instance,
-                             status.get('current_master'),
-                             status.get('holdover_level')))
+        severity = DPLL_MGR_HOLDOVER_SEVERITY.get(
+            holdover_level, fm_constants.FM_ALARM_SEVERITY_WARNING)
+        clock_class = status.get('clock_class', '?')
+        duration_min = int(holdover_duration_s) // 60
+
+        if (ho_obj.raised is False
+                or holdover_level != _dpll_mgr_holdover_level):
+            # First raise or tier transition — re-raise with current
+            # severity. Must reset raised flag to bypass raise_alarm()
+            # early-return for already-raised alarms.
+            ho_obj.raised = False
+            ho_obj.severity = severity
+            ho_obj.reason = (
+                "%s DPLL holdover tier %d (clockClass %s) "
+                "— timing reference lost for %d min"
+                % (obj.hostname, holdover_level, clock_class,
+                   duration_min))
+            collectd.info(
+                "%s dpll-mgr holdover alarm: level=%d severity=%s "
+                "clockClass=%s duration=%d min for %s"
+                % (PLUGIN, holdover_level, severity, clock_class,
+                   duration_min, dpll_mgr_instance))
+            if not ever_locked:
+                # Boot grace: don't raise alarm before first lock
+                return
             if raise_alarm(ALARM_CAUSE__DPLL_MGR_HOLDOVER,
                            dpll_mgr_instance) is True:
                 ho_obj.raised = True
+                _dpll_mgr_holdover_level = holdover_level
+
         # Clear no-lock if it was raised before holdover
         if ctrl.nolock_alarm_object.raised is True:
             if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
@@ -3853,6 +3888,7 @@ def _check_dpll_mgr_state():
         if ho_obj.raised is True:
             if clear_alarm(ho_obj.eid) is True:
                 ho_obj.raised = False
+                _dpll_mgr_holdover_level = -1
                 collectd.info("%s dpll-mgr holdover cleared for %s"
                               % (PLUGIN, dpll_mgr_instance))
         if ctrl.nolock_alarm_object.raised is True:
