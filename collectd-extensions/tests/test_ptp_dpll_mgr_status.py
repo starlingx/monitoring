@@ -22,8 +22,23 @@ sys.modules['collectd'] = MagicMock()
 sys.modules['tsconfig'] = MagicMock()
 sys.modules['tsconfig.tsconfig'] = MagicMock()
 sys.modules['plugin_common'] = MagicMock()
-sys.modules['fm_api'] = MagicMock()
-sys.modules['fm_api.constants'] = MagicMock()
+mock_fm_constants = MagicMock()
+mock_fm_constants.FM_ALARM_SEVERITY_CLEAR = 'clear'
+mock_fm_constants.FM_ALARM_SEVERITY_WARNING = 'warning'
+mock_fm_constants.FM_ALARM_SEVERITY_MINOR = 'minor'
+mock_fm_constants.FM_ALARM_SEVERITY_MAJOR = 'major'
+mock_fm_constants.FM_ALARM_SEVERITY_CRITICAL = 'critical'
+mock_fm_constants.ALARM_PROBABLE_CAUSE_50 = '50'
+mock_fm_constants.ALARM_PROBABLE_CAUSE_51 = '51'
+mock_fm_constants.ALARM_PROBABLE_CAUSE_29 = '29'
+mock_fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN = 'unknown'
+mock_fm_constants.FM_ALARM_STATE_SET = 'set'
+mock_fm_constants.FM_ALARM_STATE_CLEAR = 'clear'
+mock_fm_constants.FM_ENTITY_TYPE_HOST = 'host'
+mock_fm_api = MagicMock()
+mock_fm_api.constants = mock_fm_constants
+sys.modules['fm_api'] = mock_fm_api
+sys.modules['fm_api.constants'] = mock_fm_constants
 sys.modules['fm_api.fm_api'] = MagicMock()
 sys.modules['ptp_interface'] = MagicMock()
 sys.modules['ptp_gnss_monitor'] = MagicMock()
@@ -47,6 +62,9 @@ def _make_status(lock_status='locked', current_master='GNSS_REF4P',
                  in_holdover=False, holdover_level=-1,
                  ever_locked=True, **kwargs):
     """Helper to create a valid status.json dict."""
+    # Default clockClass based on holdover level
+    default_clock_class = {0: 13, 1: 14, 2: 15, 3: 16}.get(
+        holdover_level, 6)
     data = {
         'format_version': DPLL_MGR_FORMAT_VERSION,
         'timestamp': '2026-07-08T12:00:00.000Z',
@@ -57,6 +75,7 @@ def _make_status(lock_status='locked', current_master='GNSS_REF4P',
         'in_holdover': in_holdover,
         'holdover_duration_s': kwargs.get('holdover_duration_s', 0),
         'holdover_level': holdover_level,
+        'clock_class': kwargs.get('clock_class', default_clock_class),
         'gearshift': kwargs.get('gearshift', {'ptp_bh': 'NEUTRAL',
                                               'ts2_0': 'DRIVE'}),
         'phase_offset_ns': kwargs.get('phase_offset_ns', 0),
@@ -154,6 +173,21 @@ class TestCheckDpllMgrState(unittest.TestCase):
     """Test _check_dpll_mgr_state() alarm raise/clear logic."""
 
     def setUp(self):
+        # Rebuild holdover severity map with real string values
+        # (the module-level dict captured MagicMock objects at import time)
+        ptp.DPLL_MGR_HOLDOVER_SEVERITY = {
+            0: 'warning',
+            1: 'minor',
+            2: 'major',
+            3: 'critical',
+        }
+        # Set fm_constants severity values (used as .get() defaults in code)
+        ptp.fm_constants.FM_ALARM_SEVERITY_CLEAR = 'clear'
+        ptp.fm_constants.FM_ALARM_SEVERITY_WARNING = 'warning'
+        ptp.fm_constants.FM_ALARM_SEVERITY_MINOR = 'minor'
+        ptp.fm_constants.FM_ALARM_SEVERITY_MAJOR = 'major'
+        ptp.fm_constants.FM_ALARM_SEVERITY_CRITICAL = 'critical'
+
         # Setup dpll-mgr instance in ptpinstances
         self.instance_name = 'dpll-mgr1'
         self.ctrl = PTP_ctrl_object(PTP_INSTANCE_TYPE_DPLL_MGR)
@@ -180,6 +214,7 @@ class TestCheckDpllMgrState(unittest.TestCase):
     def tearDown(self):
         ptp.ptpinstances.pop(self.instance_name, None)
         ptp._dpll_mgr_instance_name = None
+        ptp._dpll_mgr_holdover_level = -1
 
     @patch('ptp.is_service_running', return_value=True)
     @patch('ptp.raise_alarm', return_value=True)
@@ -285,6 +320,201 @@ class TestCheckDpllMgrState(unittest.TestCase):
         """Boot grace: no alarm when unlocked but ever_locked=False."""
         status = _make_status(lock_status='unlocked', ever_locked=False,
                               current_master='UNKNOWN', connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        mock_raise.assert_not_called()
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_holdover_level_0_severity_warning(self, mock_raise, mock_running):
+        """Holdover level 0 raises alarm with WARNING severity."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=0, holdover_duration_s=30,
+                              current_master='HOLDOVER_0',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(self.ctrl.holdover_alarm_object.severity,
+                         'warning')
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_holdover_level_1_severity_minor(self, mock_raise, mock_running):
+        """Holdover level 1 raises alarm with MINOR severity."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=1, holdover_duration_s=1900,
+                              current_master='HOLDOVER_1',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(self.ctrl.holdover_alarm_object.severity,
+                         'minor')
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_holdover_level_2_severity_major(self, mock_raise, mock_running):
+        """Holdover level 2 raises alarm with MAJOR severity."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=2, holdover_duration_s=4000,
+                              current_master='HOLDOVER_2',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(self.ctrl.holdover_alarm_object.severity,
+                         'major')
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_holdover_level_3_severity_critical(self, mock_raise, mock_running):
+        """Holdover level 3 raises alarm with CRITICAL severity."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=3, holdover_duration_s=15000,
+                              current_master='HOLDOVER_3',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(self.ctrl.holdover_alarm_object.severity,
+                         'critical')
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_tier_transition_re_raises_alarm(self, mock_raise, mock_running):
+        """Tier transition (0→1) re-raises alarm with new severity."""
+        # First enter ho_0
+        self.ctrl.holdover_alarm_object.raised = True
+        ptp._dpll_mgr_holdover_level = 0
+
+        # Now transition to ho_1
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=1, holdover_duration_s=1900,
+                              current_master='HOLDOVER_1',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        # Alarm should be re-raised (level changed)
+        mock_raise.assert_called_with(
+            ALARM_CAUSE__DPLL_MGR_HOLDOVER, self.instance_name)
+        self.assertEqual(ptp._dpll_mgr_holdover_level, 1)
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_same_tier_does_not_re_raise(self, mock_raise, mock_running):
+        """Same tier repeated does NOT re-raise alarm."""
+        # Already at ho_0 and alarm raised
+        self.ctrl.holdover_alarm_object.raised = True
+        ptp._dpll_mgr_holdover_level = 0
+
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=0, holdover_duration_s=45,
+                              current_master='HOLDOVER_0',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        mock_raise.assert_not_called()
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_reason_text_includes_clockclass_and_duration(
+            self, mock_raise, mock_running):
+        """Reason text includes clockClass and duration."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=2, holdover_duration_s=5400,
+                              current_master='HOLDOVER_2',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        reason = self.ctrl.holdover_alarm_object.reason
+        self.assertIn('clockClass 15', reason)
+        self.assertIn('tier 2', reason)
+        self.assertIn('90 min', reason)
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.clear_alarm', return_value=True)
+    def test_recovery_resets_holdover_level(self, mock_clear, mock_running):
+        """Recovery clears alarm and resets tracked holdover level."""
+        self.ctrl.holdover_alarm_object.raised = True
+        ptp._dpll_mgr_holdover_level = 2
+
+        status = _make_status(lock_status='locked')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(ptp._dpll_mgr_holdover_level, -1)
+        self.assertFalse(self.ctrl.holdover_alarm_object.raised)
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm', return_value=True)
+    def test_unknown_holdover_level_defaults_to_warning(
+            self, mock_raise, mock_running):
+        """Unknown holdover_level defaults to WARNING severity."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=99, holdover_duration_s=100,
+                              current_master='HOLDOVER_UNKNOWN',
+                              connected_pin='none')
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1):
+            ptp._check_dpll_mgr_state()
+
+        self.assertEqual(self.ctrl.holdover_alarm_object.severity,
+                         'warning')
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.raise_alarm')
+    def test_no_holdover_alarm_when_not_ever_locked(
+            self, mock_raise, mock_running):
+        """Boot grace: no holdover alarm when ever_locked=False."""
+        status = _make_status(lock_status='holdover', in_holdover=True,
+                              holdover_level=0, holdover_duration_s=10,
+                              ever_locked=False,
+                              current_master='HOLDOVER_0',
+                              connected_pin='none')
         ptp._dpll_mgr_status._cache = status
         ptp._dpll_mgr_status._mtime = 1
 
