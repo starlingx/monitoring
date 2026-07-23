@@ -1351,7 +1351,7 @@ sub read_schedstat
   $_ = <$fh>; ($version) = /^version\s+(\d+)/;
   $_ = <$fh>; ($timestamp) = /^timestamp\s+(\d+)/;
 
-  if ($version == 15 or $version == 16) {
+  if ($version >= 15 && $version <= 17) {
     LOOP_SCHEDSTAT: while (<$fh>) {
       # version 15 and 16: cputime is 7th field
       if (/^cpu(\d+)\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+(\d+)\s+/) {

@@ -39,7 +39,7 @@ PLUGIN_CPU_FREQUENCY_INTERVAL = 300  # cpu frequency interval in secs
 TIMESTAMP = 'timestamp'
 PLATFORM_CPU_PERCENT = 'platform-occupancy'
 CGROUP_PLATFORM_CPU_PERCENT = 'cgroup-platform-occupancy'
-SCHEDSTAT_SUPPORTED_VERSION = 16
+SCHEDSTAT_SUPPORTED_VERSIONS = [15, 16, 17]
 
 # Linux per-cpu info
 CPUINFO = '/proc/cpuinfo'
@@ -1074,7 +1074,7 @@ def init_func():
     except Exception as err:
         collectd.error('%s Cannot read schedstat, error=%s' % (PLUGIN, err))
         return pc.PLUGIN_FAIL
-    if version != SCHEDSTAT_SUPPORTED_VERSION:
+    if version not in SCHEDSTAT_SUPPORTED_VERSIONS:
         obj.schedstat_supported = False
         collectd.error('%s unsupported schedstat version [%d]'
                        % (PLUGIN, version))
