@@ -7,7 +7,8 @@
 
 Monitors DPLL EEC lock status via pynetlink and drives synce4l QL
 via the socket API. Raises FM alarm on SyncE source loss (HOLDOVER/
-UNLOCKED), clears on recovery (LOCKED).
+UNLOCKED), clears on recovery (LOCKED). Also raises FM alarm when
+synce4l service is enabled but not running (stopped/failed/killed).
 
 State-to-QL mapping:
   LOCKED / LOCKED_HO_ACQ -> pass-through (no override), alarm clear
@@ -18,6 +19,7 @@ State-to-QL mapping:
 import collectd
 import socket
 import struct
+import subprocess
 import configparser
 from glob import glob
 import re
@@ -43,13 +45,20 @@ PTPINSTANCE_PATH = '/etc/linuxptp/ptpinstance/'
 PTPINSTANCE_SYNCE4L_CONF_FILE_PATTERN = PTPINSTANCE_PATH + 'synce4l-*.conf'
 PTPINSTANCE_INSTANCE_MONITORING_CONF_FILE = PTPINSTANCE_PATH + "instance-monitoring.conf"
 
+# systemctl
+SYSTEMCTL = '/usr/bin/systemctl'
+
 # FM Alarm
 PLUGIN_ALARMID = '100.119'
 ALARM_ENTITY_TYPE = 'synce'
 ALARM_REASON_HOLDOVER = 'SyncE source unavailable; DPLL in holdover'
 ALARM_REASON_FREERUN = 'SyncE source lost; DPLL in freerun/unlocked'
-ALARM_REPAIR = ('Check SyncE source connectivity. '
-                'Verify ESMC RX on the configured interface.')
+ALARM_REASON_NOT_RUNNING = 'SyncE service {} is enabled but not running'
+ALARM_REPAIR_SOURCE_LOSS = ('Check SyncE source connectivity. '
+                            'Verify ESMC RX on the configured interface.')
+ALARM_REPAIR_NOT_RUNNING = ('Start service with: systemctl start {}. '
+                            'If issue persists, check synce4l '
+                            'configuration and logs.')
 
 # TLV protocol (synce4l external API)
 _HDR = struct.Struct('<HH')
@@ -66,8 +75,9 @@ class SynceController:
         self._dpll = None
         self._api = None
         self._last_ql = None
-        self._alarm_raised = False
-        self._alarm_severity = None
+        self._source_loss_alarm_raised = False
+        self._source_loss_alarm_severity = None
+        self._process_alarm_raised = False
         self.instance_name = None
         self._config_logged = False
 
@@ -163,13 +173,13 @@ class SynceController:
             collectd.info(f"{PLUGIN} config found: interface={self.interface}")
         if 'holdover_ql' in section:
             self.holdover_ql = int(section['holdover_ql'], 0)
-            collectd.info(f"{PLUGIN} config found: holdover_ql={self.holdover_ql}")
+            collectd.info(f"{PLUGIN} config found: holdover_ql={self.holdover_ql:#x}")
         if 'freerun_ql' in section:
             self.freerun_ql = int(section['freerun_ql'], 0)
-            collectd.info(f"{PLUGIN} config found: freerun_ql={self.freerun_ql}")
+            collectd.info(f"{PLUGIN} config found: freerun_ql={self.freerun_ql:#x}")
         if 'static_ql' in section:
             self.static_ql = int(section['static_ql'], 0)
-            collectd.info(f"{PLUGIN} config found: static_ql={self.static_ql}")
+            collectd.info(f"{PLUGIN} config found: static_ql={self.static_ql:#x}")
 
         collectd.info(f"{PLUGIN} loaded monitoring config for [{instance_name}]")
 
@@ -179,10 +189,12 @@ class SynceController:
         obj.hostname = obj.gethostname()
         obj.init_completed()
         obj.base_eid = f"host={obj.hostname}.{ALARM_ENTITY_TYPE}"
-        self._alarm_eid = f"{obj.base_eid}.interface={self.interface}.synce=source-loss"
+        self._source_loss_alarm_eid = f"{obj.base_eid}.interface={self.interface}.synce=source-loss"
+        self._process_alarm_eid = f"{obj.base_eid}.instance={self.instance_name}.synce=not-running"
         collectd.debug(f"{PLUGIN} on {obj.hostname} with entity id '{obj.base_eid}'")
 
         try:
+            self._api = fm_api.FaultAPIs()
             # Non-singleton avoids stale-socket read errors over time
             self._dpll = NetlinkDPLL(True)
             devices = self._dpll.get_all_devices()
@@ -190,18 +202,37 @@ class SynceController:
                 collectd.info(f"{PLUGIN} no EEC DPLL device found, disabling")
                 self._dpll = None
                 return
-            self._api = fm_api.FaultAPIs()
             collectd.info(f"{PLUGIN} initialized, socket={self.socket_path} "
                           f"device={self.device} interface={self.interface}")
         except Exception as e:
             collectd.error(f"{PLUGIN} init failed: {e}")
 
     def read(self):
-        if not all([self._dpll, self.socket_path, self.device,
-                    self.interface, self.clock_id]):
+        if not all([self.socket_path, self.device, self.interface,
+                    self.instance_name]):
             if not self._config_logged:
                 collectd.info(f"{PLUGIN} disabled: incomplete config")
                 self._config_logged = True
+            return
+
+        service = f"synce4l@{self.instance_name}.service"
+
+        # Check if service is enabled (user may have intentionally disabled)
+        if not self._is_service_enabled(service):
+            self._clear_process_alarm()
+            self._clear_source_loss_alarm()
+            return
+
+        # Check if service is running
+        if not self._is_service_active(service):
+            self._raise_process_alarm(service)
+            self._clear_source_loss_alarm()
+            return
+
+        self._clear_process_alarm()
+
+        # DPLL monitoring requires hardware
+        if not all([self._dpll, self.clock_id]):
             return
 
         status = self._get_dpll_status()
@@ -216,21 +247,82 @@ class SynceController:
                 collectd.info(f"{PLUGIN} DPLL locked (SyncE source), "
                               f"clearing QL override")
                 self._last_ql = None
-            self._clear_alarm()
+            self._clear_source_loss_alarm()
             return
 
         if ql != self._last_ql:
             state_name = getattr(status, 'name', str(status))
             collectd.info(f"{PLUGIN} DPLL state={state_name}, "
-                          f"setting QL=0x{ql:02x}")
+                          f"setting QL={ql:#x}")
             if self._set_ql(ql):
                 self._last_ql = ql
 
         # Alarm only for degraded states (holdover/freerun), not static_ql
         if status in (LockStatus.LOCKED, LockStatus.LOCKED_AND_HOLDOVER):
-            self._clear_alarm()
+            self._clear_source_loss_alarm()
         else:
-            self._raise_alarm(status)
+            self._raise_source_loss_alarm(status)
+
+    def _is_service_enabled(self, service):
+        """Check if synce4l service is enabled via systemctl."""
+        try:
+            result = subprocess.check_output(
+                [SYSTEMCTL, 'is-enabled', service],
+                stderr=subprocess.DEVNULL).decode().strip()
+            return result == 'enabled'
+        except subprocess.CalledProcessError:
+            return False
+
+    def _is_service_active(self, service):
+        """Check if synce4l service is active (running) via systemctl."""
+        try:
+            result = subprocess.check_output(
+                [SYSTEMCTL, 'is-active', service],
+                stderr=subprocess.DEVNULL).decode().strip()
+            return result == 'active'
+        except subprocess.CalledProcessError:
+            return False
+
+    def _raise_process_alarm(self, service):
+        """Raise FM alarm when synce4l service is enabled but not running."""
+        if self._process_alarm_raised or not self._api:
+            return
+        try:
+            fault = fm_api.Fault(
+                alarm_id=PLUGIN_ALARMID,
+                alarm_state=fm_constants.FM_ALARM_STATE_SET,
+                entity_type_id=fm_constants.FM_ENTITY_TYPE_HOST,
+                entity_instance_id=self._process_alarm_eid,
+                severity=fm_constants.FM_ALARM_SEVERITY_MAJOR,
+                reason_text=ALARM_REASON_NOT_RUNNING.format(service),
+                alarm_type=fm_constants.FM_ALARM_TYPE_1,
+                probable_cause=fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN,
+                proposed_repair_action=ALARM_REPAIR_NOT_RUNNING.format(
+                    service),
+                service_affecting=True,
+                suppression=True)
+            alarm_uuid = self._api.set_fault(fault)
+            if alarm_uuid:
+                collectd.info(f"{PLUGIN} process alarm raised: "
+                              f"{PLUGIN_ALARMID} {self._process_alarm_eid}")
+                self._process_alarm_raised = True
+            else:
+                collectd.warning(f"{PLUGIN} set_fault (process) returned: "
+                                 f"{alarm_uuid}")
+        except Exception as e:
+            collectd.error(f"{PLUGIN} raise process alarm failed: {e}")
+
+    def _clear_process_alarm(self):
+        """Clear process alarm when synce4l service resumes running."""
+        if not self._process_alarm_raised or not self._api:
+            return
+        try:
+            self._api.clear_fault(PLUGIN_ALARMID, self._process_alarm_eid)
+            collectd.info(f"{PLUGIN} process alarm cleared: "
+                          f"{PLUGIN_ALARMID} {self._process_alarm_eid}")
+            self._process_alarm_raised = False
+        except Exception as e:
+            collectd.error(f"{PLUGIN} clear process alarm failed: {e}")
 
     def _get_dpll_status(self):
         """Get EEC DPLL lock status for our clock_id."""
@@ -278,7 +370,7 @@ class SynceController:
                              f"device={self.device},source={self.source}): {e}")
             return False
 
-    def _raise_alarm(self, status):
+    def _raise_source_loss_alarm(self, status):
         """Raise FM alarm for SyncE source loss. Re-raises on severity change."""
         if not self._api:
             return
@@ -289,10 +381,10 @@ class SynceController:
             reason = ALARM_REASON_FREERUN
             fm_severity = fm_constants.FM_ALARM_SEVERITY_CRITICAL
 
-        if self._alarm_raised and self._alarm_severity == fm_severity:
+        if self._source_loss_alarm_raised and self._source_loss_alarm_severity == fm_severity:
             return  # already raised at correct severity
 
-        eid = self._alarm_eid
+        eid = self._source_loss_alarm_eid
         try:
             fault = fm_api.Fault(
                 alarm_id=PLUGIN_ALARMID,
@@ -303,7 +395,7 @@ class SynceController:
                 reason_text=reason,
                 alarm_type=fm_constants.FM_ALARM_TYPE_1,  # communication
                 probable_cause=fm_constants.ALARM_PROBABLE_CAUSE_29,  # loss-of-signal
-                proposed_repair_action=ALARM_REPAIR,
+                proposed_repair_action=ALARM_REPAIR_SOURCE_LOSS,
                 service_affecting=True,
                 suppression=True)
 
@@ -311,24 +403,24 @@ class SynceController:
             if alarm_uuid:
                 collectd.info(f"{PLUGIN} alarm raised: {PLUGIN_ALARMID} "
                               f"{eid} severity={fm_severity}")
-                self._alarm_raised = True
-                self._alarm_severity = fm_severity
+                self._source_loss_alarm_raised = True
+                self._source_loss_alarm_severity = fm_severity
             else:
                 collectd.warning(f"{PLUGIN} set_fault returned: {alarm_uuid}")
         except Exception as e:
             collectd.error(f"{PLUGIN} raise alarm failed: {e}")
 
-    def _clear_alarm(self):
+    def _clear_source_loss_alarm(self):
         """Clear FM alarm when SyncE source recovers."""
-        if not self._alarm_raised or not self._api:
+        if not self._source_loss_alarm_raised or not self._api:
             return
 
-        eid = self._alarm_eid
+        eid = self._source_loss_alarm_eid
         try:
             self._api.clear_fault(PLUGIN_ALARMID, eid)
             collectd.info(f"{PLUGIN} alarm cleared: {PLUGIN_ALARMID} {eid}")
-            self._alarm_raised = False
-            self._alarm_severity = None
+            self._source_loss_alarm_raised = False
+            self._source_loss_alarm_severity = None
         except Exception as e:
             collectd.error(f"{PLUGIN} clear alarm failed: {e}")
 
