@@ -259,6 +259,48 @@ class TestSynceController(unittest.TestCase):
 
         self.assertIsNone(self.ctrl._dpll)
 
+    def test_init_clears_stale_synce_alarms(self):
+        """init() clears stale synce alarms from FM on startup."""
+        mock_eec = MagicMock()
+        mock_eec.dev_type = MockDeviceType.EEC
+
+        mock_dpll = MagicMock()
+        mock_dpll.get_all_devices.return_value = [mock_eec]
+
+        stale_alarm = MagicMock()
+        stale_alarm.entity_instance_id = (
+            'host=controller-0.synce.instance=synce1.synce=not-running')
+        mock_api = MagicMock()
+        mock_api.get_faults_by_id.return_value = [stale_alarm]
+
+        with patch('synce.NetlinkDPLL', return_value=mock_dpll):
+            with patch('synce.fm_api.FaultAPIs', return_value=mock_api):
+                self.ctrl.init()
+
+        mock_api.clear_fault.assert_called_once_with(
+            '100.119',
+            'host=controller-0.synce.instance=synce1.synce=not-running')
+
+    def test_init_skips_non_synce_alarms(self):
+        """init() does not clear ptp alarms from FM."""
+        mock_eec = MagicMock()
+        mock_eec.dev_type = MockDeviceType.EEC
+
+        mock_dpll = MagicMock()
+        mock_dpll.get_all_devices.return_value = [mock_eec]
+
+        ptp_alarm = MagicMock()
+        ptp_alarm.entity_instance_id = (
+            'host=controller-0.ptp.instance=ptp01.ptp=no-lock')
+        mock_api = MagicMock()
+        mock_api.get_faults_by_id.return_value = [ptp_alarm]
+
+        with patch('synce.NetlinkDPLL', return_value=mock_dpll):
+            with patch('synce.fm_api.FaultAPIs', return_value=mock_api):
+                self.ctrl.init()
+
+        mock_api.clear_fault.assert_not_called()
+
     def test_load_monitoring_config(self):
         """_load_monitoring_config sets values from config section."""
         config = configparser.ConfigParser(delimiters=' ')
@@ -704,6 +746,193 @@ class TestSynceController(unittest.TestCase):
         ctrl._get_dpll_status = MagicMock()
         ctrl.read()
         ctrl._get_dpll_status.assert_not_called()
+
+    # ---------------------------------------------------------------
+    # Holdover timer tests
+    # ---------------------------------------------------------------
+
+    def test_holdover_timer_starts_on_holdover_entry(self):
+        """Timer starts when DPLL enters HOLDOVER."""
+        self.ctrl._last_ql = None
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True):
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm'):
+                        self.ctrl.read()
+        self.assertIsNotNone(self.ctrl._holdover_start)
+        self.assertFalse(self.ctrl._holdover_expired)
+
+    def test_holdover_timer_sets_holdover_ql_before_expiry(self):
+        """Before timer expires, holdover_ql is used."""
+        self.ctrl._last_ql = None
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm'):
+                        self.ctrl.read()
+                        mock_set.assert_called_once_with(0x04)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_expiry_escalates_to_freerun(self, mock_time):
+        """After timer expires, freerun_ql is set and alarm escalated."""
+        mock_time.return_value = 20000
+        self.ctrl._last_ql = 0x04  # already in holdover
+        self.ctrl._holdover_start = 5599  # 14401s ago
+        self.ctrl._holdover_expired = False
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm') as mock_raise:
+                        self.ctrl.read()
+                        mock_set.assert_called_once_with(0x0f)
+                        mock_raise.assert_called_once_with(
+                            MockLockStatus.UNLOCKED)
+        self.assertTrue(self.ctrl._holdover_expired)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_no_re_escalation(self, mock_time):
+        """After expiry, repeated reads don't re-trigger escalation log."""
+        mock_time.return_value = 30000
+        self.ctrl._last_ql = 0x0f  # already freerun
+        self.ctrl._holdover_start = 10000
+        self.ctrl._holdover_expired = True  # already expired
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm') as mock_raise:
+                        self.ctrl.read()
+                        # QL unchanged (already 0x0f)
+                        mock_set.assert_not_called()
+                        # Alarm still raised at critical
+                        mock_raise.assert_called_once_with(
+                            MockLockStatus.UNLOCKED)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_cancelled_on_recovery(self, mock_time):
+        """Timer cancelled when DPLL returns to LOCKED."""
+        mock_time.return_value = 1100
+        self.ctrl._holdover_start = 1000  # 100s ago
+        self.ctrl._holdover_expired = False
+        self.ctrl._last_ql = 0x04
+        self.ctrl._source_loss_alarm_raised = True
+        self.ctrl._source_loss_alarm_severity = 'major'
+        self.ctrl._api = MagicMock()
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.LOCKED)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True):
+                    self.ctrl.read()
+        self.assertIsNone(self.ctrl._holdover_start)
+        self.assertFalse(self.ctrl._holdover_expired)
+        self.assertFalse(self.ctrl._source_loss_alarm_raised)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_cancelled_on_synce_passthrough_recovery(
+            self, mock_time):
+        """Timer cancelled when DPLL locks back with SyncE source."""
+        mock_time.return_value = 1100
+        self.ctrl.source = 'SYNCE'
+        self.ctrl._holdover_start = 1000
+        self.ctrl._holdover_expired = False
+        self.ctrl._last_ql = 0x04
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.LOCKED)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True):
+                    self.ctrl.read()
+        self.assertIsNone(self.ctrl._holdover_start)
+        self.assertFalse(self.ctrl._holdover_expired)
+        self.assertIsNone(self.ctrl._last_ql)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_cancelled_on_immediate_freerun(self, mock_time):
+        """Timer cancelled when DPLL goes directly to UNLOCKED."""
+        mock_time.return_value = 1050
+        self.ctrl._holdover_start = 1000
+        self.ctrl._holdover_expired = False
+        self.ctrl._last_ql = 0x04
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.UNLOCKED)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True):
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm'):
+                        self.ctrl.read()
+        self.assertIsNone(self.ctrl._holdover_start)
+        self.assertFalse(self.ctrl._holdover_expired)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_custom_duration(self, mock_time):
+        """Custom holdover_timer respected."""
+        mock_time.return_value = 1061
+        self.ctrl.holdover_timer = 60  # 1 minute
+        self.ctrl._last_ql = 0x04
+        self.ctrl._holdover_start = 1000  # 61s ago — expired
+        self.ctrl._holdover_expired = False
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm'):
+                        self.ctrl.read()
+                        mock_set.assert_called_once_with(0x0f)
+        self.assertTrue(self.ctrl._holdover_expired)
+
+    @patch('synce.time.monotonic')
+    def test_holdover_timer_not_expired_within_window(self, mock_time):
+        """Timer not expired when within configured window."""
+        mock_time.return_value = 1100
+        self.ctrl.holdover_timer = 14400
+        self.ctrl._last_ql = 0x04
+        self.ctrl._holdover_start = 1000  # 100s ago — not expired
+        self.ctrl._holdover_expired = False
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=MockLockStatus.HOLDOVER)
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mock_set:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm') as mock_raise:
+                        self.ctrl.read()
+                        # QL unchanged (still 0x04)
+                        mock_set.assert_not_called()
+                        mock_raise.assert_called_once_with(
+                            MockLockStatus.HOLDOVER)
+        self.assertFalse(self.ctrl._holdover_expired)
+
+    def test_load_monitoring_config_reads_holdover_timer(self):
+        """_load_monitoring_config parses holdover_timer."""
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string(
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+            "holdover_timer 7200\n"
+        )
+        self.ctrl._load_monitoring_config('synce1', config)
+        self.assertEqual(self.ctrl.holdover_timer, 7200)
+
+    def test_load_monitoring_config_holdover_timer_default(self):
+        """holdover_timer remains default (14400) when not in config."""
+        config = configparser.ConfigParser(delimiters=' ')
+        config.read_string(
+            "[synce1]\n"
+            "smc_socket_path /tmp/synce4l_socket_synce1\n"
+            "interface eno8303\n"
+        )
+        ctrl = synce.SynceController()
+        ctrl._load_monitoring_config('synce1', config)
+        self.assertEqual(ctrl.holdover_timer, 14400)
 
 
 if __name__ == '__main__':
