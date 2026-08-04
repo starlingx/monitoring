@@ -14,19 +14,19 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 # Mock all external dependencies before importing ptp module
-sys.modules['collectd'] = MagicMock()
-sys.modules['tsconfig'] = MagicMock()
-sys.modules['tsconfig.tsconfig'] = MagicMock()
-sys.modules['plugin_common'] = MagicMock()
-sys.modules['fm_api'] = MagicMock()
-sys.modules['fm_api.constants'] = MagicMock()
-sys.modules['fm_api.fm_api'] = MagicMock()
-sys.modules['ptp_interface'] = MagicMock()
-sys.modules['ptp_gnss_monitor'] = MagicMock()
-sys.modules['cgu_handler'] = MagicMock()
-sys.modules['pynetlink'] = MagicMock()
-sys.modules['oslo_utils'] = MagicMock()
-sys.modules['oslo_utils.timeutils'] = MagicMock()
+sys.modules.setdefault('collectd', MagicMock())
+sys.modules.setdefault('tsconfig', MagicMock())
+sys.modules.setdefault('tsconfig.tsconfig', MagicMock())
+sys.modules.setdefault('plugin_common', MagicMock())
+sys.modules.setdefault('fm_api', MagicMock())
+sys.modules.setdefault('fm_api.constants', MagicMock())
+sys.modules.setdefault('fm_api.fm_api', MagicMock())
+sys.modules.setdefault('ptp_interface', MagicMock())
+sys.modules.setdefault('ptp_gnss_monitor', MagicMock())
+sys.modules.setdefault('cgu_handler', MagicMock())
+sys.modules.setdefault('pynetlink', MagicMock())
+sys.modules.setdefault('oslo_utils', MagicMock())
+sys.modules.setdefault('oslo_utils.timeutils', MagicMock())
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import ptp

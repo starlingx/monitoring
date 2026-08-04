@@ -57,6 +57,7 @@ mock_pynetlink.NetlinkDPLL = MagicMock
 sys.modules['pynetlink'] = mock_pynetlink
 
 # Imported after mocking — collectd, fm_api and pynetlink are runtime-only.
+sys.modules.pop('synce', None)
 import synce  # noqa: E402
 
 

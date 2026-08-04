@@ -9,8 +9,8 @@ import unittest
 from unittest.mock import MagicMock
 
 # bypass 'import collectd' as it's C-based daemon, and cannot be directly imported.
-sys.modules["collectd"] = mock_collectd = MagicMock()
-sys.modules["gps"] = MagicMock()
+mock_collectd = sys.modules.setdefault("collectd", MagicMock())
+sys.modules.setdefault("gps", MagicMock())
 from src import ptp_gnss_monitor as ptp_monitoring
 
 
