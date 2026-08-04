@@ -12,6 +12,26 @@
         - kube-memory-tox-flake8
         - kube-memory-tox-pylint
         - collectd-extensions-py39
+        - monitoring-tox-coverage:
+            voting: false
+        - monitoring-tox-coverage-trixie:
+            voting: false
+        - monitoring-tox-bandit-trixie:
+            voting: false
+        - kube-cpusets-tox-py313:
+            voting: false
+        - kube-cpusets-tox-flake8-trixie:
+            voting: false
+        - kube-cpusets-tox-pylint-trixie:
+            voting: false
+        - kube-memory-tox-py313:
+            voting: false
+        - kube-memory-tox-flake8-trixie:
+            voting: false
+        - kube-memory-tox-pylint-trixie:
+            voting: false
+        - collectd-extensions-py313:
+            voting: false
     gate:
       jobs:
         - starlingx-common-tox-linters
@@ -51,7 +71,7 @@
       - kube-cpusets/*
     vars:
       tox_envlist: pylint
-      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
 
 - job:
     name: kube-cpusets-tox-flake8
@@ -65,7 +85,7 @@
       - kube-cpusets/kube-cpusets/*
     vars:
       tox_envlist: flake8
-      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
 
 - job:
     name: kube-cpusets-tox-py39
@@ -79,7 +99,7 @@
       - kube-cpusets/kube-cpusets/*
     vars:
       tox_envlist: py39
-      tox_extra_args: -c kube-cpusets/kube-cpusets/tox.ini
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
 
 - job:
     name: kube-memory-tox-pylint
@@ -93,7 +113,7 @@
       - kube-memory/kube-memory/*
     vars:
       tox_envlist: pylint
-      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+      tox_config_file: kube-memory/kube-memory/tox.ini
 
 - job:
     name: kube-memory-tox-flake8
@@ -107,7 +127,7 @@
       - kube-memory/kube-memory/*
     vars:
       tox_envlist: flake8
-      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+      tox_config_file: kube-memory/kube-memory/tox.ini
 
 - job:
     name: kube-memory-tox-py39
@@ -121,7 +141,7 @@
       - kube-memory/kube-memory/*
     vars:
       tox_envlist: py39
-      tox_extra_args: -c kube-memory/kube-memory/tox.ini
+      tox_config_file: kube-memory/kube-memory/tox.ini
 
 - job:
     name: collectd-extensions-py39
@@ -215,3 +235,139 @@
           XXX1m+0hJakAt6RLw+qNZUhCG7PGoxTzDhvSeNrH9Yggnp9yw4hvp4MWGGuEUVBFVOOKS
           ygM3Q/a1rckArxiL7yF0GNUvdpqafg76vjrTYVntLxGqcYZFslML3thfQh3B91yov31k/
           cWv1K69QMM3/yhcXmZqQNynIHwro4ilxC+b4jz0k47rumDx8P+q7W9/vB0z6y0=
+
+- job:
+    name: monitoring-tox-coverage
+    parent: tox
+    description: |
+      Run all tests with coverage analysis for monitoring repo
+    required-projects:
+      - starlingx/config
+      - starlingx/fault
+    nodeset: debian-bullseye
+    pre-run: collectd-extensions/tests/playbooks/pre-run-coverage.yaml
+    vars:
+      tox_envlist: coverage
+    post-run: collectd-extensions/tests/playbooks/upload-coverage-reports.yaml
+
+- job:
+    name: monitoring-tox-coverage-trixie
+    parent: openstack-tox-py313
+    description: |
+      Run all tests with coverage analysis for monitoring repo (Trixie)
+    required-projects:
+      - starlingx/config
+      - starlingx/fault
+    nodeset: debian-trixie-8GB
+    pre-run: collectd-extensions/tests/playbooks/pre-run-coverage.yaml
+    vars:
+      tox_envlist: coverage-trixie
+    post-run: collectd-extensions/tests/playbooks/upload-coverage-reports.yaml
+
+- job:
+    name: monitoring-tox-bandit-trixie
+    parent: openstack-tox-py313
+    description: |
+      Run security analysis for monitoring repo (Trixie)
+    nodeset: debian-trixie-8GB
+    vars:
+      tox_envlist: bandit-trixie
+    post-run: collectd-extensions/tests/playbooks/upload-security-reports.yaml
+
+- job:
+    name: kube-cpusets-tox-py313
+    parent: tox
+    description: |
+      Run py313 for kube-cpusets
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      tox_envlist: py313
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-cpusets-tox-flake8-trixie
+    parent: tox
+    description: |
+      Run flake8 test for kube-cpusets (Trixie)
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-cpusets/kube-cpusets/*
+    vars:
+      tox_envlist: flake8-trixie
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-cpusets-tox-pylint-trixie
+    parent: tox
+    description: |
+      Run pylint test for kube-cpusets (Trixie)
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-cpusets/*
+    vars:
+      tox_envlist: pylint-trixie
+      tox_config_file: kube-cpusets/kube-cpusets/tox.ini
+
+- job:
+    name: kube-memory-tox-py313
+    parent: tox
+    description: |
+      Run py313 test for kube-memory
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: py313
+      tox_config_file: kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-flake8-trixie
+    parent: tox
+    description: |
+      Run flake8 test for kube-memory (Trixie)
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: flake8-trixie
+      tox_config_file: kube-memory/kube-memory/tox.ini
+
+- job:
+    name: kube-memory-tox-pylint-trixie
+    parent: tox
+    description: |
+      Run pylint test for kube-memory (Trixie)
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - kube-memory/kube-memory/*
+    vars:
+      tox_envlist: pylint-trixie
+      tox_config_file: kube-memory/kube-memory/tox.ini
+
+- job:
+    name: collectd-extensions-py313
+    parent: tox
+    description: |
+      Run py313 for collectd-extensions
+    required-projects:
+      - starlingx/config
+    nodeset: debian-trixie-8GB
+    files:
+      - collectd-extensions/*
+    vars:
+      tox_envlist: py313
+      tox_extra_args: -c collectd-extensions/tox.ini
