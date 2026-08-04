@@ -1,0 +1,27 @@
+# hacking pulls in flake8
+hacking>=6.1.0
+bashate >= 0.2
+bandit;python_version>="3.5"
+pytest>=8.3.4
+pytest-cov>=4.1.0
+mock>=5.1.0
+testtools>=2.7.2
+stestr>=4.1.0
+prettytable>=3.15.1
+httplib2>=0.22.0
+six>=1.17.0
+numpy>=2.2.4
+oslo.concurrency>=7.1.0
+kubernetes>=35.0.0
+urllib3>=2.3.0
+libvirt-python>=10.0.0
+python-novaclient>=18.9.0
+python-cinderclient>=9.7.0
+python-glanceclient>=4.8.0
+python-keystoneclient>=5.6.0
+keystoneauth1>=5.10.0
+keystonemiddleware>=10.9.0
+oslo.serialization>=5.7.0
+oslo.config>=9.7.1
+psutil>=7.0.0
+sqlalchemy>=2.0.40

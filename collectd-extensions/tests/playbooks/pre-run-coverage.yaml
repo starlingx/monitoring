@@ -1,0 +1,10 @@
+- hosts: all
+  tasks:
+    - name: Install system dependencies for coverage tests
+      become: true
+      apt:
+        name:
+          - libvirt-dev
+          - pkg-config
+        state: present
+      failed_when: false

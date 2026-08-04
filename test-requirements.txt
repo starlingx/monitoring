@@ -2,3 +2,26 @@
 hacking < 4.0.1
 bashate >= 0.2
 bandit;python_version>="3.5"
+pytest>=8.0.1
+pytest-cov>=4.1.0
+mock>=5.1.0
+testtools>=2.7.2
+stestr>=4.1.0
+prettytable>=0.7.2
+httplib2>=0.18.1
+six>=1.16.0
+numpy>=1.19.5
+oslo.concurrency>=4.3.1
+kubernetes>=34.1.0
+urllib3>=1.26.5
+libvirt-python>=10.0.0
+python-novaclient>=17.2.1
+python-cinderclient>=7.2.0
+python-glanceclient>=3.2.2
+python-keystoneclient>=4.1.1
+keystoneauth1>=4.2.1
+keystonemiddleware>=9.1.0
+oslo.serialization>=4.0.2
+oslo.config>=8.3.3
+psutil>=5.9.8
+sqlalchemy>=1.4.47

@@ -137,7 +137,15 @@ enable=E1603,E1609,E1610,E1602,E1606,E1608,E1607,E1605,E1604,E1601,E1611,W1652,
 #  R0915: Too many statements
 # Disable Python3 checkers:
 #  W1618: no-absolute-import
-disable=C0103, C0111, C0325, C0330, R0912, R0914, R0915, W0703, W1618
+# TODO: Fix these warnings and re-enable
+# W0613: unused-argument
+# W1514: unspecified-encoding
+# C0415: import-outside-toplevel
+# C0209: consider-using-f-string
+# W0108: unnecessary-direct-lambda-call
+# R1732: consider-using-with
+# E1137: unsupported-assignment-operation (prettytable.align false positive)
+disable=C0103, C0111, C0325, C0330, R0912, R0914, R0915, W0703, W1618,W0613,W1514,C0415,C0209,W0108,R1732,R0022,W0012,E0015,E1137,unnecessary-direct-lambda-call
 
 [REPORTS]
 

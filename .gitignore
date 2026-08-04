@@ -2,3 +2,4 @@
 .coverage
 .stestr
 __pycache__/
+UTCoverage/
