@@ -10,9 +10,15 @@ via the socket API. Raises FM alarm on SyncE source loss (HOLDOVER/
 UNLOCKED), clears on recovery (LOCKED). Also raises FM alarm when
 synce4l service is enabled but not running (stopped/failed/killed).
 
+Implements a configurable holdover timer: when the DPLL enters HOLDOVER,
+the plugin sets holdover_ql and starts a countdown. If the source does
+not recover before the timer expires, the plugin transitions to freerun_ql
+and escalates the alarm from major to critical.
+
 State-to-QL mapping:
   LOCKED / LOCKED_HO_ACQ -> pass-through (no override), alarm clear
   HOLDOVER               -> QL-SSU-A (0x04), alarm raised (major)
+  HOLDOVER (timer expired)-> QL-DNU  (0x0f), alarm escalated (critical)
   UNLOCKED / FREERUN     -> QL-DNU  (0x0f), alarm raised (critical)
 """
 
@@ -20,6 +26,7 @@ import collectd
 import socket
 import struct
 import subprocess
+import time
 import configparser
 from glob import glob
 import re
@@ -81,6 +88,10 @@ class SynceController:
         self.instance_name = None
         self._config_logged = False
 
+        # Holdover timer state
+        self._holdover_start = None  # monotonic timestamp of HOLDOVER entry
+        self._holdover_expired = False
+
         # Default instance-monitoring.conf config values
         # - required
         self.socket_path = None
@@ -92,6 +103,7 @@ class SynceController:
         self.holdover_ql = 0x04
         self.freerun_ql = 0x0f
         self.static_ql = 0x02  # PRC — advertised when locked, no incoming SyncE
+        self.holdover_timer = 14400  # seconds before escalating to freerun (4h)
 
     def config(self):
         """Auto-discover from instance-monitoring.conf."""
@@ -180,6 +192,10 @@ class SynceController:
         if 'static_ql' in section:
             self.static_ql = int(section['static_ql'], 0)
             collectd.info(f"{PLUGIN} config found: static_ql={self.static_ql:#x}")
+        if 'holdover_timer' in section:
+            self.holdover_timer = int(section['holdover_timer'])
+            collectd.info(f"{PLUGIN} config found: "
+                          f"holdover_timer={self.holdover_timer}s")
 
         collectd.info(f"{PLUGIN} loaded monitoring config for [{instance_name}]")
 
@@ -195,6 +211,20 @@ class SynceController:
 
         try:
             self._api = fm_api.FaultAPIs()
+            # Clear any stale synce alarms from previous collectd session.
+            # Follows same pattern as ptp plugin: fresh start = clean slate.
+            # The ptp plugin skips synce alarms, so we must handle our own.
+            try:
+                alarms = self._api.get_faults_by_id(PLUGIN_ALARMID)
+                if alarms:
+                    for alarm in alarms:
+                        eid = alarm.entity_instance_id
+                        if eid and '.synce=' in eid:
+                            self._api.clear_fault(PLUGIN_ALARMID, eid)
+                            collectd.info(f"{PLUGIN} cleared startup alarm:"
+                                          f" {eid}")
+            except Exception as ex:
+                collectd.warning(f"{PLUGIN} startup alarm query failed: {ex}")
             # Non-singleton avoids stale-socket read errors over time
             self._dpll = NetlinkDPLL(True)
             devices = self._dpll.get_all_devices()
@@ -247,8 +277,32 @@ class SynceController:
                 collectd.info(f"{PLUGIN} DPLL locked (SyncE source), "
                               f"clearing QL override")
                 self._last_ql = None
+            self._cancel_holdover_timer()
             self._clear_source_loss_alarm()
             return
+
+        # Holdover timer: on HOLDOVER entry start timer, on expiry escalate
+        if status == LockStatus.HOLDOVER:
+            if self._holdover_start is None:
+                # Entering holdover — start timer
+                self._holdover_start = time.monotonic()
+                self._holdover_expired = False
+                collectd.info(f"{PLUGIN} HOLDOVER entered, "
+                              f"timer started ({self.holdover_timer}s)")
+            elif (not self._holdover_expired and
+                  time.monotonic() - self._holdover_start >=
+                  self.holdover_timer):
+                # Timer expired — escalate to freerun
+                self._holdover_expired = True
+                collectd.info(f"{PLUGIN} holdover timer expired after "
+                              f"{self.holdover_timer}s, escalating to "
+                              f"freerun QL={self.freerun_ql:#x}")
+            # Use freerun_ql if timer expired, otherwise holdover_ql
+            if self._holdover_expired:
+                ql = self.freerun_ql
+        else:
+            # UNLOCKED/FREERUN — immediate freerun, no timer needed
+            self._cancel_holdover_timer()
 
         if ql != self._last_ql:
             state_name = getattr(status, 'name', str(status))
@@ -257,11 +311,27 @@ class SynceController:
             if self._set_ql(ql):
                 self._last_ql = ql
 
-        # Alarm only for degraded states (holdover/freerun), not static_ql
+        # Alarm: major for holdover (timer not expired), critical otherwise
         if status in (LockStatus.LOCKED, LockStatus.LOCKED_AND_HOLDOVER):
+            self._cancel_holdover_timer()
             self._clear_source_loss_alarm()
-        else:
+        elif status == LockStatus.HOLDOVER and not self._holdover_expired:
             self._raise_source_loss_alarm(status)
+        else:
+            self._raise_source_loss_alarm(LockStatus.UNLOCKED)
+
+    def _cancel_holdover_timer(self):
+        """Cancel holdover timer on recovery or direct freerun."""
+        if self._holdover_start is not None:
+            elapsed = time.monotonic() - self._holdover_start
+            if self._holdover_expired:
+                collectd.info(f"{PLUGIN} holdover timer cleared "
+                              f"after {elapsed:.0f}s (was expired)")
+            else:
+                collectd.info(f"{PLUGIN} holdover timer cancelled "
+                              f"after {elapsed:.0f}s")
+            self._holdover_start = None
+            self._holdover_expired = False
 
     def _is_service_enabled(self, service):
         """Check if synce4l service is enabled via systemctl."""
