@@ -51,7 +51,52 @@ re_dict = re.compile(r'^(\w+)\s+(\d+)')
 re_pid = re.compile(r'^\d')
 re_word = re.compile(r'^(\w+)')
 re_uid = re.compile(r'^pod(\S+)')
-re_path_uid = re.compile(r'\/pod(\S+)\/')
+# v2 cgroup dirs flatten the entire hierarchy into one name, e.g.:
+#   k8sinfra_stx-kubepods-burstable-pod<uid>.slice
+# We anchor on '-pod' (not 'pod') because 'kubepods' also contains 'pod';
+# without the hyphen anchor, re.search() matches the first 'pod' in
+# 'kubepods' and captures garbage like 's-burstable-pod<uid>'.
+re_uid_v2 = re.compile(r'-pod(\S+)\.slice$')
+re_path_uid = re.compile(r'/pod(\S+)/')
+re_path_uid_v2 = re.compile(r'-pod(\S+)\.slice')
+
+
+def extract_pod_uid(name, from_path=False):
+    """Extract pod UID from a cgroup directory name or path.
+
+    Handles both v1 and v2 cgroup naming conventions:
+      v1 dir:  pod<uid>
+      v1 path: /kubepods/burstable/pod<uid>/<cid>
+      v2 dir:  k8sinfra_stx-kubepods-burstable-pod<uid>.slice
+      v2 path: .../k8sinfra_stx-kubepods-burstable-pod<uid>.slice/...
+
+    Args:
+        name: directory name or full path string
+        from_path: True if matching against a full path (uses path regexes)
+
+    Returns:
+        pod UID string with hyphens, or None if not a pod entry
+    """
+    if pc.CGROUP_V2:
+        if '-pod' not in name:
+            return None
+        regex = re_path_uid_v2 if from_path else re_uid_v2
+        match = regex.search(name)
+        if match:
+            return match.group(1).replace('_', '-')
+    else:
+        if from_path:
+            if '/pod' not in name:
+                return None
+            match = re_path_uid.search(name)
+        else:
+            if not name.startswith('pod'):
+                return None
+            match = re_uid.search(name)
+        if match:
+            return match.group(1)
+    return None
+
 re_blank = re.compile(r'^\s*$')
 re_comment = re.compile(r'^\s*[#!]')
 re_nonword = re.compile(r'^\s*\W')
@@ -295,20 +340,26 @@ def get_platform_memory():
     # We can safely ignore reading this if the path does not exist.
     # The path wont exist on non-K8S nodes. The path is created as part of
     # kubernetes configuration.
+    #
+    # v1 path example:
+    #   /sys/fs/cgroup/memory/k8sinfra_stx/kubepods/burstable/pod<uid>
+    # v2 path example:
+    #   /sys/fs/cgroup/k8sinfra_stx.slice/k8sinfra_stx-kubepods.slice/
+    #     k8sinfra_stx-kubepods-burstable-pod<uid_with_underscores>.slice
     paths = ['/'.join([MEMCONT, pc.K8S_ROOT, pc.KUBEPODS]),
              '/'.join([MEMCONT, pc.K8S_ROOT_STX, pc.KUBEPODS_STX])]
     for path in paths:
         if not os.path.isdir(path):
             continue
         for root, dirs, files in pc.walklevel(path, level=1):
+            if MEMORY_STAT not in files:
+                continue
             for name in dirs:
-                if name.startswith('pod') and MEMORY_STAT in files:
-                    match = re_uid.search(name)
-                    if match:
-                        uid = match.group(1)
-                        cg_path = os.path.join(root, name)
-                        m = get_cgroup_memory(cg_path)
-                        memory[pc.GROUP_PODS][uid] = m.get('rss_MiB', 0.0)
+                uid = extract_pod_uid(name)
+                if uid:
+                    cg_path = os.path.join(root, name)
+                    m = get_cgroup_memory(cg_path)
+                    memory[pc.GROUP_PODS][uid] = m.get('rss_MiB', 0.0)
     return memory
 
 
@@ -591,26 +642,24 @@ def get_platform_memory_per_process():
             cg_path = '/'.join([path, directory])
             paths = get_cgroups_procs_paths(cg_path)
             for path in paths:
-                if '/pod' in path:
-                    match = re_path_uid.search(path)
-                    if match:
-                        uid = match.group(1)
-                        for pid in get_cgroup_pid(path):
-                            name = str(get_pid_name(pid))
-                            rss = get_pid_rss(pid)
-                            if rss is not None and rss > 0:
-                                pods_mem[int(pid)] = {
+                uid = extract_pod_uid(path, from_path=True)
+                if uid:
+                    for pid in get_cgroup_pid(path):
+                        name = str(get_pid_name(pid))
+                        rss = get_pid_rss(pid)
+                        if rss is not None and rss > 0:
+                            pods_mem[int(pid)] = {
+                                'rss': float(rss),
+                                'name': str(name)}
+                            if uid not in pod_group:
+                                pod_group[uid] = {}
+                            if pid not in pod_group[uid]:
+                                pod_group[uid][int(pid)] = {}
+                                pod_group[uid][int(pid)] = {
                                     'rss': float(rss),
                                     'name': str(name)}
-                                if uid not in pod_group:
-                                    pod_group[uid] = {}
-                                if pid not in pod_group[uid]:
-                                    pod_group[uid][int(pid)] = {}
-                                    pod_group[uid][int(pid)] = {
-                                        'rss': float(rss),
-                                        'name': str(name)}
-                    else:
-                        k8s_system_pids.extend(get_cgroup_pid(path))
+                else:
+                    k8s_system_pids.extend(get_cgroup_pid(path))
 
     for pid in platform_pids:
         name = str(get_pid_name(pid))
