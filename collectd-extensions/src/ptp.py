@@ -3842,6 +3842,112 @@ def process_ptp_bc(instance):
     if domain != upstream_domain:
         return
 
+    # Check if the ts2phc service disciplining this instance is running.
+    # If ts2phc is not running, degrade downstream PTP status through
+    # holdover (if previously locked) and then to holdover expired when
+    # the holdover timer expires.
+    base_port = get_base_port(ctrl.interface)
+    mapped_ts2phc_instance = ts2phc_instance_map.get(base_port, None)
+    if mapped_ts2phc_instance:
+        mapped_ts2phc_service = (
+            PTP_INSTANCE_TYPE_TS2PHC + "@" + mapped_ts2phc_instance + ".service"
+        )
+        is_ts2phc_running = is_service_running(mapped_ts2phc_service)
+        if not is_ts2phc_running:
+            collectd.info(
+                f"{PLUGIN} process_ptp_bc: ts2phc service "
+                f"{mapped_ts2phc_service} is not running, "
+                f"degrading downstream PTP status for {instance}")
+
+            previous_state = ctrl.ptp4l_ptp_source_state
+            # Determine degraded state based on previous state.
+            # Transition to holdover only from locked.
+            # In holdover, verify holdover timer.
+            # Once holdover has expired, remain in holdover expired.
+            # Once unlocked, remain in unlocked (free-run).
+            if previous_state == CLOCK_STATE_LOCKED:
+                state = CLOCK_STATE_HOLDOVER
+            else:
+                state = previous_state
+
+            current_data = query_pmc(instance,
+                                     'GRANDMASTER_SETTINGS_NP',
+                                     query_action='GET')
+            if len(current_data) < 11:
+                collectd.info(f"{PLUGIN} failed to query current GM settings NP, "
+                              f"response: {current_data}")
+                return
+            new_data = dict(current_data)
+            new_clock_class = None
+            new_clock_accuracy = None
+            new_offset_scaled = None
+            new_time_traceable = None
+            new_freq_traceable = None
+            new_time_source = None
+
+            if state == CLOCK_STATE_HOLDOVER:
+                # Initialize holdover timestamp if not already set
+                if (
+                    ctrl.interface not in ctrl.holdover_timestamp or
+                    not ctrl.holdover_timestamp[ctrl.interface]
+                ):
+                    ctrl.holdover_timestamp[ctrl.interface] = timeutils.utcnow()
+                    collectd.info(
+                        f"{PLUGIN} Holdover timestamp for {instance} "
+                        f"PHC {ctrl.interface}: "
+                        f"{ctrl.holdover_timestamp[ctrl.interface]}")
+
+                # Check if holdover timer has expired
+                delta = timeutils.delta_seconds(
+                    ctrl.holdover_timestamp[ctrl.interface],
+                    timeutils.utcnow(),
+                )
+                if delta <= ctrl.monitoring_parameters['holdover_seconds']:
+                    # T-BC in holdover, within holdover specification
+                    new_clock_class = CLOCK_CLASS_135
+                    new_clock_accuracy = '0xfe'
+                    new_offset_scaled = '0xffff'
+                    new_time_traceable = '1'
+                    new_freq_traceable = '0'
+                    new_time_source = '0xa0'
+                else:
+                    # Holdover expired
+                    state = CLOCK_STATE_HOLDOVER_EXPIRED
+                    new_clock_class = CLOCK_CLASS_165
+                    new_clock_accuracy = '0xfe'
+                    new_offset_scaled = '0xffff'
+                    new_time_traceable = '0'
+                    new_freq_traceable = '0'
+                    new_time_source = '0xa0'
+
+            ctrl.ptp4l_ptp_source_state = state
+            if new_clock_class is not None:
+                new_data['clockClass'] = new_clock_class
+            if new_clock_accuracy is not None:
+                new_data['clockAccuracy'] = new_clock_accuracy
+            if new_offset_scaled is not None:
+                new_data['offsetScaledLogVariance'] = new_offset_scaled
+            if new_time_traceable is not None:
+                new_data['timeTraceable'] = new_time_traceable
+            if new_freq_traceable is not None:
+                new_data['frequencyTraceable'] = new_freq_traceable
+            if new_time_source is not None:
+                new_data['timeSource'] = new_time_source
+
+            fields = ['clockClass',
+                      'clockAccuracy',
+                      'offsetScaledLogVariance',
+                      'currentUtcOffset',
+                      'currentUtcOffsetValid',
+                      'ptpTimescale',
+                      'timeTraceable',
+                      'frequencyTraceable',
+                      'timeSource']
+            if any(new_data[field] != current_data[field]
+                   for field in fields):
+                write_ptp4l_gm_fields(instance, new_data)
+            return
+
     # Query upstream's parent, time properties and port data sets, and
     # current downstream grandmaster settings.
     # To avoid status swing, if a query fails keep previous status.
