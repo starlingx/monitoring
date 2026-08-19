@@ -4286,6 +4286,12 @@ def _check_dpll_mgr_state():
                      status.get('connected_pin', '?'),
                      ever_locked,
                      status.get('operation_mode', '?')))
+    pins = status.get('pins', {})
+    for pin_name, pin_info in pins.items():
+        collectd.info("%s dpll-mgr %s pin %s state=%s priority=%s"
+                      % (PLUGIN, dpll_mgr_instance, pin_name,
+                         pin_info.get('state', '?'),
+                         pin_info.get('priority', '?')))
 
     if lock == 'holdover':
         ho_obj = ctrl.holdover_alarm_object
