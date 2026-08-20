@@ -14,7 +14,10 @@ ExecStopPost=/bin/rm -f /var/run/collectd.pid
 
 # cgroup performance engineering
 # - smooth out CPU impulse from poorly behaved plugin
+# CPUShares for v1
 CPUShares=256
+# CPUWeight for v2
+CPUWeight=25
 
 [Install]
 WantedBy=multi-user.target
