@@ -150,7 +150,7 @@ def get_gps_data_by_session(session, device_path):
                     break
                 else:
                     data.lock_state = 1
-                    if sky_report_scanned:
+                    if sky_report_scanned and data.satellite_count > 0:
                         break
 
                 # Set TPV report scanned flag
@@ -162,21 +162,23 @@ def get_gps_data_by_session(session, device_path):
                 and "device" in report
                 and report["device"] == device_path
             ):
-                # uSat key is optional in SKY class, Number of satellites used in navigation solution
+                # In gpsd >= 3.25, multiple SKY reports may be emitted per
+                # cycle (one per GNSS constellation). Only some contain the
+                # uSat and satellites fields. Only update our data when the
+                # fields are present — never zero out a previously good value.
                 if "uSat" in report:
                     data.satellite_count = report["uSat"]
-                else:
-                    data.satellite_count = 0
-                # satellites key is optional in SKY class, List of satellite objects in skyview
                 if "satellites" in report:
-                    data.signal_quality_db = get_signal_to_noise_ratio(
-                        report["satellites"]
-                    )
-                else:
-                    data.signal_quality_db = SignalQualityDb(min=0, max=0, avg=0)
+                    snr = get_signal_to_noise_ratio(report["satellites"])
+                    # Only update if we got actual data (avoid overwriting
+                    # a good reading with an empty constellation report).
+                    if snr.avg > 0 or data.signal_quality_db.avg == 0:
+                        data.signal_quality_db = snr
 
                 # All reports collected, No more polling required.
-                if tpv_report_scanned:
+                # Only break if we have meaningful satellite data, since
+                # gpsd 3.25 may send empty constellation reports first.
+                if tpv_report_scanned and data.satellite_count > 0:
                     break
 
                 # Set SKY report scanned flag
@@ -217,8 +219,15 @@ def get_gps_data(device_path):
             signal_quality_db=SignalQualityDb(min=0, max=0, avg=0),
         )
 
-    session.stream(flags=gps.WATCH_JSON)
-    session.stream(flags=gps.WATCH_DEVICE, devpath=device_path)
+    # Use a single stream() call with combined flags and device path.
+    # In gpsd >= 3.25 (Debian Trixie), calling stream() multiple times
+    # overwrites the previous configuration rather than augmenting it.
+    # Combining WATCH_ENABLE | WATCH_JSON with devpath in one call works
+    # correctly on both gpsd 3.22 (Bullseye) and 3.25 (Trixie).
+    session.stream(
+        flags=gps.WATCH_ENABLE | gps.WATCH_JSON | gps.WATCH_DEVICE,
+        devpath=device_path,
+    )
 
     data = get_gps_data_by_session(session, device_path)
 
