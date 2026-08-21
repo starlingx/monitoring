@@ -524,6 +524,30 @@ def calculate_occupancy(
         cpuacct[pc.GROUP_OVERALL][pc.GROUP_PLATFORM] += \
             cpuacct[pc.GROUP_OVERALL][g]
 
+    # v2: cgroup cpu.stat does not provide per-CPU breakdown, so platform
+    # overhead is back-calculated from schedstat and cgroup measurements,
+    # using the following definition for total platform occupancy:
+    #
+    #   p_occ = overhead_occ + base_occ + k8s_system_occ
+    #
+    # p_occ is schedstat based; base_occ and k8s_system_occ are cgroup based.
+    # The overhead is calculated as:
+    #   overhead_occ = p_occ - base_occ - k8s_system_occ
+    #
+    # Applied at cputime level (nanoseconds) so all downstream calculations
+    # (occupancy, histogram, debug logs) remain consistent.
+    if pc.CGROUP_V2:
+        cpuacct[pc.GROUP_OVERALL][pc.GROUP_OVERHEAD] = max(
+            0.0,
+            cputime_ms * float(pc.ONE_MILLION)
+            - cpuacct[pc.GROUP_OVERALL].get(pc.GROUP_BASE, 0.0)
+            - cpuacct[pc.GROUP_OVERALL].get(pc.GROUP_K8S_SYSTEM, 0.0))
+        # Recalculate platform as sum of its components
+        cpuacct[pc.GROUP_OVERALL][pc.GROUP_PLATFORM] = \
+            cpuacct[pc.GROUP_OVERALL][pc.GROUP_OVERHEAD] \
+            + cpuacct[pc.GROUP_OVERALL].get(pc.GROUP_BASE, 0.0) \
+            + cpuacct[pc.GROUP_OVERALL].get(pc.GROUP_K8S_SYSTEM, 0.0)
+
     # Calculate cgroup based occupancy for overall groupings
     for g in pc.OVERALL_GROUPS:
         cputime_ms = \
