@@ -4265,12 +4265,11 @@ def _check_dpll_mgr_state():
                      status.get('current_master', '?'),
                      status.get('previous_master', '?')))
     collectd.info("%s dpll-mgr %s in_holdover=%s holdover_level=%s "
-                  "holdover_duration_s=%s clock_class=%s"
+                  "holdover_duration_s=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('in_holdover', '?'),
                      status.get('holdover_level', '?'),
-                     status.get('holdover_duration_s', '?'),
-                     status.get('clock_class', '?')))
+                     status.get('holdover_duration_s', '?')))
     collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('gearshift', {}).get('ptp_bh', '-'),
@@ -4297,7 +4296,6 @@ def _check_dpll_mgr_state():
         ho_obj = ctrl.holdover_alarm_object
         severity = DPLL_MGR_HOLDOVER_SEVERITY.get(
             holdover_level, fm_constants.FM_ALARM_SEVERITY_WARNING)
-        clock_class = status.get('clock_class', '?')
         duration_min = int(holdover_duration_s) // 60
 
         if (ho_obj.raised is False
@@ -4308,14 +4306,14 @@ def _check_dpll_mgr_state():
             ho_obj.raised = False
             ho_obj.severity = severity
             ho_obj.reason = (
-                "%s DPLL holdover tier %d (clockClass %s) "
+                "%s DPLL holdover tier %d "
                 "— timing reference lost for %d min"
-                % (obj.hostname, holdover_level, clock_class,
+                % (obj.hostname, holdover_level,
                    duration_min))
             collectd.info(
                 "%s dpll-mgr holdover alarm: level=%d severity=%s "
-                "clockClass=%s duration=%d min for %s"
-                % (PLUGIN, holdover_level, severity, clock_class,
+                "duration=%d min for %s"
+                % (PLUGIN, holdover_level, severity,
                    duration_min, dpll_mgr_instance))
             if not ever_locked:
                 # Boot grace: don't raise alarm before first lock

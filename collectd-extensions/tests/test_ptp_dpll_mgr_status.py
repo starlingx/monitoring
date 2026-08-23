@@ -75,7 +75,6 @@ def _make_status(lock_status='locked', current_master='GNSS_REF4P',
         'in_holdover': in_holdover,
         'holdover_duration_s': kwargs.get('holdover_duration_s', 0),
         'holdover_level': holdover_level,
-        'clock_class': kwargs.get('clock_class', default_clock_class),
         'gearshift': kwargs.get('gearshift', {'ptp_bh': 'NEUTRAL',
                                               'ts2_0': 'DRIVE'}),
         'phase_offset_ns': kwargs.get('phase_offset_ns', 0),
@@ -449,9 +448,9 @@ class TestCheckDpllMgrState(unittest.TestCase):
 
     @patch('ptp.is_service_running', return_value=True)
     @patch('ptp.raise_alarm', return_value=True)
-    def test_reason_text_includes_clockclass_and_duration(
+    def test_reason_text_includes_tier_and_duration(
             self, mock_raise, mock_running):
-        """Reason text includes clockClass and duration."""
+        """Reason text includes tier and duration."""
         status = _make_status(lock_status='holdover', in_holdover=True,
                               holdover_level=2, holdover_duration_s=5400,
                               current_master='HOLDOVER_2',
@@ -464,9 +463,9 @@ class TestCheckDpllMgrState(unittest.TestCase):
             ptp._check_dpll_mgr_state()
 
         reason = self.ctrl.holdover_alarm_object.reason
-        self.assertIn('clockClass 15', reason)
         self.assertIn('tier 2', reason)
         self.assertIn('90 min', reason)
+        self.assertNotIn('clockClass', reason)
 
     @patch('ptp.is_service_running', return_value=True)
     @patch('ptp.clear_alarm', return_value=True)
