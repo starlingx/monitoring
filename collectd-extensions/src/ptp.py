@@ -213,6 +213,9 @@ ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOSS = 22
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK = 23
 ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_FORCED_SELECTION = 24
 
+# Phc2sys UTC ahead of PHC (TAI) Alarm code
+ALARM_CAUSE__PHC2SYS_UTC_AHEAD_OF_PHC = 25
+
 # gnss-monitor Alarm codes
 ALARM_CAUSE__GNSS_MONITOR_GNSS_SIGNAL_LOSS = 30
 ALARM_CAUSE__GNSS_MONITOR_SATELLITE_COUNT = 31
@@ -457,6 +460,8 @@ class PTP_ctrl_object:
         self.phc2sys_clock_source_loss = None
         self.phc2sys_clock_source_no_lock = None
         self.phc2sys_clock_source_forced_selection = None
+        self.phc2sys_utc_ahead_of_phc = None
+        self.phc2sys_utc_ahead_of_phc_count = 0
 
 
 # PTP crtl objects for each PTP instances
@@ -1346,6 +1351,9 @@ def raise_alarm(alarm_cause,
     elif alarm_cause == ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK:
         reason += ' clockClass: ' + str(data)
 
+    elif alarm_cause == ALARM_CAUSE__PHC2SYS_UTC_AHEAD_OF_PHC:
+        reason += ' offset: %.0f ns' % abs(float(data))
+
     try:
         fault = fm_api.Fault(
             alarm_id=PLUGIN_ALARMID,
@@ -1505,6 +1513,19 @@ def create_interface_alarm_objects(interface, instance=None, instance_type=PTP_I
         o.cause = fm_constants.ALARM_PROBABLE_CAUSE_UNKNOWN
         ALARM_OBJ_LIST.append(o)
         ctrl.phc2sys_clock_source_low_priority = o
+
+        o = PTP_alarm_object(instance)
+        # UTC (system clock) ahead of PHC (TAI source clock)
+        o.alarm = ALARM_CAUSE__PHC2SYS_UTC_AHEAD_OF_PHC
+        o.severity = fm_constants.FM_ALARM_SEVERITY_WARNING
+        o.reason = obj.hostname
+        o.reason += ' phc2sys system clock (UTC) is ahead of source clock PHC (TAI)'
+        o.repair = 'Check PTP clock synchronization and phc2sys configuration'
+        o.eid = obj.base_eid + '.phc2sys=' + instance + \
+            '.phc2sys=utc-ahead-of-phc'
+        o.cause = fm_constants.ALARM_PROBABLE_CAUSE_51  # timing-problem
+        ALARM_OBJ_LIST.append(o)
+        ctrl.phc2sys_utc_ahead_of_phc = o
 
         ptpinstances[instance] = ctrl
 
@@ -3213,6 +3234,88 @@ def check_time_drift(instance, gm_identity=None, master_offset=0):
                                  ctrl.monitoring_parameters["offset_threshold_major_nsec"]))
 
 
+def check_phc2sys_utc_ahead_of_phc(instance, ctrl):
+    """Check if system clock (UTC) is ahead of source clock PHC (TAI).
+
+    For each phc2sys instance, compare the system clock (CLOCK_REALTIME / UTC)
+    against the PHC source clock (TAI). If UTC is ahead of TAI (i.e., the PHC
+    offset from CLOCK_REALTIME is positive) for consecutive readings, raise a
+    warning alarm. A grace counter avoids false positives from transient
+    conditions during clock source switchovers or synchronization startup.
+    """
+    collectd.debug(f"{PLUGIN} check_phc2sys_utc_ahead_of_phc {instance}")
+
+    # Number of consecutive positive readings required before raising alarm
+    UTC_AHEAD_GRACE_COUNT = 2
+
+    if ctrl.interface is None:
+        collectd.debug(f"{PLUGIN} {instance}: no interface set, skipping "
+                       "UTC-ahead-of-PHC check")
+        return
+
+    try:
+        # Get the PHC offset from CLOCK_REALTIME using phc_ctl cmp
+        data = subprocess.check_output(
+            [PHC_CTL, ctrl.interface, '-q', 'cmp']).decode()
+    except Exception as ex:
+        collectd.debug(f"{PLUGIN} {instance}: failed to read PHC offset: {ex}")
+        return
+
+    if 'offset from CLOCK_REALTIME is' not in data:
+        collectd.debug(f"{PLUGIN} {instance}: unexpected phc_ctl output: {data}")
+        return
+
+    # phc_ctl cmp reports: "offset from CLOCK_REALTIME is <value>ns"
+    # The value is computed as UTC - PHC(TAI), i.e. CLOCK_REALTIME - PHC.
+    # A negative value means PHC (TAI) is ahead of CLOCK_REALTIME (normal).
+    # A positive value means CLOCK_REALTIME (UTC) is ahead of PHC (TAI).
+    #
+    # Normally, PHC (TAI) = UTC + utc_offset (e.g., +37s),
+    # so PHC should be ahead of CLOCK_REALTIME, yielding a negative offset.
+    # If CLOCK_REALTIME is ahead of PHC, the offset will be positive,
+    # indicating an anomalous condition.
+    try:
+        raw_offset = float(data.rsplit(' ', 1)[1].strip('ns\n'))
+    except (ValueError, IndexError) as ex:
+        collectd.debug(f"{PLUGIN} {instance}: failed to parse PHC offset: {ex}")
+        return
+
+    # raw_offset < 0 means PHC is ahead of CLOCK_REALTIME (normal for TAI vs UTC)
+    # raw_offset > 0 means CLOCK_REALTIME (UTC) is ahead of PHC (TAI) - anomalous
+    utc_ahead = (raw_offset > 0)
+
+    alarm_obj = ctrl.phc2sys_utc_ahead_of_phc
+    if alarm_obj is None:
+        return
+
+    if utc_ahead:
+        ctrl.phc2sys_utc_ahead_of_phc_count += 1
+        if ctrl.phc2sys_utc_ahead_of_phc_count >= UTC_AHEAD_GRACE_COUNT:
+            collectd.warning(
+                f"{PLUGIN} {instance}: system clock (UTC) is ahead of source "
+                f"clock PHC (TAI) by {abs(raw_offset):.0f} ns "
+                f"(consecutive readings: {ctrl.phc2sys_utc_ahead_of_phc_count})")
+            rc = raise_alarm(ALARM_CAUSE__PHC2SYS_UTC_AHEAD_OF_PHC,
+                             instance, raw_offset, alarm_obj)
+            if rc is True:
+                alarm_obj.raised = True
+        else:
+            collectd.info(
+                f"{PLUGIN} {instance}: system clock (UTC) ahead of PHC (TAI) "
+                f"detected (reading {ctrl.phc2sys_utc_ahead_of_phc_count}/"
+                f"{UTC_AHEAD_GRACE_COUNT}), waiting for confirmation")
+    else:
+        # Condition cleared - PHC (TAI) is ahead of UTC as expected
+        if ctrl.phc2sys_utc_ahead_of_phc_count > 0:
+            ctrl.phc2sys_utc_ahead_of_phc_count = 0
+        if alarm_obj.raised is True:
+            if clear_alarm(alarm_obj.eid) is True:
+                alarm_obj.raised = False
+                collectd.info(
+                    f"{PLUGIN} {instance}: system clock (UTC) is no longer "
+                    f"ahead of source clock PHC (TAI)")
+
+
 def check_phc2sys_time_drift(instance, ctrl, conf_file):
     collectd.debug(f"{PLUGIN} check_phc2sys_time_drift {instance}")
     # in case of HA, overwrite conf_file with socket_file of active source
@@ -4586,6 +4689,7 @@ def read_func():
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PHC2SYS:
             check_phc2sys_time_drift(instance, ctrl, conf_file)
+            check_phc2sys_utc_ahead_of_phc(instance, ctrl)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_GNSS_MONITOR:
             process_gnss_monitor(ctrl)
