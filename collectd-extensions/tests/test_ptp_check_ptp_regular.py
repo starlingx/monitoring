@@ -114,6 +114,36 @@ class TestCheckPtpRegular(unittest.TestCase):
                 gmIdentity                 acde48.0000.000003
 """
 
+    # Local instance is itself the Grand Master (T-GM): my_identity ==
+    # gmIdentity. The master_offset here is a stale value populated while the
+    # instance was still a slave before becoming master; it must be ignored.
+    TIME_STATUS_LOCAL_GM_STALE_OFFSET = b"""sending: GET TIME_STATUS_NP
+        b49691.fffe.dc787d-0 seq 0 RESPONSE MANAGEMENT TIME_STATUS_NP
+                master_offset              123456
+                ingress_time               0
+                cumulativeScaledRateOffset +0.000000000
+                scaledLastGmPhaseChange    0
+                gmTimeBaseIndicator        0
+                lastGmPhaseChange          0x0000'0000000000000000.0000
+                gmPresent                  false
+                gmIdentity                 b49691.fffe.dc787d
+"""
+
+    # Local instance is locked to a remote Grand Master (T-BC, or a T-GM that
+    # lost GNSS and fell back to an external PTP GM): my_identity != gmIdentity.
+    # The master_offset is meaningful and must be forwarded to check_time_drift.
+    TIME_STATUS_LOCKED_TO_REMOTE_GM = b"""sending: GET TIME_STATUS_NP
+        b49691.fffe.dc787d-0 seq 0 RESPONSE MANAGEMENT TIME_STATUS_NP
+                master_offset              -42
+                ingress_time               1771429877613143311
+                cumulativeScaledRateOffset +0.000000000
+                scaledLastGmPhaseChange    0
+                gmTimeBaseIndicator        0
+                lastGmPhaseChange          0x0000'0000000000000000.0000
+                gmPresent                  true
+                gmIdentity                 acde48.0000.000003
+"""
+
     def setUp(self):
         """Set up test fixtures"""
         self.instance = 'test-instance'
@@ -187,6 +217,175 @@ class TestCheckPtpRegular(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(ptp.ptpinstances[self.instance].nolock_alarm_object.raised, False)
         mock_check_time_drift.assert_called_once()
+
+
+class TestCheckPtpRegularMasterOffset(unittest.TestCase):
+    """Test check_ptp_regular master offset
+
+    Verify master_offset from TIME_STATUS_NP is only forwarded to
+    check_time_drift when the local instance is NOT the Grand Master.
+
+    When the local ptp4l instance is itself the GM (my_identity ==
+    gmIdentity), the reported master_offset can be a stale value left over
+    from when the instance was still a slave, so it must be ignored. When the
+    instance is locked to a remote GM (T-BC, or a T-GM that lost GNSS and fell
+    back to an external PTP GM), the master_offset is meaningful and must be
+    forwarded.
+    """
+
+    # Local instance is the GM: my_identity (b49691.fffe.dc787d) ==
+    # gmIdentity. Stale master_offset must be ignored.
+    TIME_STATUS_LOCAL_GM_STALE_OFFSET = \
+        TestCheckPtpRegular.TIME_STATUS_LOCAL_GM_STALE_OFFSET
+
+    # Local instance is locked to a remote GM: my_identity != gmIdentity.
+    # master_offset must be forwarded.
+    TIME_STATUS_LOCKED_TO_REMOTE_GM = \
+        TestCheckPtpRegular.TIME_STATUS_LOCKED_TO_REMOTE_GM
+
+    # A single SLAVE port so port_locked is True (needed for the T-BC path to
+    # avoid entering the no-lock branch).
+    PORT_DATA_SLAVE = b"""sending: GET PORT_DATA_SET
+        b49691.fffe.dc787d-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            b49691.fffe.dc787d-1
+                portState               SLAVE
+                logMinDelayReqInterval  -4
+                peerMeanPathDelay       0
+                logAnnounceInterval     -3
+                announceReceiptTimeout  3
+                logSyncInterval         -4
+                delayMechanism          1
+                logMinPdelayReqInterval 0
+                versionNumber           2
+"""
+
+    def setUp(self):
+        self.instance = 'test-instance'
+        self.conf_file = '/etc/linuxptp/ptpinstance/ptp4l-test-instance.conf'
+
+        ctrl = PTP_ctrl_object()
+        ctrl.instance_type = 'ptp4l'
+        ctrl.interface = 'ens0f0'
+        ctrl.log_throttle_count = 0
+        ctrl.disciplined_by_ts2phc = True
+        ctrl.nolock_alarm_object = PTP_alarm_object(self.instance)
+        ctrl.nolock_alarm_object.raised = False
+        ctrl.nolock_alarm_object.eid = 'test-eid'
+        ptp.ptpinstances[self.instance] = ctrl
+
+        ptp.obj.hostname = 'test-host'
+        # nmea path lets us control clock_locked via get_netlink_dpll_status
+        ptp.obj.capabilities = {'ts2phc_source': 'nmea'}
+        ptp.obj.INIT_LOG_THROTTLE = 10
+
+    def tearDown(self):
+        if self.instance in ptp.ptpinstances:
+            del ptp.ptpinstances[self.instance]
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_tgm_local_gm_ignores_stale_master_offset(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """T-GM: local instance is GM, stale master_offset must be ignored."""
+        mock_check_output.side_effect = [
+            TestCheckPtpRegular.PORT_DATA_MASTER,
+            self.TIME_STATUS_LOCAL_GM_STALE_OFFSET,
+        ]
+        mock_get_base_port.return_value = 'ens0f0'
+        # DPLL locked so clock_locked is True and we reach check_time_drift
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        # master_offset must NOT be forwarded (called with gm_identity only)
+        mock_check_time_drift.assert_called_once_with(
+            self.instance, 'b49691.fffe.dc787d')
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_tbc_locked_to_remote_gm_forwards_master_offset(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """T-BC: locked to a remote GM, master_offset must be forwarded."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_SLAVE,
+            self.TIME_STATUS_LOCKED_TO_REMOTE_GM,
+        ]
+        mock_get_base_port.return_value = 'ens0f0'
+        # DPLL locked so clock_locked is True and we reach check_time_drift
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        # master_offset (-42) must be forwarded to check_time_drift
+        mock_check_time_drift.assert_called_once_with(
+            self.instance, 'acde48.0000.000003', -42.0)
+
+
+class TestCheckPhc2sysTimeDriftMasterOffset(unittest.TestCase):
+    """Test check_phc2sys_time_drift master offset
+
+    Verify check_phc2sys_time_drift applies the same master_offset gating:
+    forward master_offset only when the local instance is not the GM.
+    """
+
+    def setUp(self):
+        self.instance = 'test-instance'
+        self.conf_file = '/etc/linuxptp/ptpinstance/ptp4l-test-instance.conf'
+
+        ctrl = PTP_ctrl_object()
+        ctrl.instance_type = 'ptp4l'
+        ctrl.interface = 'ens0f0'
+        ctrl.disciplined_by_ts2phc = True
+        # config: no HA, default domain
+        ctrl.timing_instance = MagicMock()
+        ctrl.timing_instance.config = {'global': {}}
+        ptp.ptpinstances[self.instance] = ctrl
+
+        ptp.obj.hostname = 'test-host'
+
+    def tearDown(self):
+        if self.instance in ptp.ptpinstances:
+            del ptp.ptpinstances[self.instance]
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.read_time_status_np')
+    def test_tgm_local_gm_ignores_stale_master_offset(
+        self, mock_read_time_status, mock_check_time_drift
+    ):
+        """T-GM: my_identity == gm_identity, stale master_offset ignored."""
+        # my_identity, gm_present, gm_identity, got_master_offset, master_offset
+        mock_read_time_status.return_value = (
+            'b49691.fffe.dc787d', 'false', 'b49691.fffe.dc787d', True, 123456.0)
+
+        ptp.check_phc2sys_time_drift(
+            self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        mock_check_time_drift.assert_called_once_with(
+            self.instance, 'b49691.fffe.dc787d')
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.read_time_status_np')
+    def test_tbc_locked_to_remote_gm_forwards_master_offset(
+        self, mock_read_time_status, mock_check_time_drift
+    ):
+        """T-BC: my_identity != gm_identity, master_offset forwarded."""
+        mock_read_time_status.return_value = (
+            'b49691.fffe.dc787d', 'true', 'acde48.0000.000003', True, -42.0)
+
+        ptp.check_phc2sys_time_drift(
+            self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        mock_check_time_drift.assert_called_once_with(
+            self.instance, 'acde48.0000.000003', -42.0)
+
 
 if __name__ == '__main__':
     unittest.main()
