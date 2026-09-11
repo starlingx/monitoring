@@ -399,6 +399,11 @@ class PTP_alarm_object:
         self.reason = ''
         self.repair = ''
         self.eid = ''
+        # Last value appended to the reason text for alarms whose reason
+        # carries a changing value (e.g. clockClass for NO_LOCK). Used to
+        # detect when an already-raised alarm must be re-asserted so the
+        # reason text tracks the current value.
+        self.last_reported_value = None
 
 
 # Plugin specific control class and object.
@@ -1320,6 +1325,16 @@ def raise_alarm(alarm_cause,
             f"nsec, major:{ctrl.monitoring_parameters['offset_threshold_major_nsec']} nsec)"
         )
 
+    elif alarm_cause == ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK:
+        # The reason carries the current gm clockClass, which can change
+        # while the alarm stays raised (e.g. 6 -> 7 -> 140). Keep the alarm
+        # reason updated with the latest clockClass even when already raised,
+        # but avoid re-asserting the fault on every poll when it is unchanged.
+        if alarm.raised is True and str(data) == str(alarm.last_reported_value):
+            return True
+        reason += ' clockClass: ' + str(data)
+        alarm.last_reported_value = data
+
     elif alarm.raised is True:
         # If alarm already raised then exit.
         #
@@ -1347,9 +1362,6 @@ def raise_alarm(alarm_cause,
 
     elif alarm_cause == ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_LOW_PRIORITY:
         reason += ' interface: ' + str(data)
-
-    elif alarm_cause == ALARM_CAUSE__PHC2SYS_CLOCK_SOURCE_NO_LOCK:
-        reason += ' clockClass: ' + str(data)
 
     elif alarm_cause == ALARM_CAUSE__PHC2SYS_UTC_AHEAD_OF_PHC:
         reason += ' offset: %.0f ns' % abs(float(data))
@@ -5042,6 +5054,9 @@ def process_phc2sys_ha(ctrl):
                 if alarm_obj.raised is True:
                     if clear_alarm(alarm_obj.eid) is True:
                         alarm_obj.raised = False
+                        # Reset so a subsequent degrade cycle re-asserts the
+                        # fault with the current clockClass.
+                        alarm_obj.last_reported_value = None
                         collectd.info(
                             "%s Phc2sys instance %s source clock %s is now locked to a PRC" %
                             (PLUGIN, ctrl.timing_instance.instance_name,
