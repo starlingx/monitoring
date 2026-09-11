@@ -301,6 +301,7 @@ class TestSynceController(unittest.TestCase):
             "source GNSS\n"
             "holdover_ql 0x04\n"
             "freerun_ql 0x0f\n"
+            "holdover_seconds 300\n"
         )
         ctrl = _make_controller()
         ctrl._load_monitoring_config(config)
@@ -310,6 +311,7 @@ class TestSynceController(unittest.TestCase):
         self.assertEqual(ctrl.source, 'GNSS')
         self.assertEqual(ctrl.holdover_ql, 0x04)
         self.assertEqual(ctrl.freerun_ql, 0x0f)
+        self.assertEqual(ctrl.holdover_seconds, 300)
 
     def test_read_recovery_clears_ql_and_alarm(self):
         """DPLL returns to LockStatus.LOCKED: alarm cleared, SET_QL called."""
@@ -495,7 +497,10 @@ class TestSynceController(unittest.TestCase):
         """After timer expires, freerun_ql is set."""
         mock_time.return_value = 20000
         self.ctrl._last_ql = 0x04
-        self.ctrl._holdover_start = 5599  # 14401s ago
+        # holdover_seconds default is 300; start well beyond it so the
+        # timer is expired (20000 - 5599 = 14401s >= 300s).
+        self.ctrl.holdover_seconds = 300
+        self.ctrl._holdover_start = 5599
         self.ctrl._holdover_expired = False
         self.ctrl._get_dpll_status = MagicMock(
             return_value=LockStatus.HOLDOVER)
@@ -526,10 +531,10 @@ class TestSynceController(unittest.TestCase):
         self.assertFalse(self.ctrl._holdover_expired)
 
     @patch('synce.time.monotonic')
-    def test_holdover_timer_custom_duration(self, mock_time):
-        """Custom holdover_timer respected."""
+    def test_holdover_seconds_custom_duration(self, mock_time):
+        """Custom holdover_seconds respected."""
         mock_time.return_value = 1061
-        self.ctrl.holdover_timer = 60
+        self.ctrl.holdover_seconds = 60
         self.ctrl._last_ql = 0x04
         self.ctrl._holdover_start = 1000  # 61s ago
         self.ctrl._holdover_expired = False
@@ -543,17 +548,17 @@ class TestSynceController(unittest.TestCase):
                         mock_set.assert_called_once_with(0x0f)
         self.assertTrue(self.ctrl._holdover_expired)
 
-    def test_load_monitoring_config_reads_holdover_timer(self):
-        """_load_monitoring_config parses holdover_timer."""
+    def test_load_monitoring_config_reads_holdover_seconds(self):
+        """_load_monitoring_config parses holdover_seconds."""
         config = configparser.ConfigParser(delimiters=' ')
         config.read_string(
             "[synce1]\n"
             "smc_socket_path /tmp/synce4l_socket_synce1\n"
             "interface eno8303\n"
-            "holdover_timer 7200\n"
+            "holdover_seconds 7200\n"
         )
         self.ctrl._load_monitoring_config(config)
-        self.assertEqual(self.ctrl.holdover_timer, 7200)
+        self.assertEqual(self.ctrl.holdover_seconds, 7200)
 
 
 class TestMultiInstance(unittest.TestCase):
