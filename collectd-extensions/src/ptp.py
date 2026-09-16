@@ -3346,7 +3346,16 @@ def check_phc2sys_time_drift(instance, ctrl, conf_file):
     my_identity, gm_present, gm_identity, got_master_offset, master_offset = (
         read_time_status_np(conf_file, is_socket=socket, domain_number=domain_number)
     )
-    if got_master_offset:
+    # When the local ptp4l instance is itself the grand master, the
+    # master_offset reported in TIME_STATUS_NP can hold a stale value
+    # populated while the instance was still a slave, before it became
+    # master. That value is meaningless once the instance is the GM, so
+    # ignore it and rely solely on the PHC-to-system offset for the
+    # out-of-tolerance alarm logic. Comparing identities (rather than the
+    # T-GM flag) also handles the case where a T-GM loses its GNSS signal
+    # and locks to an external PTP GM: master_offset becomes meaningful
+    # again once my_identity differs from gm_identity.
+    if got_master_offset and my_identity != gm_identity:
         check_time_drift(instance, gm_identity, master_offset)
     else:
         check_time_drift(instance, gm_identity)
@@ -5289,7 +5298,16 @@ def check_ptp_regular(instance, ctrl, conf_file):
         if clear_alarm(ctrl.nolock_alarm_object.eid) is True:
             ctrl.nolock_alarm_object.raised = False
 
-    if got_master_offset:
+    # When the local ptp4l instance is itself the grand master, the
+    # master_offset reported in TIME_STATUS_NP can hold a stale value
+    # populated while the instance was still a slave, before it became
+    # master. That value is meaningless once the instance is the GM, so
+    # ignore it and rely solely on the PHC-to-system offset for the
+    # out-of-tolerance alarm logic. Comparing identities (rather than the
+    # T-GM flag) also handles the case where a T-GM loses its GNSS signal
+    # and locks to an external PTP GM: master_offset becomes meaningful
+    # again once my_identity differs from gm_identity.
+    if got_master_offset and my_identity != gm_identity:
         check_time_drift(instance, gm_identity, master_offset)
     else:
         check_time_drift(instance, gm_identity)
