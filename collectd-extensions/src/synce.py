@@ -118,7 +118,7 @@ class SynceController:
         self.holdover_ql = 0x04
         self.freerun_ql = 0x0f
         self.static_ql = 0x02  # PRC — advertised when locked, no incoming SyncE
-        self.holdover_timer = 14400  # seconds before escalating to freerun (4h)
+        self.holdover_seconds = 300  # seconds before escalating to freerun
 
         # Alarm entity IDs (set during init after hostname is known)
         self._source_loss_alarm_eid = None
@@ -185,10 +185,10 @@ class SynceController:
             self.static_ql = int(section['static_ql'], 0)
             collectd.info(f"{self._log_prefix} "
                           f"static_ql={self.static_ql:#x}")
-        if 'holdover_timer' in section:
-            self.holdover_timer = int(section['holdover_timer'])
+        if 'holdover_seconds' in section:
+            self.holdover_seconds = int(section['holdover_seconds'])
             collectd.info(f"{self._log_prefix} "
-                          f"holdover_timer={self.holdover_timer}s")
+                          f"holdover_seconds={self.holdover_seconds}s")
 
         collectd.info(f"{self._log_prefix} monitoring config loaded")
 
@@ -277,14 +277,14 @@ class SynceController:
                 self._holdover_expired = False
                 collectd.info(f"{self._log_prefix} HOLDOVER "
                               f"entered, timer started "
-                              f"({self.holdover_timer}s)")
+                              f"({self.holdover_seconds}s)")
             elif (not self._holdover_expired and
                   time.monotonic() - self._holdover_start >=
-                  self.holdover_timer):
+                  self.holdover_seconds):
                 # Timer expired — escalate to freerun
                 self._holdover_expired = True
                 collectd.info(f"{self._log_prefix} holdover "
-                              f"timer expired after {self.holdover_timer}s, "
+                              f"timer expired after {self.holdover_seconds}s, "
                               f"escalating to freerun "
                               f"QL={self.freerun_ql:#x}")
             # Use freerun_ql if timer expired, otherwise holdover_ql
