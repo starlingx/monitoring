@@ -8,6 +8,7 @@ Requires=local-fs.target network-online.target
 
 [Service]
 Type=notify
+Environment=MALLOC_ARENA_MAX=2
 ExecStart=/usr/sbin/collectd
 ExecStartPost=/bin/bash -c 'echo $MAINPID > /var/run/collectd.pid'
 ExecStopPost=/bin/rm -f /var/run/collectd.pid
