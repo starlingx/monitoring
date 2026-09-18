@@ -546,11 +546,17 @@ class TestCheckClockClass(unittest.TestCase):
     @patch('ptp.workaround_for_stale_parent_data_set')
     @patch('ptp.write_ptp4l_gm_fields')
     @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.get_netlink_dpll_status')
     @patch('ptp.get_dpll_state', return_value=(ptp.CLOCK_STATE_LOCKED, MagicMock()))
     @patch('ptp.query_pmc', return_value={'clockClass': '248'})
-    def test_locked_sets_class_6(self, mock_pmc, mock_dpll, mock_svc,
-                                 mock_write, mock_wa):
+    def test_locked_sets_class_6(self, mock_pmc, mock_dpll, mock_netlink,
+                                 mock_svc, mock_write, mock_wa):
         """Verify locked DPLL sets clock class 6."""
+        # Locked to a GNSS reference (a valid time source), so the
+        # SyncE-only-frequency-holdover guard must not divert to class 7.
+        gnss_pin = MagicMock()
+        gnss_pin.pin_type = ptp.PinType.GNSS
+        mock_netlink.return_value = (ptp.CLOCK_STATE_LOCKED, gnss_pin)
         ptp.check_clock_class('inst1')
         mock_write.assert_called()
         args = mock_write.call_args[0]
@@ -575,9 +581,14 @@ class TestCheckClockClass(unittest.TestCase):
     @patch('ptp.get_dpll_state')
     @patch('ptp.query_pmc', return_value={'clockClass': '6'})
     @patch('ptp.timeutils')
-    def test_holdover_within_spec(self, mock_time, mock_pmc, mock_dpll,
-                                  mock_svc, mock_write, mock_wa):
+    @patch('ptp._is_synce_only_frequency_holdover', return_value=False)
+    def test_holdover_within_spec(self, mock_synce_ho, mock_time, mock_pmc,
+                                  mock_dpll, mock_svc, mock_write, mock_wa):
         """Verify holdover within spec sets clock class 7."""
+        # Plain DPLL holdover (not SyncE-only): get_dpll_state reports
+        # HOLDOVER and _is_synce_only_frequency_holdover() is False, so
+        # check_clock_class takes the time-holdover path (clockClass 7)
+        # without hitting the real netlink/cgu handler.
         mock_dpll.return_value = (ptp.CLOCK_STATE_HOLDOVER, MagicMock())
         # Setup ts2phc instance with holdover timestamp
         ptp.create_interface_alarm_objects('ens1f0', 'ts2phc_inst',

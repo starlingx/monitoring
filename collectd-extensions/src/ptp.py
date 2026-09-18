@@ -2975,6 +2975,10 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
     primary_nic = ts2phc_source_interfaces.get(base_port, None)
 
     severity = fm_constants.FM_ALARM_SEVERITY_CLEAR
+    # Whether this holdover is the SyncE-only frequency kind. Set in the
+    # HOLDOVER branch below; initialized here so it is always defined at the
+    # raise_alarm() call regardless of which severity branch runs.
+    synce_freq_holdover = False
     if not state or state in [CLOCK_STATE_INVALID,
                               CLOCK_STATE_UNLOCKED]:
         severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
@@ -2982,6 +2986,15 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
         ctrl.locked_timestamp[interface] = None
     elif state == CLOCK_STATE_HOLDOVER:
         severity = fm_constants.FM_ALARM_SEVERITY_MINOR
+
+        # A SyncE-only frequency holdover is not a flapping/unstable transition:
+        # get_dpll_state() reinterpreted a hardware-LOCKED (to a SyncE pin, no
+        # GNSS/phase reference) as HOLDOVER. The node remains traceable to a
+        # Category-1 physical-layer frequency source, so the alarm state must
+        # stay HOLDOVER to align with the clockClass plane (clockClass 7 -> 140)
+        # rather than being downgraded to holdover-unstable(freerun). Evaluate
+        # the predicate once here and reuse it below.
+        synce_freq_holdover = _is_synce_only_frequency_holdover(primary_nic)
 
         if interface != primary_nic:
             holdover_ts = ctrl.holdover_timestamp.get(primary_nic, None)
@@ -3004,8 +3017,12 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
             # state transition: locked to holdover happened.
             delta = timeutils.delta_seconds(locked_timestamp,
                                             timeutils.utcnow())
-            if delta < ctrl.monitoring_parameters['locked_to_holdover_threshold_seconds']:
-                # Overwrite state to holdover-unstable and severity to major
+            if (delta < ctrl.monitoring_parameters['locked_to_holdover_threshold_seconds']
+                    and not synce_freq_holdover):
+                # Overwrite state to holdover-unstable and severity to major.
+                # Skipped for a SyncE-only frequency holdover: the DPLL was
+                # hardware-locked to a SyncE pin (not flapping), so it stays a
+                # valid HOLDOVER aligned with the clockClass plane.
                 state = CLOCK_STATE_HOLDOVER_UNSTABLE
                 severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
                 collectd.info(
@@ -3037,9 +3054,14 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
                 # state transition: invalid/unlocked to holdover happened.
                 # This happens when last time's actual holdover overwritten to holdover-unstable,
                 # this next poll cycle sees actual state still in holdover.
-                # Overwrite state and severity, treat still as holdover-unstable
-                severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
-                state = CLOCK_STATE_HOLDOVER_UNSTABLE
+                # Overwrite state and severity, treat still as holdover-unstable.
+                # Skipped for a SyncE-only frequency holdover: it is a valid
+                # HOLDOVER (traceable to the SyncE frequency source), not an
+                # unstable/flapping transition, so it keeps state=HOLDOVER and
+                # the holdover timestamp is seeded below.
+                if not synce_freq_holdover:
+                    severity = fm_constants.FM_ALARM_SEVERITY_MAJOR
+                    state = CLOCK_STATE_HOLDOVER_UNSTABLE
 
         # Reset locked_timestamp, as state changed to holdover/holdover-expired/holdover-unstable
         ctrl.locked_timestamp[interface] = None
@@ -3085,8 +3107,17 @@ def check_gnss_alarm(instance, alarm_object, interface, state):
             alarm_object.severity = severity
             alarm_object.raised = False
         if alarm_object.raised is False:
+            # For a SyncE-only frequency holdover, clarify in the alarm text
+            # WHY the state is holdover (the DPLL is still hardware-locked to a
+            # SyncE frequency pin but has lost its GNSS/phase reference), so the
+            # operator is not left with a bare "holdover" and no cause.
+            alarm_state_detail = state
+            if state == CLOCK_STATE_HOLDOVER and synce_freq_holdover:
+                alarm_state_detail = (
+                    f"{state} (SyncE-only frequency holdover; "
+                    f"no GNSS/phase reference)")
             rc = raise_alarm(alarm_object.alarm, interface,
-                             state, alarm_object)
+                             alarm_state_detail, alarm_object)
             if rc is True:
                 alarm_object.raised = True
 
@@ -3390,6 +3421,25 @@ def get_dpll_state(base_port):
 
     Combine the status of EEC and PPS devices and return the worst state
     and pin information.
+
+    SyncE-only frequency holdover: on GNR-D (zl3073x) the SyncE
+    recovered-clock pin is a selectable DPLL input. When the time/phase
+    reference (GNSS or external 1PPS) is lost the DPLL fails over to SyncE
+    and keeps reporting LOCKED / LOCKED_AND_HOLDOVER, so the raw worst-of
+    state still looks "locked" even though the node has lost its time
+    reference. Per ITU-T G.8275.1 Table 2 this is a time holdover
+    (clockClass 7 -> 140), not a locked state.
+
+    This override is applied HERE, at the single point every consumer
+    (check_clock_class, check_gnss_signal, check_1pps_signal ->
+    check_gnss_alarm) resolves DPLL state, so the clockClass plane, the
+    holdover-timestamp lifecycle, and the GNSS-signal-loss alarm all agree.
+    Applying it in only one consumer previously left the others (e.g. the
+    clock/BC path via check_1pps_signal) treating SyncE-only as locked --
+    nulling the holdover timestamp every poll and clearing the alarm.
+
+    The real (SyncE) pin is returned unchanged; only the state is
+    reinterpreted as HOLDOVER.
     """
     state_eec, pin_eec = get_netlink_dpll_status(base_port, DeviceType.EEC)
     state_pps, pin_pps = get_netlink_dpll_status(base_port, DeviceType.PPS)
@@ -3402,6 +3452,16 @@ def get_dpll_state(base_port):
     else:
         state = state_eec
         pin = pin_eec
+
+    # Reinterpret a SyncE-only frequency holdover (DPLL reports locked but
+    # rides a SyncE pin with no GNSS/EXT time reference) as HOLDOVER. Only
+    # evaluate the predicate for the locked states -- the sole case where the
+    # DPLL looks locked but may be riding SyncE only -- to avoid an extra
+    # netlink read on every poll for genuinely unlocked/holdover states.
+    if state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ] \
+            and _is_synce_only_frequency_holdover(base_port):
+        state = CLOCK_STATE_HOLDOVER
+
     return state, pin
 
 
@@ -3494,6 +3554,51 @@ def workaround_for_stale_parent_data_set(
                 unblock_ptp_traffic(instance_name, iface)
 
 
+def _is_synce_only_frequency_holdover(primary_nic):
+    """Return True for a SyncE-only frequency holdover with no time reference.
+
+    That is, the DPLL is locked to a SyncE frequency pin but has no time/phase
+    reference (GNSS or external 1PPS).
+
+    On GNR-D (zl3073x) the SyncE recovered-clock pin is a selectable DPLL
+    input. When GNSS is lost the DPLL fails over to SyncE and keeps reporting
+    LOCKED/LOCKED_AND_HOLDOVER, so the worst-of get_dpll_state() still looks
+    "locked". Frequency is still traceable via SyncE, but the T-GM has lost
+    its time/phase reference and must NOT advertise clockClass 6.
+
+    Per ITU-T G.8275.1 Table 2, a T-GM in time holdover within specification
+    that remains traceable to a Category-1 physical-layer frequency source
+    (SyncE) advertises clockClass 7 with timeTraceable=TRUE and
+    frequencyTraceable=TRUE, degrading to 140/150/160 as the time-holdover
+    specification is exceeded.
+
+    Returns True only when a SyncE pin is the active reference AND no GNSS or
+    external phase reference is present on either DPLL device.
+    """
+    pps_state, pps_pin = get_netlink_dpll_status(primary_nic, DeviceType.PPS)
+    eec_state, eec_pin = get_netlink_dpll_status(primary_nic, DeviceType.EEC)
+
+    def _is_time_ref(pin):
+        # A valid time/phase reference is GNSS or an external 1PPS
+        # (backhaul SDP / SMA), not a frequency-only SyncE recovered clock.
+        return pin is not None and pin.pin_type in [PinType.GNSS, PinType.EXT]
+
+    def _is_synce(pin):
+        return pin is not None and pin.pin_type == PinType.SYNCE
+
+    have_time_ref = _is_time_ref(pps_pin) or _is_time_ref(eec_pin)
+    have_synce_freq = _is_synce(pps_pin) or _is_synce(eec_pin)
+
+    if have_synce_freq and not have_time_ref:
+        collectd.info(
+            f"{PLUGIN} SyncE-only frequency holdover on {primary_nic}: "
+            f"time reference lost, DPLL locked to SyncE "
+            f"(pps={pps_pin.pin_type.value if pps_pin else None}, "
+            f"eec={eec_pin.pin_type.value if eec_pin else None})")
+        return True
+    return False
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -3579,17 +3684,53 @@ def check_clock_class(instance):
         # ensures handle_ptp4l_g8275_fields() applies degraded clockAccuracy
         # (0xFE) and offsetScaledLogVariance (0xFFFF) per G.8275.1 Table V.2.
         ctrl.ptp4l_prc_state = CLOCK_STATE_UNLOCKED
-    if (is_ts2phc_running and state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]):
+    # A DPLL that has failed over to a SyncE recovered-clock pin after GNSS
+    # loss still reports LOCKED/LOCKED_AND_HOLDOVER at the hardware level, but
+    # the T-GM has lost its time/phase reference. get_dpll_state() already
+    # reinterprets that case as HOLDOVER (single source of truth), so here we
+    # only need to know WHETHER this holdover is the SyncE-only kind -- it
+    # determines frequencyTraceable (a SyncE-disciplined clock stays traceable
+    # to a Category-1 physical-layer frequency source). Derive it from the
+    # predicate directly rather than from the (already-overridden) state.
+    synce_freq_holdover = (
+        is_ts2phc_running
+        and state == CLOCK_STATE_HOLDOVER
+        and _is_synce_only_frequency_holdover(primary_nic)
+    )
+    if (is_ts2phc_running
+            and state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]):
         new_clock_class = CLOCK_CLASS_6
         time_traceable = True
         frequency_traceable = True
         current_utc_offset_valid = True
     elif is_ts2phc_running and state == CLOCK_STATE_HOLDOVER:
+        # Time holdover per G.8275.1. get_dpll_state() maps both a genuine
+        # DPLL holdover and a SyncE-only frequency holdover to HOLDOVER.
+        # Within the holdover specification the T-GM advertises clockClass 7;
+        # once the holdover timer expires it degrades to 140.
+        #
+        # frequencyTraceable differs by kind: a SyncE-disciplined clock
+        # remains traceable to a physical-layer (Category-1) frequency source,
+        # so frequencyTraceable stays TRUE while in spec; a plain DPLL holdover
+        # is likewise treated as frequency-traceable within spec here.
         new_clock_class = CLOCK_CLASS_7
         time_traceable = True
         frequency_traceable = True
         current_utc_offset_valid = True
         holdover_timestamp = None
+        # For the SyncE path the DPLL is "locked" at the hardware level, so a
+        # holdover timestamp may not have been seeded by the alarm path yet
+        # this cycle; seed it now so the 7 -> 140 (out-of-spec) transition can
+        # run on subsequent cycles.
+        if synce_freq_holdover:
+            for _key, _ctrl_obj in ptpinstances.items():
+                if _ctrl_obj.instance_type == instance_type:
+                    if (ho_timer_interface not in _ctrl_obj.holdover_timestamp
+                            or not _ctrl_obj.holdover_timestamp[
+                                ho_timer_interface]):
+                        _ctrl_obj.holdover_timestamp[ho_timer_interface] = \
+                            timeutils.utcnow()
+                    break
         # Get the holdover timestamp of the clock/ts2phc instance
         for key, ctrl_obj in ptpinstances.items():
             if ctrl_obj.instance_type == instance_type:
@@ -3620,8 +3761,15 @@ def check_clock_class(instance):
             ):
                 new_clock_class = CLOCK_CLASS_140
                 time_traceable = False
-                frequency_traceable = False
                 current_utc_offset_valid = False
+                # Per G.8275.1 Table 2 the 7 -> 140/150/160 ladder tracks the
+                # TIME-holdover budget only. A SyncE-only holdover remains
+                # traceable to a Category-1 physical-layer frequency source, so
+                # frequencyTraceable stays TRUE at 140 and only drops to FALSE
+                # (clockClass 248) on loss of the frequency reference. A plain
+                # DPLL holdover has no such physical-layer source once the
+                # holdover spec is exceeded, so it drops frequencyTraceable.
+                frequency_traceable = bool(synce_freq_holdover)
         else:
             # holdover_timestamp None means, source is on derived holdover-unstable state,
             # this is treated as unlocked.
