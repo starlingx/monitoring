@@ -51,8 +51,26 @@ class DeviceType:
     PPS = 'pps'
 
 
+class PinType:
+    """Mock pynetlink.PinType enum for testing."""
+    GNSS = 'gnss'
+    EXT = 'ext'
+    SYNCE = 'synce-eth-port'
+    UNDEFINED = 'undefined'
+
+
+class PinState:
+    """Mock pynetlink.PinState enum for testing."""
+    CONNECTED = 'connected'
+    DISCONNECTED = 'disconnected'
+    SELECTABLE = 'selectable'
+    UNDEFINED = 'undefined'
+
+
 mock_pynetlink.LockStatus = LockStatus
 mock_pynetlink.DeviceType = DeviceType
+mock_pynetlink.PinType = PinType
+mock_pynetlink.PinState = PinState
 mock_pynetlink.NetlinkDPLL = MagicMock
 sys.modules['pynetlink'] = mock_pynetlink
 
@@ -560,6 +578,82 @@ class TestSynceController(unittest.TestCase):
         self.ctrl._load_monitoring_config(config)
         self.assertEqual(self.ctrl.holdover_seconds, 7200)
 
+    # --- Pin-aware holdover reclassification (SyncE-only frequency holdover) ---
+
+    def _mock_pins(self, *pins):
+        """Wire _dpll.get_pins_by_clock_id to return the given (type,state) pins."""
+        pin_objs = []
+        for pin_type, pin_state in pins:
+            p = MagicMock()
+            p.pin_type = pin_type
+            p.pin_state = pin_state
+            pin_objs.append(p)
+
+        class _Pins(list):
+            def filter_by_pin_state(self, state):
+                return _Pins([x for x in self if x.pin_state == state])
+
+        self.ctrl._dpll.get_pins_by_clock_id = MagicMock(
+            return_value=_Pins(pin_objs))
+
+    def test_time_ref_true_when_gnss_connected(self):
+        """Connected GNSS pin counts as a real time reference."""
+        self._mock_pins((synce.PinType.GNSS, synce.PinState.CONNECTED))
+        self.assertTrue(self.ctrl._has_connected_time_reference())
+
+    def test_time_ref_true_when_ext_connected(self):
+        """Connected external (1PPS/SMA) pin counts as a time reference."""
+        self._mock_pins((synce.PinType.EXT, synce.PinState.CONNECTED))
+        self.assertTrue(self.ctrl._has_connected_time_reference())
+
+    def test_time_ref_false_when_only_synce_selectable(self):
+        """A selectable-only SyncE pin is not a time reference."""
+        self._mock_pins((synce.PinType.SYNCE, synce.PinState.SELECTABLE))
+        self.assertFalse(self.ctrl._has_connected_time_reference())
+
+    def test_time_ref_false_when_synce_connected_no_time(self):
+        """A connected SyncE (frequency-only) pin is not a time reference."""
+        self._mock_pins((synce.PinType.SYNCE, synce.PinState.CONNECTED))
+        self.assertFalse(self.ctrl._has_connected_time_reference())
+
+    def test_time_ref_true_on_pin_read_error(self):
+        """On DPLL pin read error, fail safe to prior (recovery) behaviour."""
+        self.ctrl._dpll.get_pins_by_clock_id = MagicMock(
+            side_effect=RuntimeError('netlink boom'))
+        self.assertTrue(self.ctrl._has_connected_time_reference())
+
+    def test_locked_ho_no_timeref_holds_holdover_ql(self):
+        """LOCKED_AND_HOLDOVER with no time ref keeps advertising holdover_ql."""
+        self.ctrl._last_ql = None
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=LockStatus.LOCKED_AND_HOLDOVER)
+        self._mock_pins((synce.PinType.SYNCE, synce.PinState.SELECTABLE))
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True) as mset:
+                    with patch.object(self.ctrl, '_raise_source_loss_alarm'):
+                        self.ctrl.read()
+                        # holdover_ql (0x04), NOT static/pass-through
+                        mset.assert_called_once_with(0x04)
+        # holdover timer must be running, not cancelled
+        self.assertIsNotNone(self.ctrl._holdover_start)
+
+    def test_locked_ho_with_gnss_cancels_holdover(self):
+        """LOCKED_AND_HOLDOVER with a connected GNSS ref is a genuine lock."""
+        # Pretend we were in holdover, then GNSS returns connected.
+        self.ctrl._holdover_start = 1.0
+        self.ctrl._holdover_expired = False
+        self.ctrl._get_dpll_status = MagicMock(
+            return_value=LockStatus.LOCKED_AND_HOLDOVER)
+        self._mock_pins((synce.PinType.GNSS, synce.PinState.CONNECTED))
+        with patch.object(self.ctrl, '_is_service_enabled', return_value=True):
+            with patch.object(self.ctrl, '_is_service_active', return_value=True):
+                with patch.object(self.ctrl, '_set_ql', return_value=True):
+                    with patch.object(self.ctrl, '_clear_source_loss_alarm'):
+                        self.ctrl.read()
+        # genuine lock -> holdover timer cancelled
+        self.assertIsNone(self.ctrl._holdover_start)
+
 
 class TestMultiInstance(unittest.TestCase):
     """Tests for multi-instance discovery and independent operation."""
@@ -742,7 +836,6 @@ class TestMultiInstance(unittest.TestCase):
         self.assertEqual(ctrl.socket_path, '/tmp/synce4l_socket_synce1')
         self.assertEqual(ctrl.interface, 'eno8303')
         self.assertEqual(ctrl.source, 'GNSS')
-
 
 if __name__ == '__main__':
     unittest.main()
