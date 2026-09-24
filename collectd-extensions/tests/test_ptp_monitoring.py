@@ -759,3 +759,265 @@ class TestBlockUnblockPtpTraffic(unittest.TestCase):
         ptp.ethtool_rule_ids['ens1f0'] = '42'
         ptp.unblock_ptp_traffic('inst1', 'ens1f0')
         self.assertNotIn('ens1f0', ptp.ethtool_rule_ids)
+
+
+def _gnss_pin():
+    """A DPLL pin object reporting pin_type == GNSS."""
+    pin = MagicMock()
+    pin.pin_type = ptp.PinType.GNSS
+    pin.pin_board_label = 'GNSS_1PPS_IN'
+    return pin
+
+
+def _ext_pin():
+    """A DPLL pin object reporting pin_type == EXT (e.g. SDP0 backhaul)."""
+    pin = MagicMock()
+    pin.pin_type = ptp.PinType.EXT
+    pin.pin_board_label = 'SDP0_REF0N'
+    return pin
+
+
+class TestGnssPresentOnDevice(unittest.TestCase):
+    """Unit tests for _gnss_present_on_device.
+
+    GNSS is 'present' on a DPLL device when the device has a GNSS-typed input
+    pin whose state is CONNECTED or SELECTABLE (signal available). DISCONNECTED
+    / UNDEFINED / absent means the GNSS signal is lost on that device.
+    """
+
+    def setUp(self):
+        _reset_module_state()
+
+    def _gnss_pin_in_state(self, pin_state):
+        pin = MagicMock()
+        pin.pin_type = ptp.PinType.GNSS
+        pin.pin_state = pin_state
+        return pin
+
+    def _run(self, pins_returned, device=MagicMock()):
+        iface = MagicMock()
+        iface.get_switch_id.return_value = 'clockid-0'
+        with patch.dict(ptp.interfaces, {'eno8703': iface}, clear=False), \
+                patch.object(ptp.cgu_handler, 'cgu_get_current_device_state',
+                             return_value=(device, None)), \
+                patch.object(ptp.cgu_handler, 'search_pins_by_type',
+                             return_value=pins_returned):
+            return ptp._gnss_present_on_device('eno8703', ptp.DeviceType.EEC)
+
+    def test_connected_is_present(self):
+        self.assertTrue(
+            self._run([self._gnss_pin_in_state(ptp.PinState.CONNECTED)]))
+
+    def test_selectable_is_present(self):
+        """SELECTABLE = signal available but not selected -> still present."""
+        self.assertTrue(
+            self._run([self._gnss_pin_in_state(ptp.PinState.SELECTABLE)]))
+
+    def test_disconnected_is_absent(self):
+        self.assertFalse(
+            self._run([self._gnss_pin_in_state(ptp.PinState.DISCONNECTED)]))
+
+    def test_no_gnss_pin_is_absent(self):
+        self.assertFalse(self._run([]))
+
+    def test_no_device_is_absent(self):
+        self.assertFalse(self._run([], device=None))
+
+    def test_unknown_interface_is_absent(self):
+        with patch.dict(ptp.interfaces, {}, clear=True):
+            self.assertFalse(
+                ptp._gnss_present_on_device('nosuch', ptp.DeviceType.EEC))
+
+
+class TestGetGnssSourceState(unittest.TestCase):
+    """Unit tests for get_gnss_source_state.
+
+    GNSS is healthy only when its pin is present (connected or selectable) on
+    BOTH the EEC and PPS DPLL devices -- judged from the GNSS pin's own state,
+    independent of which pin the DPLL is currently selecting. Otherwise the
+    helper reports HOLDOVER so the GNSS-signal-loss alarm stays/raises. Scoped
+    to dpll-mgr-present systems.
+    """
+
+    def setUp(self):
+        _reset_module_state()
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = None
+
+    def test_no_dpll_mgr_is_noop(self):
+        """Without dpll-mgr, state is returned unchanged (no failover)."""
+        ptp._dpll_mgr_instance_name = None
+        with patch('ptp._gnss_present_on_device', return_value=False) as m:
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        self.assertEqual(result, ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        m.assert_not_called()   # guard returns before reading pins
+
+    def test_gnss_present_both_devices_stays_unchanged(self):
+        """GNSS present on EEC and PPS -> state unchanged (clear)."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        with patch('ptp._gnss_present_on_device', return_value=True):
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        self.assertEqual(result, ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+
+    def test_gnss_absent_maps_to_holdover(self):
+        """GNSS not present on both devices -> HOLDOVER (raise)."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        with patch('ptp._gnss_present_on_device', return_value=False):
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        self.assertEqual(result, ptp.CLOCK_STATE_HOLDOVER)
+
+    def test_gnss_on_eec_only_maps_to_holdover(self):
+        """GNSS present on EEC but not PPS (backhaul PPS failover) -> HOLDOVER.
+
+        Models the SDP0 backhaul case: the GNSS pin is gone on the PPS device
+        while something still holds the EEC. Requiring BOTH devices means this
+        is treated as GNSS lost.
+        """
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+
+        def present(iface, device_type):
+            return device_type == ptp.DeviceType.EEC
+
+        with patch('ptp._gnss_present_on_device', side_effect=present):
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        self.assertEqual(result, ptp.CLOCK_STATE_HOLDOVER)
+
+    def test_unlocked_with_gnss_absent_maps_to_holdover(self):
+        """Both sources gone (worst-of UNLOCKED), GNSS absent -> HOLDOVER.
+
+        The per-source result does not depend on the worst-of state: even an
+        UNLOCKED DPLL yields HOLDOVER (graceful GNSS progression) rather than
+        passing UNLOCKED through to an immediate MAJOR.
+        """
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        with patch('ptp._gnss_present_on_device', return_value=False):
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_UNLOCKED)
+        self.assertEqual(result, ptp.CLOCK_STATE_HOLDOVER)
+
+    def test_gnss_selectable_lower_priority_stays_unchanged(self):
+        """GNSS present (selectable, backhaul outranks it) -> not a loss.
+
+        A future priority map where the backhaul outranks GNSS leaves the
+        healthy GNSS pin SELECTABLE; _gnss_present_on_device treats that as
+        present, so the state is unchanged (no false GNSS-loss alarm).
+        """
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        with patch('ptp._gnss_present_on_device', return_value=True):
+            result = ptp.get_gnss_source_state(
+                'eno8703', ptp.CLOCK_STATE_LOCKED)
+        self.assertEqual(result, ptp.CLOCK_STATE_LOCKED)
+
+
+class TestCheckGnssSignalPinAware(unittest.TestCase):
+    """Wiring tests for check_gnss_signal pin-aware state.
+
+    Mocks get_dpll_state and asserts the state handed to check_gnss_alarm.
+    """
+
+    def setUp(self):
+        _reset_module_state()
+        ptp.create_interface_alarm_objects('eno8703', 'ts1',
+                                           ptp.PTP_INSTANCE_TYPE_TS2PHC)
+        ctrl = ptp.ptpinstances['ts1']
+        ctrl.interface = 'eno8703'
+        ctrl.log_throttle_count = 0
+        ptp.base_port_map['eno8703'] = 'eno8703'
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = None
+
+    @patch('ptp.check_gnss_alarm')
+    @patch('ptp.get_base_port', return_value='eno8703')
+    @patch('ptp.get_dpll_state')
+    @patch('ptp._gnss_present_on_device', return_value=True)
+    def test_gnss_locked_passes_locked(self, mock_present, mock_dpll, mock_bp,
+                                       mock_alarm):
+        """GNSS present on both devices -> check_gnss_alarm gets locked."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        mock_dpll.return_value = (ptp.CLOCK_STATE_LOCKED_HO_ACQ, _gnss_pin())
+        ptp.check_gnss_signal('ts1')
+        state_arg = mock_alarm.call_args[0][3]
+        self.assertEqual(state_arg, ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+
+    @patch('ptp.check_gnss_alarm')
+    @patch('ptp.get_base_port', return_value='eno8703')
+    @patch('ptp.get_dpll_state')
+    @patch('ptp._gnss_present_on_device', return_value=False)
+    def test_gnss_on_sdp0_passes_holdover(self, mock_present, mock_dpll,
+                                          mock_bp, mock_alarm):
+        """GNSS absent (failover to SDP0) -> check_gnss_alarm gets HOLDOVER."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        mock_dpll.return_value = (ptp.CLOCK_STATE_LOCKED_HO_ACQ, _ext_pin())
+        ptp.check_gnss_signal('ts1')
+        state_arg = mock_alarm.call_args[0][3]
+        self.assertEqual(state_arg, ptp.CLOCK_STATE_HOLDOVER)
+
+    @patch('ptp.check_gnss_alarm')
+    @patch('ptp.get_base_port', return_value='eno8703')
+    @patch('ptp.get_dpll_state')
+    @patch('ptp._gnss_present_on_device', return_value=False)
+    def test_no_dpll_mgr_on_ext_stays_locked(self, mock_present, mock_dpll,
+                                             mock_bp, mock_alarm):
+        """Without dpll-mgr, an EXT lock is a valid source -> not remapped."""
+        ptp._dpll_mgr_instance_name = None
+        mock_dpll.return_value = (ptp.CLOCK_STATE_LOCKED_HO_ACQ, _ext_pin())
+        ptp.check_gnss_signal('ts1')
+        state_arg = mock_alarm.call_args[0][3]
+        self.assertEqual(state_arg, ptp.CLOCK_STATE_LOCKED_HO_ACQ)
+        # dpll-mgr guard short-circuits before reading GNSS pins
+        mock_present.assert_not_called()
+
+
+class TestCheck1ppsSignalPinAware(unittest.TestCase):
+    """Wiring tests for check_1pps_signal pin-aware state.
+
+    Asserts the state is passed to the alarm on the GNSS-fed clock port.
+    """
+
+    def setUp(self):
+        _reset_module_state()
+        ptp.create_interface_alarm_objects('eno8703', 'clock0',
+                                           ptp.PTP_INSTANCE_TYPE_CLOCK)
+        ctrl = ptp.ptpinstances['clock0']
+        ctrl.interface = 'eno8703'
+        ctrl.log_throttle_count = 0
+        # "no pins configured" branch: the GNSS-fed clock port
+        ctrl.clock_ports = {'eno8703': {}}
+        ptp.base_port_map['eno8703'] = 'eno8703'
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = None
+
+    @patch('ptp.get_alarm_object')
+    @patch('ptp.check_gnss_alarm')
+    @patch('ptp.get_dpll_state')
+    @patch('ptp._gnss_present_on_device', return_value=False)
+    def test_clock_port_on_sdp0_passes_holdover(self, mock_present, mock_dpll,
+                                                mock_alarm, mock_get_alarm):
+        """clock0 GNSS-fed port after failover to SDP0 -> HOLDOVER passed."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        mock_get_alarm.return_value = MagicMock()
+        mock_dpll.return_value = (ptp.CLOCK_STATE_LOCKED_HO_ACQ, _ext_pin())
+        ptp.check_1pps_signal('clock0')
+        state_arg = mock_alarm.call_args[0][3]
+        self.assertEqual(state_arg, ptp.CLOCK_STATE_HOLDOVER)
+
+    @patch('ptp.get_alarm_object')
+    @patch('ptp.check_gnss_alarm')
+    @patch('ptp.get_dpll_state')
+    @patch('ptp._gnss_present_on_device', return_value=True)
+    def test_clock_port_on_gnss_passes_locked(self, mock_present, mock_dpll,
+                                              mock_alarm, mock_get_alarm):
+        """clock0 GNSS present on both devices -> locked state passed (clear)."""
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'
+        mock_get_alarm.return_value = MagicMock()
+        mock_dpll.return_value = (ptp.CLOCK_STATE_LOCKED_HO_ACQ, _gnss_pin())
+        ptp.check_1pps_signal('clock0')
+        state_arg = mock_alarm.call_args[0][3]
+        self.assertEqual(state_arg, ptp.CLOCK_STATE_LOCKED_HO_ACQ)
