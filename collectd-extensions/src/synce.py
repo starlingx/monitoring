@@ -43,6 +43,8 @@ import plugin_common as pc
 from pynetlink import NetlinkDPLL
 from pynetlink import DeviceType
 from pynetlink import LockStatus
+from pynetlink import PinType
+from pynetlink import PinState
 
 PLUGIN = 'synce plugin'
 PLUGIN_READ_INTERVAL = 5
@@ -258,6 +260,24 @@ class SynceController:
         if status is None:
             return
 
+        # Pin-aware holdover reclassification.
+        #
+        # On GNR-D (zl3073x) the EEC can re-report LOCKED_AND_HOLDOVER shortly
+        # after the time reference is lost, by self-locking to a 'selectable'
+        # SyncE recovered-clock pin. That is not a genuine recovery: there is
+        # no traceable time source, so the node is still in frequency holdover.
+        # Taken at face value, LOCKED_AND_HOLDOVER would cancel the holdover
+        # timer and revert the advertised QL, abandoning holdover_seconds early.
+        #
+        # Treat LOCKED_AND_HOLDOVER with no connected GNSS/external time
+        # reference as continued HOLDOVER so the configured holdover_seconds is
+        # honoured. A genuine lock (connected GNSS/EXT, or LOCKED) is untouched.
+        if (status == LockStatus.LOCKED_AND_HOLDOVER and
+                not self._has_connected_time_reference()):
+            collectd.debug(f"{self._log_prefix} LOCKED_AND_HOLDOVER with no "
+                           f"connected time reference; treating as HOLDOVER")
+            status = LockStatus.HOLDOVER
+
         ql = self._status_to_ql(status)
         if ql is None:
             # locked with SyncE source - pass-through, no override
@@ -402,6 +422,37 @@ class SynceController:
             collectd.warning(f"{self._log_prefix} DPLL read "
                              f"failed: {type(e).__name__}: {e}")
             return None
+
+    def _has_connected_time_reference(self):
+        """Return True if a connected GNSS/external time reference is present.
+
+        The EEC can report LOCKED_AND_HOLDOVER (netlink 'locked-ho-acq') both
+        for a genuine lock to a connected reference and, on GNR-D (zl3073x),
+        for a self-relock to a merely 'selectable' SyncE recovered-clock pin
+        after the time reference is lost. Lock status alone cannot tell these
+        apart, so inspect the connected input pins.
+
+        A valid time/phase reference is a GNSS or external (1PPS/SMA) pin in
+        the CONNECTED state. A SyncE recovered-clock pin is frequency-only and
+        does not qualify: when it is the only thing the EEC is locked to, the
+        node is in SyncE-only frequency holdover with no traceable time source.
+
+        Returns True only when at least one CONNECTED GNSS/EXT pin exists on
+        the EEC for our clock_id. On any read error, returns True so that the
+        pre-existing (recovery-favouring) behaviour is preserved.
+        """
+        try:
+            pins = self._dpll.get_pins_by_clock_id(self.clock_id)
+            connected = pins.filter_by_pin_state(PinState.CONNECTED)
+            for pin in connected:
+                if pin.pin_type in (PinType.GNSS, PinType.EXT):
+                    return True
+            return False
+        except Exception as e:
+            # Fail safe: on error, keep prior behaviour (treat as a real lock)
+            collectd.warning(f"{self._log_prefix} DPLL pin read "
+                             f"failed: {type(e).__name__}: {e}")
+            return True
 
     def _status_to_ql(self, status):
         """Map DPLL lock status to QL value. None = pass-through."""
