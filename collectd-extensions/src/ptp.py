@@ -784,39 +784,46 @@ def read_dpll_mgr_config():
     if basename.startswith('dpll-mgr-') and basename.endswith('.json'):
         _dpll_mgr_instance_name = basename[len('dpll-mgr-'):-len('.json')]
 
-    # Collect UDS addresses from dpll-mgr channels
-    managed_uds_paths = set()
+    # Collect the UDS address of the dpll-mgr backhaul channel ("ptp_bh").
+    # Only the backhaul ptp4l is treated as dpll-mgr-managed for monitoring:
+    # collectd must not write its GM fields and must judge its lock by its
+    # own port/GM. Other dpll-mgr channels (fronthaul ptp4l, ts2phc, synce4l)
+    # are not backhaul monitors and keep their normal collectd handling, so
+    # match the "ptp_bh" channel specifically rather than every channel.
+    backhaul_uds_paths = set()
     for filename in filenames:
         try:
             with open(filename, 'r') as f:
                 config = json.load(f)
-            channels = config.get('channels', {})
-            for channel_name, channel_config in channels.items():
-                if isinstance(channel_config, dict):
-                    uds = channel_config.get('call_channel', '')
-                    if uds.startswith('uds:'):
-                        uds = uds[4:]
-                    if uds:
-                        managed_uds_paths.add(uds)
+            channel_config = config.get('channels', {}).get('ptp_bh')
+            if isinstance(channel_config, dict):
+                uds = channel_config.get('call_channel', '')
+                if uds.startswith('uds:'):
+                    uds = uds[4:]
+                if uds:
+                    backhaul_uds_paths.add(uds)
         except (json.JSONDecodeError, IOError) as exc:
             collectd.warning("%s Failed to parse dpll-mgr config %s: %s"
                              % (PLUGIN, filename, exc))
 
-    if not managed_uds_paths:
+    if not backhaul_uds_paths:
         return
 
-    # Match UDS paths to ptp4l instance names
+    # Mark the ptp4l instance whose UDS address is the dpll-mgr backhaul
+    # channel UDS as dpll-mgr-managed. The UDS match is the authoritative
+    # signal: it identifies the backhaul instance regardless of its ptp4l
+    # operation mode (free-running in one mode, servoing in the other), so it
+    # must not be further gated on free_running.
     for instance_name, ctrl in ptpinstances.items():
         if ctrl.instance_type != PTP_INSTANCE_TYPE_PTP4L:
             continue
         config = ctrl.timing_instance.config
         if config.has_section('global'):
             uds = config['global'].get('uds_address')
-            if uds and uds in managed_uds_paths:
-                if config['global'].get('free_running') == '1':
-                    ctrl.is_managed_by_dpll_mgr = True
-                    collectd.info("%s Instance %s managed by dpll-mgr (uds=%s)"
-                                  % (PLUGIN, instance_name, uds))
+            if uds and uds in backhaul_uds_paths:
+                ctrl.is_managed_by_dpll_mgr = True
+                collectd.info("%s Instance %s managed by dpll-mgr (uds=%s)"
+                              % (PLUGIN, instance_name, uds))
 
     # Register dpll-mgr instance in ptpinstances for process monitoring
     if _dpll_mgr_instance_name and _dpll_mgr_instance_name not in ptpinstances:
@@ -2476,9 +2483,9 @@ def write_ptp4l_gm_fields(instance, gm_fields_dict):
     """update the pmc GRANDMASTER_SETTINGS_NP values"""
     ctrl = ptpinstances[instance]
 
-    # Skip GM write for instances managed by dpll-mgr + free_running
+    # Skip GM write for instances managed by dpll-mgr
     if ctrl.is_managed_by_dpll_mgr:
-        collectd.info("%s %s managed by dpll-mgr + free_running=1,"
+        collectd.info("%s %s managed by dpll-mgr,"
                       " skipping GM write" % (PLUGIN, instance))
         return
 
@@ -5495,23 +5502,22 @@ def check_ptp_regular(instance, ctrl, conf_file):
                           f"reference {reference_instance} "
                           f"clock_locked={clock_locked}")
 
-    # dpll-mgr-managed free_running backhaul monitor (e.g. ptp01bh):
+    # dpll-mgr-managed backhaul monitor (e.g. ptp01bh):
     # its base-port DPLL is disciplined by GNSS when GNSS is available (and
     # by SDP0 after failover), so the nmea clock_locked above can never
     # reveal a lost backhaul GM. Judge this instance by its OWN port/GM
-    # instead: a healthy free_running monitor sits UNCALIBRATED/SLAVE with a
-    # GM present (on linuxptp 4.2 with free_running it stays UNCALIBRATED and
-    # never reaches SLAVE, but SLAVE is accepted defensively for other
-    # versions); FAULTY (link down), LISTENING (no GM), or gmPresent=false
-    # means the backhaul source is gone. Override clock_locked so the
-    # existing NO_LOCK block below raises the per-instance alarm. Gated
-    # strictly on is_managed_by_dpll_mgr, so every other instance's path is
-    # unchanged. When the backhaul is HEALTHY this leaves clock_locked True
-    # and check_time_drift()/OOT below still runs (unlike routing to a
-    # separate checker, which would skip it entirely); when the backhaul is
-    # LOST the NO_LOCK block returns early (no GM -> no meaningful offset to
-    # sample), consistent with the existing "not locked to GM" behavior for
-    # every instance.
+    # instead: a healthy backhaul sits UNCALIBRATED or SLAVE with a GM
+    # present (UNCALIBRATED when the instance is free-running and only
+    # measures the GM, SLAVE when it servos to the GM); FAULTY (link down),
+    # LISTENING (no GM), or gmPresent=false means the backhaul source is
+    # gone. Override clock_locked so the existing NO_LOCK block below raises
+    # the per-instance alarm. Gated strictly on is_managed_by_dpll_mgr, so
+    # every other instance's path is unchanged. When the backhaul is HEALTHY
+    # this leaves clock_locked True and check_time_drift()/OOT below still
+    # runs (unlike routing to a separate checker, which would skip it
+    # entirely); when the backhaul is LOST the NO_LOCK block returns early
+    # (no GM -> no meaningful offset to sample), consistent with the existing
+    # "not locked to GM" behavior for every instance.
     if ctrl.is_managed_by_dpll_mgr:
         port_healthy = any(
             ps in ('UNCALIBRATED', 'SLAVE') for ps in port_states)

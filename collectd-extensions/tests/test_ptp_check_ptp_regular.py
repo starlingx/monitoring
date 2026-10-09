@@ -388,20 +388,31 @@ class TestCheckPhc2sysTimeDriftMasterOffset(unittest.TestCase):
 
 
 class TestCheckPtpRegularBackhaulMonitor(unittest.TestCase):
-    """Test the dpll-mgr-managed free_running backhaul monitor path.
+    """Test the dpll-mgr-managed backhaul monitor path.
 
     For a managed backhaul instance (is_managed_by_dpll_mgr=True),
     check_ptp_regular must judge NO_LOCK by the instance's OWN port/GM state,
     NOT the base-port DPLL (which is always GNSS-locked). The base-port DPLL
     is mocked LOCKED throughout to prove that judging by the base-port DPLL
-    alone would keep clock_locked True and suppress the alarm.
+    alone would keep clock_locked True and suppress the alarm. A healthy
+    backhaul sits UNCALIBRATED (free-running, measuring the GM) or SLAVE
+    (servoing to the GM); both are accepted as healthy.
     """
 
-    # Healthy free_running monitor: UNCALIBRATED + gmPresent=true.
+    # Healthy free-running monitor: UNCALIBRATED + gmPresent=true.
     PORT_DATA_UNCALIBRATED = b"""sending: GET PORT_DATA_SET
         c4d6d3.fffe.5dc81f-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
                 portIdentity            c4d6d3.fffe.5dc81f-1
                 portState               UNCALIBRATED
+                logMinDelayReqInterval  -4
+                versionNumber           2
+"""
+
+    # Healthy servoing monitor: SLAVE + gmPresent=true.
+    PORT_DATA_SLAVE = b"""sending: GET PORT_DATA_SET
+        c4d6d3.fffe.5dc81f-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            c4d6d3.fffe.5dc81f-1
+                portState               SLAVE
                 logMinDelayReqInterval  -4
                 versionNumber           2
 """
@@ -472,6 +483,29 @@ class TestCheckPtpRegularBackhaulMonitor(unittest.TestCase):
         """UNCALIBRATED + gmPresent -> NO_LOCK not raised (backhaul healthy)."""
         mock_check_output.side_effect = [
             self.PORT_DATA_UNCALIBRATED,
+            self.TIME_STATUS_GM_PRESENT,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        # Base-port DPLL is GNSS-locked (would have suppressed the old logic)
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance],
+                          self.conf_file)
+
+        self.assertFalse(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_healthy_servoing_monitor_no_alarm(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """SLAVE + gmPresent -> NO_LOCK not raised (servoing backhaul healthy)."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_SLAVE,
             self.TIME_STATUS_GM_PRESENT,
         ]
         mock_get_base_port.return_value = 'eno8703'

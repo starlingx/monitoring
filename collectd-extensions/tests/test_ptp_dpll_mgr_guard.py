@@ -63,19 +63,94 @@ class TestDetectDpllMgrManagedInstances(unittest.TestCase):
         self.ctrl.interface = 'ens1f0'
         self.ctrl.timing_instance = MagicMock()
         self.ctrl.timing_instance.config = MockConfigDict({
-            'global': {'uds_address': '/var/run/ptp4l-ptpfr0', 'free_running': '1'}
+            'global': {'uds_address': '/var/run/ptp4l-ptp01bh', 'free_running': '0'}
         })
-        ptp.ptpinstances = {'ptpfr0': self.ctrl}
+        ptp.ptpinstances = {'ptp01bh': self.ctrl}
 
     @patch('ptp.glob')
-    def test_dpll_mgr_config_exists_instance_matched(self, mock_glob):
-        """Instance in dpll-mgr channels gets added to managed set."""
+    def test_dpll_mgr_backhaul_instance_matched(self, mock_glob):
+        """The ptp4l instance matching the dpll-mgr ptp_bh channel is managed."""
         mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
         dpll_config = {
             "global": {"operation_mode": "SW_BASED"},
             "channels": {
-                "ptp_fr": {"call_channel": "uds:/var/run/ptp4l-ptpfr0"},
-                "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp11bh"}
+                "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp01bh"},
+                "ts2_0": {"call_channel": "uds:/var/run/ts2phc0"}
+            }
+        }
+        with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
+            read_dpll_mgr_config()
+
+        self.assertTrue(self.ctrl.is_managed_by_dpll_mgr)
+
+    @patch('ptp.glob')
+    def test_dpll_mgr_only_ptp_bh_channel_managed(self, mock_glob):
+        """Only the ptp_bh channel's instance is managed.
+
+        A fronthaul ptp4l that is also a dpll-mgr channel (e.g. ptp_0) is
+        NOT marked managed, so collectd keeps managing its GM fields and
+        lock judgement.
+        """
+        fronthaul = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
+        fronthaul.interface = 'ens2f0'
+        fronthaul.timing_instance = MagicMock()
+        fronthaul.timing_instance.config = MockConfigDict({
+            'global': {'uds_address': '/var/run/ptp4l-ptp0'}
+        })
+        ptp.ptpinstances = {'ptp01bh': self.ctrl, 'ptp0': fronthaul}
+
+        mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
+        dpll_config = {
+            "global": {"operation_mode": "SW_BASED"},
+            "channels": {
+                "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp01bh"},
+                "ptp_0": {"call_channel": "uds:/var/run/ptp4l-ptp0"}
+            }
+        }
+        with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
+            read_dpll_mgr_config()
+
+        self.assertTrue(self.ctrl.is_managed_by_dpll_mgr)
+        self.assertFalse(fronthaul.is_managed_by_dpll_mgr)
+
+    @patch('ptp.glob')
+    def test_dpll_mgr_managed_servoing_backhaul(self, mock_glob):
+        """Managed ptp_bh instance is detected regardless of free_running.
+
+        A servoing backhaul (free_running 0) must be detected, not just a
+        free-running one.
+        """
+        self.ctrl.timing_instance.config = MockConfigDict({
+            'global': {'uds_address': '/var/run/ptp4l-ptp01bh',
+                       'free_running': '0'}
+        })
+        mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
+        dpll_config = {
+            "global": {"operation_mode": "SW_BASED"},
+            "channels": {
+                "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp01bh"}
+            }
+        }
+        with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
+            read_dpll_mgr_config()
+
+        self.assertTrue(self.ctrl.is_managed_by_dpll_mgr)
+
+    @patch('ptp.glob')
+    def test_dpll_mgr_managed_no_free_running_key(self, mock_glob):
+        """Managed ptp_bh instance with no free_running key is detected.
+
+        Detection is by UDS match, so the absence of a free_running key does
+        not affect it.
+        """
+        self.ctrl.timing_instance.config = MockConfigDict({
+            'global': {'uds_address': '/var/run/ptp4l-ptp01bh'}
+        })
+        mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
+        dpll_config = {
+            "global": {"operation_mode": "SW_BASED"},
+            "channels": {
+                "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp01bh"}
             }
         }
         with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
@@ -85,12 +160,27 @@ class TestDetectDpllMgrManagedInstances(unittest.TestCase):
 
     @patch('ptp.glob')
     def test_dpll_mgr_config_exists_instance_not_matched(self, mock_glob):
-        """Instance NOT in dpll-mgr channels stays out of managed set."""
+        """Instance whose UDS is not the ptp_bh channel stays unmanaged."""
         mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
         dpll_config = {
             "global": {"operation_mode": "SW_BASED"},
             "channels": {
                 "ptp_bh": {"call_channel": "uds:/var/run/ptp4l-ptp11bh"}
+            }
+        }
+        with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
+            read_dpll_mgr_config()
+
+        self.assertFalse(self.ctrl.is_managed_by_dpll_mgr)
+
+    @patch('ptp.glob')
+    def test_dpll_mgr_no_ptp_bh_channel(self, mock_glob):
+        """A dpll-mgr config without a ptp_bh channel marks nothing managed."""
+        mock_glob.return_value = ['/etc/linuxptp/ptpinstance/dpll-mgr-dpll-mgr1.json']
+        dpll_config = {
+            "global": {"operation_mode": "SW_BASED"},
+            "channels": {
+                "ts2_0": {"call_channel": "uds:/var/run/ts2phc0"}
             }
         }
         with patch('builtins.open', mock_open(read_data=json.dumps(dpll_config))):
@@ -125,13 +215,13 @@ class TestWritePtp4lGmFieldsGuard(unittest.TestCase):
         self.ctrl.interface = 'ens1f0'
         self.ctrl.timing_instance = MagicMock()
         self.ctrl.timing_instance.config = MockConfigDict({
-            'global': {'uds_address': '/var/run/ptp4l-ptpfr0', 'free_running': '1'}
+            'global': {'uds_address': '/var/run/ptp4l-ptpfr0'}
         })
         ptp.ptpinstances = {'ptpfr0': self.ctrl}
 
     @patch('ptp.subprocess.check_output')
-    def test_managed_free_running_skips(self, mock_subprocess):
-        """dpll-mgr managed + free_running=1 → skip GM write."""
+    def test_managed_skips(self, mock_subprocess):
+        """dpll-mgr managed instance → skip GM write."""
         self.ctrl.is_managed_by_dpll_mgr = True
 
         write_ptp4l_gm_fields('ptpfr0', OrderedDict({'clockClass': '6'}))
@@ -139,18 +229,8 @@ class TestWritePtp4lGmFieldsGuard(unittest.TestCase):
         mock_subprocess.assert_not_called()
 
     @patch('ptp.subprocess.check_output')
-    def test_managed_no_free_running_proceeds(self, mock_subprocess):
-        """dpll-mgr managed but free_running NOT set → GM write proceeds."""
-        self.ctrl.is_managed_by_dpll_mgr = False
-        mock_subprocess.return_value = b''
-
-        write_ptp4l_gm_fields('ptpfr0', OrderedDict({'clockClass': '6'}))
-
-        mock_subprocess.assert_called_once()
-
-    @patch('ptp.subprocess.check_output')
-    def test_not_managed_free_running_proceeds(self, mock_subprocess):
-        """NOT in dpll-mgr + free_running=1 → GM write proceeds."""
+    def test_not_managed_proceeds(self, mock_subprocess):
+        """Instance not managed by dpll-mgr → GM write proceeds."""
         self.ctrl.is_managed_by_dpll_mgr = False
         mock_subprocess.return_value = b''
 
