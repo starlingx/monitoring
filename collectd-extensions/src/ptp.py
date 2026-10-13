@@ -142,6 +142,13 @@ DPLL_MGR_FORMAT_VERSION = 1
 _dpll_mgr_instance_name = None
 _dpll_mgr_holdover_level = -1  # Last-seen holdover level
 
+# Map of dpll-mgr ts2phc gearshift channel UDS path -> gearshift key name
+# ('ts2_0' / 'ts2_1'), built from the dpll-mgr JSON channels config during
+# init. Used by the cc6-passthrough custody gate to resolve a
+# fronthaul GM leader's disciplining ts2phc instance to the dpll-mgr gearshift
+# channel whose DRIVE state proves custody.
+_dpll_mgr_ts2phc_channel_by_uds = {}
+
 
 def _get_ptp_options_path():
     os_type = _get_os_release()
@@ -291,6 +298,20 @@ CLOCK_CLASS_135 = '135'  # T-BC in holdover, within holdover specification
 CLOCK_CLASS_165 = '165'  # T-BC in holdover, out of holdover specification
 CLOCK_CLASS_140 = '140'  # T-GM in holdover, out of holdover specification
 CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
+
+# cc6 passthrough (GNR-D State-2): when the node is a locked
+# boundary clock to the PTP backhaul, forward the upstream GM's clockClass to
+# the local fronthaul GM instances instead of advertising local holdover.
+# Operator toggle (collectd monitoring-section param on the dpll-mgr instance),
+# default enabled.
+CLOCKCLASS_PASSTHROUGH_PARAM = 'clockclass_passthrough'
+# clockClass values that represent a genuinely locked/traceable upstream GM
+# worth forwarding. Anything else (holdover/free-run/slave-only, i.e. >= 128
+# per G.8275.1) means the backhaul is not a usable time source to pass through.
+CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
+    str(c) for c in range(6, 128))
+# dpll-mgr gearshift value that proves a ts2phc instance holds DRIVE custody.
+GEARSHIFT_DRIVE = 'DRIVE'
 
 # Time interval for holdover within spec (seconds)
 # Holdover threshold is set to 4 hours to match the supported holdover time
@@ -791,6 +812,8 @@ def read_dpll_mgr_config():
     # are not backhaul monitors and keep their normal collectd handling, so
     # match the "ptp_bh" channel specifically rather than every channel.
     backhaul_uds_paths = set()
+    global _dpll_mgr_ts2phc_channel_by_uds
+    _dpll_mgr_ts2phc_channel_by_uds = {}
     for filename in filenames:
         try:
             with open(filename, 'r') as f:
@@ -802,6 +825,17 @@ def read_dpll_mgr_config():
                     uds = uds[4:]
                 if uds:
                     backhaul_uds_paths.add(uds)
+            # Build the ts2phc gearshift-channel map. Each ts2_N
+            # channel's call_channel UDS identifies the ts2phc instance whose
+            # DRIVE custody collectd reads from status.json gearshift[ts2_N].
+            for channel_name in ('ts2_0', 'ts2_1'):
+                ts2_cfg = config.get('channels', {}).get(channel_name)
+                if isinstance(ts2_cfg, dict):
+                    ts2_uds = ts2_cfg.get('call_channel', '')
+                    if ts2_uds.startswith('uds:'):
+                        ts2_uds = ts2_uds[4:]
+                    if ts2_uds:
+                        _dpll_mgr_ts2phc_channel_by_uds[ts2_uds] = channel_name
         except (json.JSONDecodeError, IOError) as exc:
             collectd.warning("%s Failed to parse dpll-mgr config %s: %s"
                              % (PLUGIN, filename, exc))
@@ -3682,6 +3716,110 @@ def _is_synce_only_frequency_holdover(primary_nic):
     return False
 
 
+def _cc6_passthrough_enabled():
+    """Return True if the operator has not disabled cc6 passthrough.
+
+    The toggle is a collectd monitoring-section parameter on the dpll-mgr
+    instance, default enabled. Reads from the dpll-mgr
+    instance's monitoring_parameters; absence of the key means default-on.
+    """
+    ctrl = ptpinstances.get(_dpll_mgr_instance_name) if _dpll_mgr_instance_name \
+        else None
+    if ctrl is None:
+        return True
+    value = ctrl.monitoring_parameters.get(CLOCKCLASS_PASSTHROUGH_PARAM, 'enabled')
+    return str(value).strip().lower() not in ('disabled', '0', 'false', 'no')
+
+
+def _backhaul_forwardable_clock_class():
+    """Return the backhaul GM clockClass to forward, or None.
+
+    The backhaul is "really locked" (worth forwarding) when the dpll-mgr
+    managed instance's port tracks a GM (UNCALIBRATED/SLAVE), a GM is present,
+    and the upstream clockClass is a locked/traceable value (not holdover/
+    free-run/slave-only). This mirrors the 1007484 backhaul-health signal and
+    the 1009526 "backhaul really locked" authority. Returns the clockClass
+    string on success, else None (fail-safe to local holdover).
+    """
+    if not _dpll_mgr_instance_name:
+        return None
+
+    parent_data_set = query_pmc(
+        _dpll_mgr_instance_name, 'PARENT_DATA_SET', query_action='GET')
+    gm_clock_class = parent_data_set.get('gm.ClockClass')
+    if gm_clock_class is None:
+        return None
+    gm_clock_class = str(gm_clock_class)
+    if gm_clock_class not in CLOCKCLASS_LOCKED_FORWARDABLE:
+        return None
+
+    port_data_set = query_pmc_indexed(
+        _dpll_mgr_instance_name, 'PORT_DATA_SET', query_action='GET')
+    port_healthy = any(
+        pds.get('portState') in ('UNCALIBRATED', 'SLAVE')
+        for pds in port_data_set.values()
+    )
+    if not port_healthy:
+        return None
+
+    return gm_clock_class
+
+
+def _leader_custody_confirmed(base_port):
+    """Return True if the ts2phc disciplining this leader's PHC is DRIVE.
+
+    Resolves the leader's base_port -> ts2phc instance (ts2phc_instance_map) ->
+    that instance's uds_address -> dpll-mgr gearshift channel (ts2_0/ts2_1 via
+    _dpll_mgr_ts2phc_channel_by_uds) -> gear from status.json. DRIVE means the
+    PHC is provably disciplined to the backhaul (CGTS-108079 D3). Unknown
+    custody (channel absent/unmapped, WI-1 not present) fails safe to False.
+    """
+    ts2phc_instance = ts2phc_instance_map.get(base_port)
+    if not ts2phc_instance:
+        return False
+
+    ts2phc_ctrl = ptpinstances.get(ts2phc_instance)
+    if ts2phc_ctrl is None or ts2phc_ctrl.timing_instance is None:
+        return False
+
+    config = ts2phc_ctrl.timing_instance.config
+    ts2phc_uds = None
+    if config.has_section('global'):
+        ts2phc_uds = config['global'].get('uds_address')
+    if not ts2phc_uds:
+        return False
+
+    channel_name = _dpll_mgr_ts2phc_channel_by_uds.get(ts2phc_uds)
+    if channel_name is None:
+        return False
+
+    status = _dpll_mgr_status.read()
+    if not status:
+        return False
+    gear = status.get('gearshift', {}).get(channel_name)
+    return gear == GEARSHIFT_DRIVE
+
+
+def _cc6_passthrough_class(ctrl, base_port):
+    """Return the forwarded cc6 clockClass for this leader, or None.
+
+    Applies the full per-leader passthrough decision:
+    toggle enabled AND a dpll-mgr host AND backhaul really locked AND this
+    leader's custody confirmed DRIVE. Returns the backhaul GM clockClass string
+    to advertise, or None to fall back to local behaviour.
+    """
+    if not _cc6_passthrough_enabled():
+        return None
+    if not _dpll_mgr_instance_name:
+        return None
+    forwardable = _backhaul_forwardable_clock_class()
+    if forwardable is None:
+        return None
+    if not _leader_custody_confirmed(base_port):
+        return None
+    return forwardable
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -3868,6 +4006,25 @@ def check_clock_class(instance):
 
     else:
         new_clock_class = CLOCK_CLASS_248
+
+    # cc6 passthrough: when the node is locked to the PTP backhaul
+    # and this leader's PHC is provably DRIVE-disciplined to it, advertise the
+    # upstream GM's clockClass instead of the local holdover ladder computed
+    # above. Gated per-leader (toggle + backhaul-really-locked + DRIVE custody);
+    # fail-safe returns None and leaves the local decision untouched.
+    forwarded_clock_class = _cc6_passthrough_class(ctrl, base_port)
+    if forwarded_clock_class is not None:
+        if forwarded_clock_class != new_clock_class:
+            collectd.info(
+                "%s %s cc6 passthrough: advertising backhaul clockClass %s "
+                "(local would be %s)"
+                % (PLUGIN, instance, forwarded_clock_class, new_clock_class))
+        new_clock_class = forwarded_clock_class
+        # A forwarded locked upstream GM is time- and frequency-traceable with
+        # a valid UTC offset, consistent with a cc6 upstream.
+        time_traceable = True
+        frequency_traceable = True
+        current_utc_offset_valid = True
 
     if current_clock_class != new_clock_class and (
         not is_ts2phc_running or state != CLOCK_STATE_INVALID
@@ -4752,10 +4909,11 @@ def _check_dpll_mgr_state():
                      status.get('in_holdover', '?'),
                      status.get('holdover_level', '?'),
                      status.get('holdover_duration_s', '?')))
-    collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s"
+    collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s ts2_1=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('gearshift', {}).get('ptp_bh', '-'),
-                     status.get('gearshift', {}).get('ts2_0', '-')))
+                     status.get('gearshift', {}).get('ts2_0', '-'),
+                     status.get('gearshift', {}).get('ts2_1', '-')))
     collectd.info("%s dpll-mgr %s phase_offset_ns=%s drift_rate_ns_per_s=%s"
                   % (PLUGIN, dpll_mgr_instance,
                      status.get('phase_offset_ns', '?'),
