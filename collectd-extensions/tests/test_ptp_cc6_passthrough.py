@@ -389,6 +389,26 @@ class TestReadDpllMgrConfigTs2phcMap(unittest.TestCase):
             ptp._dpll_mgr_ts2phc_channel_by_uds,
             {'/var/run/ts2phc0': 'ts2_0'})
 
+    def test_stale_backhaul_globals_cleared_on_removal(self):
+        """Reconfig that removes the dpll-mgr instance must clear stale globals.
+
+        read_dpll_mgr_config() runs on every config read. If a prior read set
+        the backhaul identity and a later read has no dpll-mgr-*.json (instance
+        deleted), the backhaul base_port/instance globals must reset to None so
+        _backhaul_forwardable_clock_class and the State-2 custody check do not
+        keep trusting a backhaul that no longer exists (stale-global bug-class).
+        """
+        # Simulate a previous read having populated the backhaul identity.
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_base_port = 'ens1f0'
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        # Now the dpll-mgr config is gone (no matching files).
+        with patch('ptp.glob', return_value=[]):
+            ptp.read_dpll_mgr_config()
+        self.assertIsNone(ptp._dpll_mgr_instance_name)
+        self.assertIsNone(ptp._dpll_mgr_backhaul_base_port)
+        self.assertIsNone(ptp._dpll_mgr_backhaul_instance)
+
 
 class TestTs2phcSourceByBasePort(unittest.TestCase):
     """Part A: per-base_port ts2phc source resolution.

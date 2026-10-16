@@ -849,12 +849,25 @@ def read_instance_monitoring_config():
 
 def read_dpll_mgr_config():
     """Read dpll-mgr config and set ctrl.is_managed_by_dpll_mgr flag."""
+    # reset the per-read dpll-mgr globals up front, before the
+    # no-files early-return, so a reconfig that removes the dpll-mgr/backhaul
+    # instance clears stale values rather than leaving the previous read's
+    # backhaul identity live (mirrors the _dpll_mgr_ts2phc_channel_by_uds reset
+    # below). Stale globals here are the stale-global bug-class: _backhaul_forwardable
+    # _clock_class and the State-2 custody check would otherwise keep trusting a
+    # backhaul instance/base_port that no longer exists.
+    global _dpll_mgr_instance_name
+    global _dpll_mgr_backhaul_base_port
+    global _dpll_mgr_backhaul_instance
+    _dpll_mgr_instance_name = None
+    _dpll_mgr_backhaul_base_port = None
+    _dpll_mgr_backhaul_instance = None
+
     filenames = glob(PTPINSTANCE_PATH + 'dpll-mgr-*.json')
     if not filenames:
         return
 
     # Extract dpll-mgr instance name (singleton per host)
-    global _dpll_mgr_instance_name
     filename = filenames[0]
     basename = os.path.basename(filename)
     if basename.startswith('dpll-mgr-') and basename.endswith('.json'):
@@ -917,7 +930,7 @@ def read_dpll_mgr_config():
                 # the backhaul ptp4l (ptp_bh=DRIVE) disciplines this PHC while the
                 # GNSS ts2phc parks, so a fronthaul leader on this base_port has
                 # custody proven by ptp_bh, not by its ts2phc channel.
-                global _dpll_mgr_backhaul_base_port
+                # (globals declared + reset at the top of this function)
                 if ctrl.interface:
                     _dpll_mgr_backhaul_base_port = get_base_port(ctrl.interface)
                     collectd.info("%s dpll-mgr backhaul base_port=%s (%s)"
@@ -928,7 +941,6 @@ def read_dpll_mgr_config():
                 # the backhaul PARENT_DATA_SET/PORT_DATA_SET), not the dpll-mgr
                 # clock instance (which has no ptp4l UDS -> empty pmc -> cc6
                 # passthrough never fires).
-                global _dpll_mgr_backhaul_instance
                 _dpll_mgr_backhaul_instance = instance_name
 
     # Register dpll-mgr instance in ptpinstances for process monitoring
@@ -2315,6 +2327,14 @@ def init_func():
 
         # Detect ptp4l instances managed by dpll-mgr
         read_dpll_mgr_config()
+
+        # read_dpll_mgr_config() registers the dpll-mgr
+        # instance into ptpinstances AFTER the first monitoring read above, so
+        # its [dpll-mgr1] section (e.g. clockclass_passthrough) was skipped
+        # (read_instance_monitoring_config only populates instances already
+        # present). Re-read now that the dpll-mgr instance exists; the call is
+        # idempotent for the instances already loaded.
+        read_instance_monitoring_config()
 
         for key, ctrl in ptpinstances.items():
             collectd.info("%s instance: %s type: %s found" %
@@ -3987,15 +4007,30 @@ def _cc6_passthrough_class(ctrl, base_port):
     toggle enabled AND a dpll-mgr host AND backhaul really locked AND this
     leader's custody confirmed DRIVE. Returns the backhaul GM clockClass string
     to advertise, or None to fall back to local behaviour.
+
+    Each gate that fails logs at debug level which gate declined, so a field
+    "why isn't passthrough firing?" question is answerable from /var/log
+    without re-instrumenting the plugin (the pain that earlier debugging
+    hit). Debug level keeps steady-state logs quiet.
     """
+    instance = ctrl.instance_name if hasattr(ctrl, 'instance_name') else '?'
     if not _cc6_passthrough_enabled():
+        collectd.debug("%s %s cc6 passthrough declined: operator toggle disabled"
+                       % (PLUGIN, instance))
         return None
     if not _dpll_mgr_instance_name:
+        collectd.debug("%s %s cc6 passthrough declined: not a dpll-mgr host"
+                       % (PLUGIN, instance))
         return None
     forwardable = _backhaul_forwardable_clock_class()
     if forwardable is None:
+        collectd.debug("%s %s cc6 passthrough declined: backhaul not forwardable "
+                       "(not really locked / pmc empty)" % (PLUGIN, instance))
         return None
     if not _leader_custody_confirmed(base_port):
+        collectd.debug("%s %s cc6 passthrough declined: leader custody on "
+                       "base_port %s not confirmed DRIVE"
+                       % (PLUGIN, instance, base_port))
         return None
     return forwardable
 
