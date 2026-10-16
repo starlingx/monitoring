@@ -68,6 +68,7 @@ class TestCc6PassthroughDecision(unittest.TestCase):
             'instances': dict(getattr(ptp, 'ptpinstances', {})),
             'ts2map': dict(getattr(ptp, 'ts2phc_instance_map', {})),
             'bh_base': getattr(ptp, '_dpll_mgr_backhaul_base_port', None),
+            'bh_inst': getattr(ptp, '_dpll_mgr_backhaul_instance', None),
         }
         # Deterministic module state
         ptp._dpll_mgr_instance_name = 'ptp01bh'
@@ -100,6 +101,8 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         # Default: backhaul base_port unknown (path inert unless a test
         # sets it). ens1f0 is the E825/backhaul PHC base port when set.
         ptp._dpll_mgr_backhaul_base_port = None
+        # the backhaul PTP4L instance name the forwardable query uses.
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
 
     def tearDown(self):
         # Restore module globals to avoid polluting other test modules that
@@ -109,6 +112,7 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         ptp.ptpinstances = self._saved['instances']
         ptp.ts2phc_instance_map = self._saved['ts2map']
         ptp._dpll_mgr_backhaul_base_port = self._saved['bh_base']
+        ptp._dpll_mgr_backhaul_instance = self._saved['bh_inst']
 
     def test_toggle_default_enabled(self):
         self.assertTrue(ptp._cc6_passthrough_enabled())
@@ -130,6 +134,31 @@ class TestCc6PassthroughDecision(unittest.TestCase):
              patch('ptp.query_pmc_indexed',
                    return_value={'0': {'portState': 'SLAVE'}}):
             self.assertEqual(ptp._backhaul_forwardable_clock_class(), '6')
+
+    def test_backhaul_forwardable_none_when_backhaul_instance_unset(self):
+        # regression: if the backhaul ptp4l instance was never identified
+        # (_dpll_mgr_backhaul_instance is None), forwardable must be None -- never
+        # query the wrong (dpll-mgr clock) instance. This was the real-box bug:
+        # querying _dpll_mgr_instance_name (dpll-mgr1, no ptp4l UDS) -> empty pmc
+        # -> forwardable always None -> cc6 passthrough never fired.
+        ptp._dpll_mgr_backhaul_instance = None
+        with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            self.assertIsNone(ptp._backhaul_forwardable_clock_class())
+
+    def test_backhaul_forwardable_queries_backhaul_instance_not_dpll_mgr(self):
+        # the forwardable query must target the backhaul ptp4l instance
+        # (_dpll_mgr_backhaul_instance), not the dpll-mgr clock instance. Assert
+        # query_pmc is called with the backhaul instance name.
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        ptp._dpll_mgr_instance_name = 'dpll-mgr1'  # the wrong target (clock inst)
+        with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}) as qp, \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            self.assertEqual(ptp._backhaul_forwardable_clock_class(), '6')
+            # first positional arg of query_pmc must be the backhaul instance
+            assert qp.call_args[0][0] == 'ptp01bh', qp.call_args
 
     def test_backhaul_not_forwardable_holdover_class(self):
         # clockClass 135 (holdover) is not forwardable
@@ -220,6 +249,8 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         # Before the backhaul instance is identified (None), the ptp_bh path is
         # inert; State-1 ts2_0 DRIVE still confirms as before (no regression).
         ptp._dpll_mgr_backhaul_base_port = None
+        # the backhaul PTP4L instance name the forwardable query uses.
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
         status = {'gearshift': {'ptp_bh': 'DRIVE', 'ts2_0': 'DRIVE',
                                 'ts2_1': 'DRIVE'}}
         with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
@@ -297,6 +328,27 @@ class TestCc6PassthroughDecision(unittest.TestCase):
 
 class TestReadDpllMgrConfigTs2phcMap(unittest.TestCase):
     """The ts2phc channel UDS->key map is built from the dpll-mgr JSON."""
+
+    def setUp(self):
+        # read_dpll_mgr_config() mutates several module globals as a side
+        # effect (the dpll-mgr instance name, the ts2phc channel map, and the
+        # ptpinstances/ptpinterfaces/alarm registries). Snapshot them so they
+        # are restored in tearDown and do not leak into other test modules
+        # that share the imported ptp module under stestr's parallel scheduler.
+        self._saved = {
+            'name': ptp._dpll_mgr_instance_name,
+            'chan': dict(ptp._dpll_mgr_ts2phc_channel_by_uds),
+            'instances': dict(ptp.ptpinstances),
+            'interfaces': dict(ptp.ptpinterfaces),
+            'alarms': list(ptp.ALARM_OBJ_LIST),
+        }
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved['name']
+        ptp._dpll_mgr_ts2phc_channel_by_uds = self._saved['chan']
+        ptp.ptpinstances = self._saved['instances']
+        ptp.ptpinterfaces = self._saved['interfaces']
+        ptp.ALARM_OBJ_LIST[:] = self._saved['alarms']
 
     def test_map_built_from_both_channels(self):
         cfg = {

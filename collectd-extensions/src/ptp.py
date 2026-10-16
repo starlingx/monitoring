@@ -156,6 +156,13 @@ _dpll_mgr_ts2phc_channel_by_uds = {}
 # ts2phc channel. None until the backhaul instance is identified at config parse.
 _dpll_mgr_backhaul_base_port = None
 
+# name of the dpll-mgr backhaul (ptp_bh) PTP4L instance
+# (e.g. 'ptp01bh'), i.e. the one flagged is_managed_by_dpll_mgr. The backhaul's
+# forwardable clockClass must be read by pmc FROM THIS ptp4l instance, NOT from
+# the dpll-mgr/clock instance (_dpll_mgr_instance_name), which has no ptp4l UDS.
+# None until the backhaul instance is identified at config parse.
+_dpll_mgr_backhaul_instance = None
+
 
 def _get_ptp_options_path():
     os_type = _get_os_release()
@@ -916,6 +923,13 @@ def read_dpll_mgr_config():
                     collectd.info("%s dpll-mgr backhaul base_port=%s (%s)"
                                   % (PLUGIN, _dpll_mgr_backhaul_base_port,
                                      instance_name))
+                # record the backhaul PTP4L instance NAME so
+                # _backhaul_forwardable_clock_class queries this ptp4l (which has
+                # the backhaul PARENT_DATA_SET/PORT_DATA_SET), not the dpll-mgr
+                # clock instance (which has no ptp4l UDS -> empty pmc -> cc6
+                # passthrough never fires).
+                global _dpll_mgr_backhaul_instance
+                _dpll_mgr_backhaul_instance = instance_name
 
     # Register dpll-mgr instance in ptpinstances for process monitoring
     if _dpll_mgr_instance_name and _dpll_mgr_instance_name not in ptpinstances:
@@ -3819,12 +3833,18 @@ def _backhaul_forwardable_clock_class():
     free-run/slave-only). This mirrors the 1007484 backhaul-health signal and
     the 1009526 "backhaul really locked" authority. Returns the clockClass
     string on success, else None (fail-safe to local holdover).
+
+    Queries the backhaul PTP4L instance (_dpll_mgr_backhaul_instance, the one
+    flagged is_managed_by_dpll_mgr, e.g. 'ptp01bh') for PARENT_DATA_SET /
+    PORT_DATA_SET. NOT the dpll-mgr/clock instance, which has no ptp4l UDS and
+    would make every pmc query empty -> forwardable always None -> passthrough
+    never fires.
     """
-    if not _dpll_mgr_instance_name:
+    if not _dpll_mgr_backhaul_instance:
         return None
 
     parent_data_set = query_pmc(
-        _dpll_mgr_instance_name, 'PARENT_DATA_SET', query_action='GET')
+        _dpll_mgr_backhaul_instance, 'PARENT_DATA_SET', query_action='GET')
     gm_clock_class = parent_data_set.get('gm.ClockClass')
     if gm_clock_class is None:
         return None
@@ -3833,7 +3853,7 @@ def _backhaul_forwardable_clock_class():
         return None
 
     port_data_set = query_pmc_indexed(
-        _dpll_mgr_instance_name, 'PORT_DATA_SET', query_action='GET')
+        _dpll_mgr_backhaul_instance, 'PORT_DATA_SET', query_action='GET')
     port_healthy = any(
         pds.get('portState') in ('UNCALIBRATED', 'SLAVE')
         for pds in port_data_set.values()
