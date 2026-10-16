@@ -387,5 +387,202 @@ class TestCheckPhc2sysTimeDriftMasterOffset(unittest.TestCase):
             self.instance, 'acde48.0000.000003', -42.0)
 
 
+class TestCheckPtpRegularBackhaulMonitor(unittest.TestCase):
+    """Test the dpll-mgr-managed free_running backhaul monitor path.
+
+    For a managed backhaul instance (is_managed_by_dpll_mgr=True),
+    check_ptp_regular must judge NO_LOCK by the instance's OWN port/GM state,
+    NOT the base-port DPLL (which is always GNSS-locked). The base-port DPLL
+    is mocked LOCKED throughout to prove that judging by the base-port DPLL
+    alone would keep clock_locked True and suppress the alarm.
+    """
+
+    # Healthy free_running monitor: UNCALIBRATED + gmPresent=true.
+    PORT_DATA_UNCALIBRATED = b"""sending: GET PORT_DATA_SET
+        c4d6d3.fffe.5dc81f-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            c4d6d3.fffe.5dc81f-1
+                portState               UNCALIBRATED
+                logMinDelayReqInterval  -4
+                versionNumber           2
+"""
+
+    # Backhaul link down: FAULTY.
+    PORT_DATA_FAULTY = b"""sending: GET PORT_DATA_SET
+        c4d6d3.fffe.5dc81f-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            c4d6d3.fffe.5dc81f-1
+                portState               FAULTY
+                logMinDelayReqInterval  -4
+                versionNumber           2
+"""
+
+    # Upstream GM gone, link up: LISTENING.
+    PORT_DATA_LISTENING = b"""sending: GET PORT_DATA_SET
+        c4d6d3.fffe.5dc81f-1 seq 0 RESPONSE MANAGEMENT PORT_DATA_SET
+                portIdentity            c4d6d3.fffe.5dc81f-1
+                portState               LISTENING
+                logMinDelayReqInterval  -4
+                versionNumber           2
+"""
+
+    TIME_STATUS_GM_PRESENT = b"""sending: GET TIME_STATUS_NP
+        c4d6d3.fffe.5dc81f-0 seq 0 RESPONSE MANAGEMENT TIME_STATUS_NP
+                master_offset              -42
+                gmPresent                  true
+                gmIdentity                 c4d6d3.fffe.5dc5a9
+"""
+
+    TIME_STATUS_NO_GM = b"""sending: GET TIME_STATUS_NP
+        c4d6d3.fffe.5dc81f-0 seq 0 RESPONSE MANAGEMENT TIME_STATUS_NP
+                master_offset              0
+                gmPresent                  false
+                gmIdentity                 000000.0000.000000
+"""
+
+    def setUp(self):
+        self.instance = 'ptp01bh'
+        self.conf_file = '/etc/linuxptp/ptpinstance/ptp4l-ptp01bh.conf'
+
+        ctrl = PTP_ctrl_object()
+        ctrl.instance_type = 'ptp4l'
+        ctrl.interface = 'eno8403'
+        ctrl.log_throttle_count = 0
+        ctrl.disciplined_by_ts2phc = True
+        ctrl.is_managed_by_dpll_mgr = True
+        ctrl.nolock_alarm_object = PTP_alarm_object(self.instance)
+        ctrl.nolock_alarm_object.raised = False
+        ctrl.nolock_alarm_object.eid = 'ptp01bh-no-lock-eid'
+        ptp.ptpinstances[self.instance] = ctrl
+
+        ptp.obj.hostname = 'test-host'
+        ptp.obj.capabilities = {'ts2phc_source': 'nmea'}
+        ptp.obj.INIT_LOG_THROTTLE = 10
+
+    def tearDown(self):
+        if self.instance in ptp.ptpinstances:
+            del ptp.ptpinstances[self.instance]
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_healthy_monitor_no_alarm(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """UNCALIBRATED + gmPresent -> NO_LOCK not raised (backhaul healthy)."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_UNCALIBRATED,
+            self.TIME_STATUS_GM_PRESENT,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        # Base-port DPLL is GNSS-locked (would have suppressed the old logic)
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance],
+                          self.conf_file)
+
+        self.assertFalse(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_backhaul_link_down_raises_alarm(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """FAULTY port (link down) -> NO_LOCK raised even though DPLL locked."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_FAULTY,
+            self.TIME_STATUS_GM_PRESENT,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        result = check_ptp_regular(
+            self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_backhaul_gm_lost_raises_alarm(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """LISTENING + gmPresent=false (GM gone) -> NO_LOCK raised."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_LISTENING,
+            self.TIME_STATUS_NO_GM,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        result = check_ptp_regular(
+            self.instance, ptp.ptpinstances[self.instance], self.conf_file)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.clear_alarm')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_backhaul_recovery_clears_alarm(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_clear_alarm, mock_check_time_drift
+    ):
+        """Backhaul recovers (UNCALIBRATED + GM) -> raised NO_LOCK cleared."""
+        mock_check_output.side_effect = [
+            self.PORT_DATA_UNCALIBRATED,
+            self.TIME_STATUS_GM_PRESENT,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+        mock_clear_alarm.return_value = True
+        # Alarm was raised from a prior lost cycle
+        ptp.ptpinstances[self.instance].nolock_alarm_object.raised = True
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance],
+                          self.conf_file)
+
+        self.assertFalse(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+    @patch('ptp.check_time_drift')
+    @patch('ptp.get_netlink_dpll_status')
+    @patch('ptp.get_base_port')
+    @patch('subprocess.check_output')
+    def test_non_managed_instance_unchanged(
+        self, mock_check_output, mock_get_base_port, mock_get_dpll_status,
+        mock_check_time_drift
+    ):
+        """Non-managed instance keeps the base-port redirect path.
+
+        FAULTY port but DPLL locked -> no NO_LOCK (regression guard).
+        """
+        ptp.ptpinstances[self.instance].is_managed_by_dpll_mgr = False
+        mock_check_output.side_effect = [
+            self.PORT_DATA_FAULTY,
+            self.TIME_STATUS_GM_PRESENT,
+        ]
+        mock_get_base_port.return_value = 'eno8703'
+        # Base-port DPLL locked -> clock_locked True -> alarm suppressed as today
+        mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
+
+        check_ptp_regular(self.instance, ptp.ptpinstances[self.instance],
+                          self.conf_file)
+
+        self.assertFalse(
+            ptp.ptpinstances[self.instance].nolock_alarm_object.raised)
+
+
 if __name__ == '__main__':
     unittest.main()

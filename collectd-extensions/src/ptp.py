@@ -3486,6 +3486,61 @@ def get_dpll_state(base_port):
     return state, pin
 
 
+def _gnss_present_on_device(dpll_interface, device_type):
+    """Return True if a GNSS input pin is present on the given DPLL device.
+
+    "Present" means the GNSS pin exists on the device and its state is
+    CONNECTED or SELECTABLE -- the GNSS signal is available to the device,
+    whether or not it is the currently-selected source. DISCONNECTED,
+    UNDEFINED, or absent means the GNSS signal is lost on that device.
+
+    device_type is DeviceType.EEC (frequency) or DeviceType.PPS (phase/time).
+    """
+    interface = interfaces.get(dpll_interface, None)
+    if interface is None:
+        return False
+    clock_id = interface.get_switch_id()
+    device, _ = cgu_handler.cgu_get_current_device_state(clock_id, device_type)
+    if device is None:
+        return False
+    for pin in cgu_handler.search_pins_by_type(
+            clock_id, device.dev_id, PinType.GNSS):
+        if pin.pin_state in [PinState.CONNECTED, PinState.SELECTABLE]:
+            return True
+    return False
+
+
+def get_gnss_source_state(dpll_interface, state):
+    """Map the DPLL state to the GNSS per-source state by GNSS pin presence.
+
+    GNSS is the per-source-healthy signal only when its pin is present
+    (CONNECTED or SELECTABLE) on BOTH DPLL devices -- the EEC (frequency) and
+    the PPS (phase/time). A genuine GNSS lock drives both; the PTP backhaul
+    (SDP0) connects only its PPS pin (its EEC pin stays disconnected), so
+    "GNSS present on both devices" is true only for a real GNSS source, never
+    a backhaul failover. Keying on the GNSS pin's own state -- rather than on
+    which pin the DPLL is currently selecting -- keeps the alarm correct for
+    any input-priority configuration: a healthy GNSS that is merely not the
+    selected master (e.g. a config where the backhaul outranks GNSS, leaving
+    GNSS SELECTABLE) is still reported healthy.
+
+    When GNSS is not present on both devices, report HOLDOVER so the GNSS
+    alarm raises/escalates regardless of what the DPLL fell back to (backhaul,
+    SyncE, or nothing).
+
+    Only applied when dpll-mgr is present: the GNSS<->backhaul failover that
+    creates this ambiguity exists only with dpll-mgr. Without it a locked DPLL
+    is a valid source (pure-GNSS grand master, or a configured SMA/EXT source)
+    and the state is returned unchanged -- a no-op on non-dpll-mgr configs.
+    """
+    if _dpll_mgr_instance_name is None:
+        return state    # no dpll-mgr -> no failover ambiguity -> unchanged
+    if _gnss_present_on_device(dpll_interface, DeviceType.EEC) and \
+            _gnss_present_on_device(dpll_interface, DeviceType.PPS):
+        return state    # GNSS present on both devices -> real source, unchanged
+    return CLOCK_STATE_HOLDOVER
+
+
 def block_ptp_traffic(instance_name, iface):
     """Block incoming PTP traffic on an interface using ethtool.
 
@@ -4412,8 +4467,18 @@ def check_gnss_signal(instance):
     collectd.info(f"{PLUGIN} gnss-monitor instance: {instance} "
                   f"device {ctrl.interface} status {state.value} pin %s"
                   % (pin.pin_board_label if pin else "unknown"))
+    # Per-source gate: judge GNSS by the GNSS pin's own presence (connected
+    # or selectable on both EEC and PPS), not by which pin the DPLL selected.
+    # GNSS gone (e.g. after dpll-mgr failover to the SDP0 backhaul) means the
+    # alarm must stay/raise. No-op on non-dpll-mgr configs (see
+    # get_gnss_source_state).
+    gnss_state = get_gnss_source_state(base_port, state)
+    if gnss_state is not state:
+        collectd.info("%s %s GNSS signal not present on DPLL, treating GNSS "
+                      "as %s for alarm"
+                      % (PLUGIN, instance, gnss_state.value))
     check_gnss_alarm(instance, ctrl.gnss_signal_loss_alarm_object,
-                     ctrl.interface, state)
+                     ctrl.interface, gnss_state)
     if state not in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ]:
         if not (ctrl.log_throttle_count % obj.INIT_LOG_THROTTLE):
             collectd.info("%s %s not locked to remote GNSS" %
@@ -4577,7 +4642,12 @@ def check_1pps_signal(instance):
             collectd.info(f"{PLUGIN} Monitoring instance {instance} "
                           f"device {ctrl.interface} status {state.value} pin %s"
                           % (pin.pin_board_label if pin else "unknown"))
-            check_gnss_alarm(instance, alarm_obj, ctrl.interface, state)
+            # Per-source gate: a GNSS-fed clock port (e.g. GNR-D clock0) must
+            # follow its own GNSS pin presence, not clear on a non-GNSS lock
+            # after failover. No-op on non-dpll-mgr configs (see
+            # get_gnss_source_state).
+            check_gnss_alarm(instance, alarm_obj, ctrl.interface,
+                             get_gnss_source_state(interface, state))
         else:
             # Pins are configured, check GNSS then SMA
             # First, check combined EEC+PPS DPLL state of GNSS
@@ -4587,7 +4657,11 @@ def check_1pps_signal(instance):
                 collectd.info(f"{PLUGIN} Monitoring instance {instance} "
                               f"device {interface} status {state.value} pin %s"
                               % (pin.pin_board_label if pin else "unknown"))
-                check_gnss_alarm(instance, alarm_obj, interface, state)
+                # Per-source gate (same as above). A healthy SMA lock is a
+                # valid non-GNSS source; the guard no-ops without dpll-mgr so
+                # an SMA-locked clock is never treated as GNSS loss.
+                check_gnss_alarm(instance, alarm_obj, interface,
+                                 get_gnss_source_state(interface, state))
             else:
                 # Check the SMA pins if they are configured
                 for key, function in pin_function.items():
@@ -5340,11 +5414,13 @@ def check_ptp_regular(instance, ctrl, conf_file):
          'GET PORT_DATA_SET']).decode()
 
     port_locked = False
+    port_states = []
     obj.resp = data.split('\n')
     for line in obj.resp:
         if 'portState' in line:
             collectd.debug("%s portState : %s" % (PLUGIN, line.split()[1]))
             port_state = line.split()[1]
+            port_states.append(port_state)
             if port_state == 'SLAVE':
                 port_locked = True
 
@@ -5418,6 +5494,33 @@ def check_ptp_regular(instance, ctrl, conf_file):
             collectd.info(f"{PLUGIN} {instance} derived instance, "
                           f"reference {reference_instance} "
                           f"clock_locked={clock_locked}")
+
+    # dpll-mgr-managed free_running backhaul monitor (e.g. ptp01bh):
+    # its base-port DPLL is disciplined by GNSS when GNSS is available (and
+    # by SDP0 after failover), so the nmea clock_locked above can never
+    # reveal a lost backhaul GM. Judge this instance by its OWN port/GM
+    # instead: a healthy free_running monitor sits UNCALIBRATED/SLAVE with a
+    # GM present (on linuxptp 4.2 with free_running it stays UNCALIBRATED and
+    # never reaches SLAVE, but SLAVE is accepted defensively for other
+    # versions); FAULTY (link down), LISTENING (no GM), or gmPresent=false
+    # means the backhaul source is gone. Override clock_locked so the
+    # existing NO_LOCK block below raises the per-instance alarm. Gated
+    # strictly on is_managed_by_dpll_mgr, so every other instance's path is
+    # unchanged. When the backhaul is HEALTHY this leaves clock_locked True
+    # and check_time_drift()/OOT below still runs (unlike routing to a
+    # separate checker, which would skip it entirely); when the backhaul is
+    # LOST the NO_LOCK block returns early (no GM -> no meaningful offset to
+    # sample), consistent with the existing "not locked to GM" behavior for
+    # every instance.
+    if ctrl.is_managed_by_dpll_mgr:
+        port_healthy = any(
+            ps in ('UNCALIBRATED', 'SLAVE') for ps in port_states)
+        gm_ok = str(gm_present).lower() == 'true'
+        clock_locked = port_healthy and gm_ok
+        collectd.info("%s %s backhaul-monitor portStates=%s gmPresent=%s "
+                      "clock_locked=%s"
+                      % (PLUGIN, instance, port_states, gm_present,
+                         clock_locked))
 
     # Handle case where this host is the Grand Master
     #   ... or assumes it is.

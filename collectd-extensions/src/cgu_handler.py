@@ -66,6 +66,30 @@ class CguHandler:
             )
         )
 
+    def search_pins_by_type(self, clock_id, dev_id, pin_type):
+        """Search input pins of a given type on a specific device.
+
+        Args:
+            clock_id (str): The device's clock ID.
+            dev_id (int):   The DPLL device ID (EEC or PPS) to scope to.
+            pin_type:       The PinType to match (e.g. PinType.GNSS).
+
+        Returns:
+            list: Input pins on that device matching the pin type.
+        """
+        if not self._pins:
+            return []
+        return list(
+            filter(
+                lambda pin:
+                pin.dev_clock_id == clock_id and
+                pin.dev_id == dev_id and
+                pin.pin_direction == PinDirection.INPUT and
+                pin.pin_type == pin_type,
+                self._pins
+            )
+        )
+
     def get_current_pin_reference(self, device):
         """Search the pin disciplining the device's locking state"""
 
