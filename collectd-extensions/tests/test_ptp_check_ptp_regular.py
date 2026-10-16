@@ -210,6 +210,7 @@ class TestCheckPtpRegular(unittest.TestCase):
             self.UPSTREAM_TIME_LOCKED
         ]
         mock_get_base_port.return_value = 'ens0f1'
+        ptp.ts2phc_source_by_base_port['ens0f1'] = 'generic'
         mock_clear_alarm.return_value = True
 
         result = check_ptp_regular(self.instance, ptp.ptpinstances[self.instance], self.conf_file)
@@ -296,6 +297,7 @@ class TestCheckPtpRegularMasterOffset(unittest.TestCase):
             self.TIME_STATUS_LOCAL_GM_STALE_OFFSET,
         ]
         mock_get_base_port.return_value = 'ens0f0'
+        ptp.ts2phc_source_by_base_port['ens0f0'] = 'nmea'
         # DPLL locked so clock_locked is True and we reach check_time_drift
         mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
 
@@ -608,6 +610,7 @@ class TestCheckPtpRegularBackhaulMonitor(unittest.TestCase):
             self.TIME_STATUS_GM_PRESENT,
         ]
         mock_get_base_port.return_value = 'eno8703'
+        ptp.ts2phc_source_by_base_port['eno8703'] = 'nmea'
         # Base-port DPLL locked -> clock_locked True -> alarm suppressed as today
         mock_get_dpll_status.return_value = (ptp.CLOCK_STATE_LOCKED, None)
 

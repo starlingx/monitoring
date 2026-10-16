@@ -640,6 +640,47 @@ def compute_base_port(interface_name):
 ts2phc_source_interfaces = {}
 ts2phc_instance_map = {}
 
+# ts2phc source ('nmea'/'generic'/...) resolved PER base_port. A node may run
+# more than one ts2phc instance of differing source (e.g. a dual-ts2phc GNR-D
+# with an NMEA ts2phc on the E825 and a '-s generic' ts2phc on the E830); the
+# source must therefore be resolved per base_port rather than from a single
+# plugin-global value, which would otherwise reflect whichever ts2phc was read
+# last.
+ts2phc_source_by_base_port = {}
+
+
+def get_ts2phc_source(base_port):
+    """Return the ts2phc source disciplining this base_port.
+
+    'nmea', 'generic', (or another '-s <src>' value), or None when no ts2phc
+    disciplines the base_port. Replaces the former plugin-global
+    obj.capabilities['ts2phc_source'] so that a node with more than one ts2phc
+    instance classifies each leader by the source that actually disciplines it.
+    """
+    return ts2phc_source_by_base_port.get(base_port)
+
+
+def register_ts2phc_source(base_port, source):
+    """Record the ts2phc source for a base_port, deterministically.
+
+    If two ts2phc instances of differing source register the same base_port,
+    prefer 'nmea' over 'generic' (a base_port disciplined by any NMEA ts2phc is
+    a PRTC source regardless of config read order) and log the conflict. This
+    never resolves by read order and never silently overwrites -- that
+    non-determinism is exactly what per-base_port resolution removes.
+    """
+    if base_port is None or not source:
+        return
+    existing = ts2phc_source_by_base_port.get(base_port)
+    if existing is not None and existing != source:
+        winner = 'nmea' if 'nmea' in (existing, source) else existing
+        collectd.warning(
+            "%s ts2phc source conflict on base_port %s: already '%s', now '%s'"
+            " -- keeping '%s'" % (PLUGIN, base_port, existing, source, winner))
+        ts2phc_source_by_base_port[base_port] = winner
+        return
+    ts2phc_source_by_base_port[base_port] = source
+
 # List of timing instances
 timing_instance_list = []
 
@@ -1892,10 +1933,14 @@ def initialize_ptp4l_state_fields(instance):
                   % (PLUGIN, instance, ctrl.interface, base_port))
 
     mapped_ts2phc_instance = ts2phc_instance_map.get(base_port, None)
-    # "-s generic" ts2phc instance's port has mapping to None primary_interface,
-    # and this supposed to mean prtc not present.
-    mapped_primary_interface = ts2phc_source_interfaces.get(base_port, None)
-    if mapped_ts2phc_instance and mapped_primary_interface:
+    # A leader is a PRTC source if it is disciplined by a PRTC-traceable ts2phc:
+    # a classic NMEA ts2phc, OR a "-s generic" ts2phc that is a dpll-mgr
+    # gearshift channel (GNSS/DPLL-disciplined, e.g. the GNR-D E830). The latter
+    # has a None primary_interface, so derive prtc_present from the role
+    # predicate rather than from mapped_primary_interface being non-None. The
+    # ts2phc_source_interfaces None value itself is left intact (it is also read
+    # to resolve primary_nic elsewhere).
+    if mapped_ts2phc_instance and is_prtc_traceable_leader(base_port):
         collectd.info("%s ptp4l instance %s is mapped to ts2phc instance %s"
                       % (PLUGIN, instance, mapped_ts2phc_instance))
         ctrl.prtc_present = True
@@ -2028,6 +2073,10 @@ def read_ts2phc_config():
             instance = TimingInstance(filename)
             instance_name = instance.instance_name
 
+            # ts2phc "-s <src>" value (None for a pure NMEA instance). Defined
+            # here so the per-base_port source registration below is always safe.
+            source = None
+
             # Get source from ts2phc command line
             service_options = read_ptp_service_options(instance_name, PTP_INSTANCE_TYPE_TS2PHC)
             if service_options:
@@ -2077,6 +2126,7 @@ def read_ts2phc_config():
                         ptpinstances[instance_name].timing_instance = instance
                         ts2phc_source_interfaces[interface] = interface
                         ts2phc_instance_map[interface] = instance_name
+                        register_ts2phc_source(get_base_port(interface), 'nmea')
                         obj.capabilities['primary_nic'] = interface
                         obj.capabilities['ts2phc_source'] = 'nmea'
 
@@ -2106,6 +2156,8 @@ def read_ts2phc_config():
                             ptpinstances[instance_name].timing_instance = instance
                             ts2phc_source_interfaces[primary_interface] = primary_interface
                             ts2phc_instance_map[primary_interface] = instance_name
+                            register_ts2phc_source(
+                                get_base_port(primary_interface), 'nmea')
                             obj.capabilities['primary_nic'] = primary_interface
                             obj.capabilities['ts2phc_source'] = 'nmea'
 
@@ -2135,6 +2187,14 @@ def read_ts2phc_config():
                         # In case of "-s generic", primary_interface is None.
                         ts2phc_source_interfaces[base_port] = primary_interface
                         ts2phc_instance_map[base_port] = instance_name
+                    # Record the per-base_port source. 'nmea' when this
+                    # instance has an NMEA primary (primary_interface set),
+                    # else the parsed "-s <src>" value. register_ts2phc_source
+                    # resolves any base_port conflict deterministically.
+                    if base_port is not None:
+                        register_ts2phc_source(
+                            base_port,
+                            'nmea' if primary_interface else source)
 
 
 def read_clock_config():
@@ -2195,6 +2255,7 @@ def init_func():
     obj.hostname = obj.gethostname()
     obj.base_eid = 'host=' + obj.hostname
     obj.capabilities = {'primary_nic': None, 'ts2phc_source': None}
+    ts2phc_source_by_base_port.clear()
 
     # initialize base ports
     for path in glob('/sys/class/net/*/device/ptp'):
@@ -2470,7 +2531,8 @@ def handle_ptp4l_g8275_fields(instance):
         # NOTE: This function is only called for non-derived instances
         # (derived instances go through process_ptp4l_derived instead).
         # Only apply when disciplined by ts2phc (T-GM) and DPLL is locked or holdover
-        if ctrl.disciplined_by_ts2phc and obj.capabilities['ts2phc_source'] == 'nmea' and \
+        if ctrl.disciplined_by_ts2phc \
+                and is_prtc_traceable_leader(get_base_port(ctrl.interface)) and \
                 ctrl.ptp4l_prc_state in [
                 CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ, CLOCK_STATE_HOLDOVER]:
             leap_result = get_leap_flags_for_gm(ctrl)
@@ -3763,6 +3825,66 @@ def _backhaul_forwardable_clock_class():
         return None
 
     return gm_clock_class
+
+
+def _ts2phc_is_dpll_mgr_channel(base_port):
+    """Return True if a dpll-mgr gearshift ts2phc disciplines this base_port.
+
+    The channel is one of the dpll-mgr gearshift channels (ts2_0/ts2_1).
+
+    Config-time only -- it asks whether the channel EXISTS, not whether it is
+    currently DRIVE. A generic ts2phc that is a dpll-mgr gearshift channel is
+    provably GNSS/DPLL-disciplined (the GNR-D E830 hybrid case), so its leader
+    is a T-GM. Live DRIVE custody is a separate question answered by
+    _leader_custody_confirmed() for the clockClass passthrough override.
+    """
+    ts2phc_instance = ts2phc_instance_map.get(base_port)
+    if not ts2phc_instance:
+        return False
+    # No dpll-mgr gearshift channels exist on this node (no dpll-mgr instance):
+    # a generic ts2phc here is a plain T-BC relay, not DPLL-disciplined. Short
+    # out before touching the ts2phc instance config — this is the common
+    # non-dpll-mgr case and keeps the T-BC-relay path free of a dpll-mgr probe.
+    if not _dpll_mgr_ts2phc_channel_by_uds:
+        return False
+    ts2phc_ctrl = ptpinstances.get(ts2phc_instance)
+    if ts2phc_ctrl is None or ts2phc_ctrl.timing_instance is None:
+        return False
+    config = ts2phc_ctrl.timing_instance.config
+    ts2phc_uds = None
+    try:
+        if config.has_section('global'):
+            ts2phc_uds = config['global'].get('uds_address')
+    except (TypeError, KeyError, AttributeError):
+        # Malformed / unexpected config object -> cannot confirm a dpll-mgr
+        # channel; treat as not-a-channel (fail safe to T-BC relay handling).
+        return False
+    if not ts2phc_uds:
+        return False
+    return _dpll_mgr_ts2phc_channel_by_uds.get(ts2phc_uds) is not None
+
+
+def is_prtc_traceable_leader(base_port):
+    """Return True if this leader is PRTC-traceable and handled as a T-GM.
+
+    A PRTC-traceable leader (its PHC disciplined by a PRTC-traceable ts2phc)
+    is handled as a T-GM in check_clock_class().
+
+    PRTC-traceable means either:
+      - a classic NMEA ts2phc (get_ts2phc_source(base_port) == 'nmea'), or
+      - a "-s generic" ts2phc that is a dpll-mgr gearshift channel, i.e. driven
+        by the GNSS-disciplined DPLL (the GNR-D E830 hybrid case).
+
+    Off a dpll-mgr host the second clause is always False, so this reduces to
+    source == 'nmea' -- identical to the pre-change behaviour for legacy
+    single-NMEA T-GMs and T-BC relays.
+    """
+    source = get_ts2phc_source(base_port)
+    if source == 'nmea':
+        return True
+    if source == 'generic' and _ts2phc_is_dpll_mgr_channel(base_port):
+        return True
+    return False
 
 
 def _leader_custody_confirmed(base_port):
@@ -5182,7 +5304,7 @@ def read_func():
             check_ptp_regular(instance, ctrl, conf_file)
 
         # Check GNSS and 1PPS alarms if nmea source is configured
-        if obj.capabilities['ts2phc_source'] == 'nmea':
+        if get_ts2phc_source(get_base_port(ctrl.interface)) == 'nmea':
             if (
                 ctrl.instance_type == PTP_INSTANCE_TYPE_TS2PHC
                 and ctrl.interface != DUMMY_INTERFACE
@@ -5196,16 +5318,21 @@ def read_func():
 
         # Check time drift and manage PTP clock class if any ts2phc
         # source is configured, and instance type is PTP4l.
-        if obj.capabilities['ts2phc_source'] and \
+        base_port = get_base_port(ctrl.interface)
+        if get_ts2phc_source(base_port) and \
            ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
             # Removed redundant call to check_time_drift()
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
             if ctrl.disciplined_by_ts2phc and not ctrl.is_derived_instance \
                and not ctrl.is_managed_by_dpll_mgr:
-                if obj.capabilities['ts2phc_source'] == 'nmea':
+                # Route by leader ROLE, not ts2phc source type: a PRTC-traceable
+                # leader (NMEA, or a generic ts2phc that is a dpll-mgr gearshift
+                # channel) is a T-GM and must use the local clockClass arbiter;
+                # anything else is a T-BC relay following an upstream GM.
+                if is_prtc_traceable_leader(base_port):
                     check_clock_class(instance)
-                elif obj.capabilities['ts2phc_source'] == 'generic':
+                else:
                     process_ptp_bc(instance)
 
         if ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
@@ -5594,12 +5721,21 @@ def check_ptp_regular(instance, ctrl, conf_file):
     )
 
     clock_locked = False
-    if obj.capabilities['ts2phc_source'] == 'nmea':
-        # Let's read the clock state, GNSS 1PPS and SMA1
-        #
-        # Determine the base port of the NIC from the interface, and
-        # get state for primary or secondary NIC.
-        base_port = get_base_port(ctrl.interface)
+    ts2phc_source = get_ts2phc_source(get_base_port(ctrl.interface))
+    base_port = get_base_port(ctrl.interface)
+    # Route the lock determination by leader ROLE, not raw ts2phc source type —
+    # consistent with the clockClass dispatch (is_prtc_traceable_leader). A
+    # PRTC-traceable leader is a T-GM whose PHC is disciplined by its own
+    # base_port DPLL: that is 'nmea', OR a '-s generic' ts2phc that is a
+    # GNSS-disciplined dpll-mgr gearshift channel (the GNR-D E830 hybrid case).
+    # For those, clock_locked must come from the base_port DPLL (PPS/EEC) — NOT
+    # from a non-existent upstream T-BC relay. Only a generic leader that is NOT
+    # PRTC-traceable (an actual relay following an upstream GM) uses the upstream
+    # derivation below. Without this, a generic T-GM leader (E830) never sets
+    # clock_locked and the GM no-lock guard raises a false 100.119.
+    if ts2phc_source == 'nmea' or \
+            (ts2phc_source == 'generic' and is_prtc_traceable_leader(base_port)):
+        # Let's read the clock state from this leader's own base_port DPLL.
         collectd.info("%s check_ptp4l nmea path %s ctrl.interface=%s base_port=%s"
                       % (PLUGIN, instance, ctrl.interface, base_port))
         pps_status, _ = get_netlink_dpll_status(base_port, DeviceType.PPS)
@@ -5611,7 +5747,8 @@ def check_ptp_regular(instance, ctrl, conf_file):
 
         collectd.info(f"{PLUGIN} {obj.hostname} {instance} base port {base_port} "
                       f"eec {eec_status.value} pps {pps_status.value} clock_locked={clock_locked}")
-    elif obj.capabilities['ts2phc_source'] == 'generic':
+    elif ts2phc_source == 'generic':
+        # Non-traceable generic leader = T-BC relay following an upstream GM.
         # Let's read the upstream PTP clock state
         #
         # Determine upstream PTP instance, and query its Parent Data set.

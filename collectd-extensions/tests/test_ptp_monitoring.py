@@ -43,6 +43,7 @@ def _reset_module_state():
     ptp.base_port_map.clear()
     ptp.ts2phc_source_interfaces.clear()
     ptp.ts2phc_instance_map.clear()
+    ptp.ts2phc_source_by_base_port.clear()
     ptp.timing_instance_list.clear()
     ptp.ptp4l_instance_map.clear()
     ptp.ethtool_rule_ids.clear()

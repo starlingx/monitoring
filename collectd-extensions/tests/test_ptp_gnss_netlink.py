@@ -353,6 +353,7 @@ class TestInitializePtp4lStateFields(unittest.TestCase):
         """Verify prtc_present ctrl.prtc_present is True."""
         ptp.ts2phc_source_interfaces['ens1f0'] = 'ens1f0'
         ptp.ts2phc_instance_map['ens1f0'] = 'ts2phc_inst'
+        ptp.ts2phc_source_by_base_port['ens1f0'] = 'nmea'
         mock_pmc.side_effect = [
             {'currentUtcOffsetValid': '1'},
             {'clockIdentity': 'abc123'},

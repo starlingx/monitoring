@@ -283,5 +283,139 @@ class TestReadDpllMgrConfigTs2phcMap(unittest.TestCase):
             {'/var/run/ts2phc0': 'ts2_0'})
 
 
+class TestTs2phcSourceByBasePort(unittest.TestCase):
+    """Part A: per-base_port ts2phc source resolution.
+
+    Covers spec test IDs A-1 (per-instance source), A-2 (order independence)
+    and A-3 (collision guard, nmea wins). Exercises register_ts2phc_source /
+    get_ts2phc_source directly -- the resolver is what every read site now
+    consults instead of the former plugin-global obj.capabilities value.
+    """
+
+    def setUp(self):
+        self._saved = dict(ptp.ts2phc_source_by_base_port)
+        ptp.ts2phc_source_by_base_port.clear()
+
+    def tearDown(self):
+        ptp.ts2phc_source_by_base_port.clear()
+        ptp.ts2phc_source_by_base_port.update(self._saved)
+
+    def test_a1_per_instance_source(self):
+        """A-1: distinct base_ports keep distinct sources (no singleton)."""
+        ptp.register_ts2phc_source('eno8703', 'nmea')      # E825
+        ptp.register_ts2phc_source('enp108s0f0', 'generic')  # E830
+        self.assertEqual(ptp.get_ts2phc_source('eno8703'), 'nmea')
+        self.assertEqual(ptp.get_ts2phc_source('enp108s0f0'), 'generic')
+
+    def test_a1_unknown_base_port_is_none(self):
+        """A-1: a base_port with no ts2phc resolves to None (fail-safe)."""
+        self.assertIsNone(ptp.get_ts2phc_source('eno9999'))
+
+    def test_a2_order_independence(self):
+        """A-2: registration order does not change the result."""
+        ptp.register_ts2phc_source('enp108s0f0', 'generic')
+        ptp.register_ts2phc_source('eno8703', 'nmea')
+        self.assertEqual(ptp.get_ts2phc_source('eno8703'), 'nmea')
+        self.assertEqual(ptp.get_ts2phc_source('enp108s0f0'), 'generic')
+
+    def test_a3_collision_guard_nmea_wins_generic_first(self):
+        """A-3: same base_port, generic then nmea -> nmea wins + WARNING."""
+        ptp.register_ts2phc_source('eno8703', 'generic')
+        warn = MagicMock()
+        with patch.object(ptp.collectd, 'warning', warn):
+            ptp.register_ts2phc_source('eno8703', 'nmea')
+        self.assertTrue(warn.called)
+        self.assertEqual(ptp.get_ts2phc_source('eno8703'), 'nmea')
+
+    def test_a3_collision_guard_nmea_wins_nmea_first(self):
+        """A-3: same base_port, nmea then generic -> still nmea (order-indep)."""
+        ptp.register_ts2phc_source('eno8703', 'nmea')
+        warn = MagicMock()
+        with patch.object(ptp.collectd, 'warning', warn):
+            ptp.register_ts2phc_source('eno8703', 'generic')
+        self.assertTrue(warn.called)
+        self.assertEqual(ptp.get_ts2phc_source('eno8703'), 'nmea')
+
+    def test_a3_same_source_no_warning(self):
+        """A-3: re-registering the same source is not a conflict."""
+        ptp.register_ts2phc_source('eno8703', 'nmea')
+        warn = MagicMock()
+        with patch.object(ptp.collectd, 'warning', warn):
+            ptp.register_ts2phc_source('eno8703', 'nmea')
+        self.assertFalse(warn.called)
+        self.assertEqual(ptp.get_ts2phc_source('eno8703'), 'nmea')
+
+    def test_register_ignores_none(self):
+        """A-1: None base_port or empty source is a no-op (never crashes)."""
+        ptp.register_ts2phc_source(None, 'nmea')
+        ptp.register_ts2phc_source('eno8703', None)
+        self.assertEqual(ptp.ts2phc_source_by_base_port, {})
+
+
+class TestIsPrtcTraceableLeader(unittest.TestCase):
+    """Part B: PRTC-traceable role predicate (spec B-1).
+
+    A leader is a T-GM (-> check_clock_class) when disciplined by an NMEA
+    ts2phc, OR by a '-s generic' ts2phc that is a dpll-mgr gearshift channel
+    (the GNR-D E830 hybrid case). Off a dpll-mgr host the generic clause is
+    always False, so the predicate reduces to source == 'nmea'.
+    """
+
+    def setUp(self):
+        self._saved = {
+            'src': dict(ptp.ts2phc_source_by_base_port),
+            'chan': dict(ptp._dpll_mgr_ts2phc_channel_by_uds),
+            'instances': dict(getattr(ptp, 'ptpinstances', {})),
+            'ts2map': dict(getattr(ptp, 'ts2phc_instance_map', {})),
+        }
+        ptp.ts2phc_source_by_base_port.clear()
+        # E825 NMEA leader on eno8703; E830 generic leader on enp108s0f0.
+        ptp.ts2phc_source_by_base_port.update(
+            {'eno8703': 'nmea', 'enp108s0f0': 'generic'})
+        ptp._dpll_mgr_ts2phc_channel_by_uds = {
+            '/var/run/ts2phc-ts1': 'ts2_0',
+            '/var/run/ts2phc-ts2': 'ts2_1',
+        }
+        ptp.ptpinstances = {
+            'ts1': _mk_ts2phc_ctrl('/var/run/ts2phc-ts1'),
+            'ts2': _mk_ts2phc_ctrl('/var/run/ts2phc-ts2'),
+            'ts_bad': _mk_ts2phc_ctrl('/var/run/ts2phc-nochan'),
+        }
+        ptp.ts2phc_instance_map = {
+            'eno8703': 'ts1',
+            'enp108s0f0': 'ts2',
+            'enp108s0f1': 'ts_bad',   # generic ts2phc, NOT a gearshift channel
+        }
+
+    def tearDown(self):
+        ptp.ts2phc_source_by_base_port.clear()
+        ptp.ts2phc_source_by_base_port.update(self._saved['src'])
+        ptp._dpll_mgr_ts2phc_channel_by_uds = self._saved['chan']
+        ptp.ptpinstances = self._saved['instances']
+        ptp.ts2phc_instance_map = self._saved['ts2map']
+
+    def test_b1_nmea_is_true(self):
+        self.assertTrue(ptp.is_prtc_traceable_leader('eno8703'))
+
+    def test_b1_generic_with_gearshift_channel_is_true(self):
+        """The E830 hybrid case: generic ts2phc that IS a dpll-mgr channel."""
+        self.assertTrue(ptp.is_prtc_traceable_leader('enp108s0f0'))
+
+    def test_b1_generic_without_channel_is_false(self):
+        """A plain generic ts2phc (no gearshift channel) is a BC relay."""
+        ptp.ts2phc_source_by_base_port['enp108s0f1'] = 'generic'
+        self.assertFalse(ptp.is_prtc_traceable_leader('enp108s0f1'))
+
+    def test_b1_no_ts2phc_is_false(self):
+        self.assertFalse(ptp.is_prtc_traceable_leader('eno9999'))
+
+    def test_b1_off_dpll_mgr_generic_is_false(self):
+        """Off a dpll-mgr host (no channel map) generic reduces to not-PRTC."""
+        ptp._dpll_mgr_ts2phc_channel_by_uds = {}
+        self.assertFalse(ptp.is_prtc_traceable_leader('enp108s0f0'))
+        # NMEA stays True regardless -- legacy behaviour preserved.
+        self.assertTrue(ptp.is_prtc_traceable_leader('eno8703'))
+
+
 if __name__ == '__main__':
     unittest.main()
