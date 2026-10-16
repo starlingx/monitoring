@@ -149,6 +149,13 @@ _dpll_mgr_holdover_level = -1  # Last-seen holdover level
 # channel whose DRIVE state proves custody.
 _dpll_mgr_ts2phc_channel_by_uds = {}
 
+# base_port of the dpll-mgr backhaul (ptp_bh) ptp4l instance.
+# In State-2 (GNSS lost) the backhaul ptp4l disciplines THIS base_port's PHC via
+# gearshift ptp_bh=DRIVE, while the GNSS ts2phc (ts2_0) parks. A fronthaul leader
+# on this base_port therefore has its custody proven by ptp_bh=DRIVE, not by its
+# ts2phc channel. None until the backhaul instance is identified at config parse.
+_dpll_mgr_backhaul_base_port = None
+
 
 def _get_ptp_options_path():
     os_type = _get_os_release()
@@ -899,6 +906,16 @@ def read_dpll_mgr_config():
                 ctrl.is_managed_by_dpll_mgr = True
                 collectd.info("%s Instance %s managed by dpll-mgr (uds=%s)"
                               % (PLUGIN, instance_name, uds))
+                # record the backhaul's base_port. In State-2
+                # the backhaul ptp4l (ptp_bh=DRIVE) disciplines this PHC while the
+                # GNSS ts2phc parks, so a fronthaul leader on this base_port has
+                # custody proven by ptp_bh, not by its ts2phc channel.
+                global _dpll_mgr_backhaul_base_port
+                if ctrl.interface:
+                    _dpll_mgr_backhaul_base_port = get_base_port(ctrl.interface)
+                    collectd.info("%s dpll-mgr backhaul base_port=%s (%s)"
+                                  % (PLUGIN, _dpll_mgr_backhaul_base_port,
+                                     instance_name))
 
     # Register dpll-mgr instance in ptpinstances for process monitoring
     if _dpll_mgr_instance_name and _dpll_mgr_instance_name not in ptpinstances:
@@ -3888,14 +3905,38 @@ def is_prtc_traceable_leader(base_port):
 
 
 def _leader_custody_confirmed(base_port):
-    """Return True if the ts2phc disciplining this leader's PHC is DRIVE.
+    """Return True if this leader's PHC is provably DRIVE-disciplined.
 
-    Resolves the leader's base_port -> ts2phc instance (ts2phc_instance_map) ->
-    that instance's uds_address -> dpll-mgr gearshift channel (ts2_0/ts2_1 via
-    _dpll_mgr_ts2phc_channel_by_uds) -> gear from status.json. DRIVE means the
-    PHC is provably disciplined to the backhaul (CGTS-108079 D3). Unknown
-    custody (channel absent/unmapped, WI-1 not present) fails safe to False.
+    Two custody paths:
+
+    1. ts2phc custody (State-1, GNSS present): resolve the leader's base_port ->
+       ts2phc instance (ts2phc_instance_map) -> its uds_address -> dpll-mgr
+       gearshift channel (ts2_0/ts2_1) -> gear; DRIVE means the leader's ts2phc
+       disciplines its PHC. Unknown custody (channel absent/unmapped, WI-1 not
+       present) fails safe to False.
+
+    2. ptp_bh custody (State-2, GNSS lost): when the leader sits on the backhaul
+       ptp4l's PHC base_port, the GNSS ts2phc (ts2_0) PARKs and the backhaul
+       ptp4l disciplines that PHC via gearshift ptp_bh=DRIVE. In that case the
+       leader's custody is proven by ptp_bh=DRIVE, NOT by its ts2phc channel
+       (which is correctly parked). Scoped strictly to the backhaul base_port so
+       it never confirms custody for a leader (e.g. E830) that ptp_bh does not
+       discipline.
+
+    Returns True if either path confirms DRIVE custody.
     """
+    status = _dpll_mgr_status.read()
+    if not status:
+        return False
+    gearshift = status.get('gearshift', {})
+
+    # Path 2 (State-2): leader on the backhaul PHC base_port, ptp_bh DRIVE.
+    if (_dpll_mgr_backhaul_base_port is not None
+            and base_port == _dpll_mgr_backhaul_base_port
+            and gearshift.get('ptp_bh') == GEARSHIFT_DRIVE):
+        return True
+
+    # Path 1 (State-1): the leader's own ts2phc channel is DRIVE.
     ts2phc_instance = ts2phc_instance_map.get(base_port)
     if not ts2phc_instance:
         return False
@@ -3915,10 +3956,7 @@ def _leader_custody_confirmed(base_port):
     if channel_name is None:
         return False
 
-    status = _dpll_mgr_status.read()
-    if not status:
-        return False
-    gear = status.get('gearshift', {}).get(channel_name)
+    gear = gearshift.get(channel_name)
     return gear == GEARSHIFT_DRIVE
 
 

@@ -67,6 +67,7 @@ class TestCc6PassthroughDecision(unittest.TestCase):
             'chan': dict(ptp._dpll_mgr_ts2phc_channel_by_uds),
             'instances': dict(getattr(ptp, 'ptpinstances', {})),
             'ts2map': dict(getattr(ptp, 'ts2phc_instance_map', {})),
+            'bh_base': getattr(ptp, '_dpll_mgr_backhaul_base_port', None),
         }
         # Deterministic module state
         ptp._dpll_mgr_instance_name = 'ptp01bh'
@@ -96,6 +97,9 @@ class TestCc6PassthroughDecision(unittest.TestCase):
             'ens1f0': 'ts2phc-0',   # E825 leader base port
             'ens2f0': 'ts2phc-1',   # E830 leader base port
         }
+        # Default: backhaul base_port unknown (path inert unless a test
+        # sets it). ens1f0 is the E825/backhaul PHC base port when set.
+        ptp._dpll_mgr_backhaul_base_port = None
 
     def tearDown(self):
         # Restore module globals to avoid polluting other test modules that
@@ -104,6 +108,7 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         ptp._dpll_mgr_ts2phc_channel_by_uds = self._saved['chan']
         ptp.ptpinstances = self._saved['instances']
         ptp.ts2phc_instance_map = self._saved['ts2map']
+        ptp._dpll_mgr_backhaul_base_port = self._saved['bh_base']
 
     def test_toggle_default_enabled(self):
         self.assertTrue(ptp._cc6_passthrough_enabled())
@@ -178,6 +183,56 @@ class TestCc6PassthroughDecision(unittest.TestCase):
     def test_custody_no_status(self):
         with patch.object(ptp._dpll_mgr_status, 'read', return_value=None):
             self.assertFalse(ptp._leader_custody_confirmed('ens1f0'))
+
+    # ---- State-2 ptp_bh custody --------------------
+    # In State-2 (GNSS lost) the E825 fronthaul leader's ts2phc (ts2_0) PARKs
+    # and the backhaul ptp4l disciplines its PHC via ptp_bh=DRIVE. Custody must
+    # be confirmed by ptp_bh for a leader on the backhaul base_port, even though
+    # its ts2phc channel is parked.
+
+    def test_custody_state2_ptp_bh_drive_on_backhaul_base_port(self):
+        # E825 leader (ens1f0) == backhaul base_port; ts2_0 PARK, ptp_bh DRIVE.
+        ptp._dpll_mgr_backhaul_base_port = 'ens1f0'
+        status = {'gearshift': {'ptp_bh': 'DRIVE', 'ts2_0': 'PARK',
+                                'ts2_1': 'DRIVE'}}
+        with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertTrue(ptp._leader_custody_confirmed('ens1f0'))
+
+    def test_custody_state2_ptp_bh_not_applied_to_non_backhaul_leader(self):
+        # E830 leader (ens2f0) is NOT on the backhaul base_port; ptp_bh DRIVE
+        # must NOT confirm its custody. Its own ts2_1 governs (here PARK->False).
+        ptp._dpll_mgr_backhaul_base_port = 'ens1f0'
+        status = {'gearshift': {'ptp_bh': 'DRIVE', 'ts2_0': 'PARK',
+                                'ts2_1': 'PARK'}}
+        with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertFalse(ptp._leader_custody_confirmed('ens2f0'))
+
+    def test_custody_state2_ptp_bh_park_no_confirm(self):
+        # Backhaul base_port leader but ptp_bh not DRIVE -> fall through to
+        # ts2phc path (ts2_0 PARK) -> False.
+        ptp._dpll_mgr_backhaul_base_port = 'ens1f0'
+        status = {'gearshift': {'ptp_bh': 'PARK', 'ts2_0': 'PARK',
+                                'ts2_1': 'DRIVE'}}
+        with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertFalse(ptp._leader_custody_confirmed('ens1f0'))
+
+    def test_custody_state2_backhaul_base_port_unset_inert(self):
+        # Before the backhaul instance is identified (None), the ptp_bh path is
+        # inert; State-1 ts2_0 DRIVE still confirms as before (no regression).
+        ptp._dpll_mgr_backhaul_base_port = None
+        status = {'gearshift': {'ptp_bh': 'DRIVE', 'ts2_0': 'DRIVE',
+                                'ts2_1': 'DRIVE'}}
+        with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertTrue(ptp._leader_custody_confirmed('ens1f0'))
+
+    def test_custody_state1_e825_ts2_0_drive_still_confirms(self):
+        # State-1 (GNSS present): ptp_bh PARK, ts2_0 DRIVE -> ts2phc path
+        # confirms even though base_port == backhaul base_port.
+        ptp._dpll_mgr_backhaul_base_port = 'ens1f0'
+        status = {'gearshift': {'ptp_bh': 'PARK', 'ts2_0': 'DRIVE',
+                                'ts2_1': 'DRIVE'}}
+        with patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertTrue(ptp._leader_custody_confirmed('ens1f0'))
 
     # ---- full per-leader decision --------------------------------------
 
