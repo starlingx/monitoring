@@ -79,6 +79,17 @@ class TestDpllHoldoverClockClass(unittest.TestCase):
         ptp.fm_constants.FM_ALARM_SEVERITY_CLEAR = 'clear'
         ptp.fm_constants.FM_ALARM_SEVERITY_MINOR = 'minor'
         ptp.fm_constants.FM_ALARM_SEVERITY_MAJOR = 'major'
+        # Under parallel stestr sharding a sibling test module can pop and
+        # re-import the real 'cgu_handler', so check_gnss_signal /
+        # check_1pps_signal reach the real _gnss_present_on_device() ->
+        # cgu_get_current_device_state(), which unpacks to (device, pin);
+        # against an unpopulated device table that raises ValueError. These
+        # tests drive the clockClass/alarm logic via mocked get_dpll_state /
+        # get_netlink_dpll_status and do not assert on GNSS presence, so stub
+        # the helper for order-independent determinism.
+        _gnss_patcher = patch('ptp._gnss_present_on_device', return_value=True)
+        self.mock_gnss_present = _gnss_patcher.start()
+        self.addCleanup(_gnss_patcher.stop)
 
         self.holdover_time = datetime(2024, 1, 1, 10, 0, 0)
 
@@ -677,6 +688,17 @@ class TestSynceHoldoverAlarmState(unittest.TestCase):
         ptp.fm_constants.FM_ALARM_SEVERITY_CLEAR = 'clear'
         ptp.fm_constants.FM_ALARM_SEVERITY_MINOR = 'minor'
         ptp.fm_constants.FM_ALARM_SEVERITY_MAJOR = 'major'
+        # Under parallel stestr sharding a sibling test module can pop and
+        # re-import the real 'cgu_handler', so check_gnss_signal /
+        # check_1pps_signal reach the real _gnss_present_on_device() ->
+        # cgu_get_current_device_state(), which unpacks to (device, pin);
+        # against an unpopulated device table that raises ValueError. These
+        # tests drive the clockClass/alarm logic via mocked get_dpll_state /
+        # get_netlink_dpll_status and do not assert on GNSS presence, so stub
+        # the helper for order-independent determinism.
+        _gnss_patcher = patch('ptp._gnss_present_on_device', return_value=True)
+        self.mock_gnss_present = _gnss_patcher.start()
+        self.addCleanup(_gnss_patcher.stop)
 
         self.ctrl = ptp.PTP_ctrl_object(ptp.PTP_INSTANCE_TYPE_TS2PHC)
         self.ctrl.interface = 'ens0f0'
