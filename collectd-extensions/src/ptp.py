@@ -4298,7 +4298,49 @@ def _lock_derived_instance(instance, ctrl, reference_instance):
     """Lock this instance as derived, with reference_instance as its reference.
 
     Once locked, the role never changes for the ptp4l instance lifecycle.
+
+    An instance is NEVER derived-locked off the dpll-mgr backhaul. The
+    reference/derived mechanism assumes the siblings sharing a base_port are the
+    same logical clock at different domainNumbers (e.g. PTS domain 44 + FTS
+    domain 24 on one E825), so the derived copies the reference's clock quality.
+    That holds for same-source siblings — including a detached downstream PTP GM
+    that shares a NIC with its upstream PTP instance (no ts2phc): there the
+    downstream is a local GM but still rides the same shared PHC, so forwarding
+    is correct and must NOT be blocked.
+
+    It is FALSE only in the GNR-D hybrid case where the dpll-mgr backhaul T-BC
+    (ptp_bh) and an independently GNSS-disciplined fronthaul T-GM happen to share
+    a NIC base_port. There the fronthaul's time source (its own GNSS) is
+    different from the backhaul reference's (upstream PTP), so copying the
+    backhaul's clockClass (e.g. 248) onto the GNSS-locked fronthaul is wrong.
+
+    dpll-mgr config arbitrates this precisely: _dpll_mgr_backhaul_instance is the
+    ptp_bh backhaul ptp4l instance (set by read_dpll_mgr_config, which runs
+    before role resolution). If the proposed reference IS that backhaul and the
+    instance being locked is not itself the dpll-mgr backhaul, refuse — the
+    fronthaul is an independent T-GM, not a follower of the backhaul. Refusing
+    leaves its role unresolved (None) so it keeps running its own
+    check_clock_class and advertises its own GNSS clockClass (cc6).
+
+    This guard is inert off a dpll-mgr node (_dpll_mgr_backhaul_instance is None),
+    so the PTS/FTS and detached-downstream-GM cases are completely unaffected.
     """
+    # Reference IS the dpll-mgr backhaul and this sibling is NOT itself a
+    # dpll-mgr backhaul -> this is the GNR-D hybrid case: an independent GNSS
+    # T-GM being enslaved by the backhaul. Refuse. The authoritative "is this a
+    # backhaul" signal is is_managed_by_dpll_mgr, which read_dpll_mgr_config()
+    # sets only for a ptp_bh backhaul instance (never a fronthaul/ts2phc
+    # sibling). We key the sibling test on that flag rather than on
+    # instance != _dpll_mgr_backhaul_instance (a single global that holds just
+    # one backhaul name) so the guard stays correct even if a config ever
+    # defines more than one ptp_bh-managed instance.
+    if (_dpll_mgr_backhaul_instance is not None
+            and reference_instance == _dpll_mgr_backhaul_instance
+            and not ctrl.is_managed_by_dpll_mgr):
+        collectd.info(f"{PLUGIN} Instance {instance} is independent of the "
+                      f"dpll-mgr backhaul {reference_instance}; not locking as "
+                      f"derived (hybrid GNSS T-GM sharing backhaul base_port)")
+        return
     ctrl.is_derived_instance = True
     ctrl.reference_ptp4l_instance = reference_instance
     collectd.info(f"{PLUGIN} Instance {instance} locked as derived "
@@ -4373,7 +4415,11 @@ def _try_lock_reference_derived(instance, ctrl, base_port):
                 other_ctrl = ptpinstances.get(other)
                 if other_ctrl and other_ctrl.is_derived_instance is None:
                     _lock_derived_instance(other, other_ctrl, sibling)
-            return True
+            # Report whether THIS instance actually became derived.
+            # _lock_derived_instance refuses to derive-lock a local GM, so an
+            # independently GNSS-disciplined T-GM sharing this base_port stays
+            # unresolved (None) rather than derived — do not report it derived.
+            return ctrl.is_derived_instance is True
 
     # Check if I own a port listed in ts2phc config — if so, I am reference
     ts2phc_instance_name = ts2phc_instance_map.get(base_port, None)
@@ -4416,7 +4462,9 @@ def _try_lock_reference_derived(instance, ctrl, base_port):
                         other_ctrl = ptpinstances.get(other)
                         if other_ctrl and other_ctrl.is_derived_instance is None:
                             _lock_derived_instance(other, other_ctrl, sibling)
-                    return True
+                    # Report whether THIS instance actually became derived
+                    # (a local GM is refused by _lock_derived_instance).
+                    return ctrl.is_derived_instance is True
 
     # No slave port observed yet on any sibling — defer
     return False

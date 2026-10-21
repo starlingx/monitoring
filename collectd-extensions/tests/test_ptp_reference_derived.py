@@ -46,6 +46,7 @@ class TestTryLockReferenceDerived(unittest.TestCase):
 
     def setUp(self):
         """Set up two ptp4l instances sharing the same base_port."""
+        # Derived targets in these tests are legitimate same-clock followers.
         self.ctrl_a = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
         self.ctrl_a.interface = 'ens1f0'
         self.ctrl_b = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
@@ -208,6 +209,196 @@ class TestTryLockReferenceDerived(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertFalse(self.ctrl_a.is_derived_instance)
+
+
+class TestTs2phcOwnerOutranksSiblingSlave(unittest.TestCase):
+    """GNR-D hybrid (F4 / CGTS-108079) GNSS T-GM must outrank a sibling slave.
+
+    An independently GNSS-disciplined T-GM fronthaul and the dpll-mgr
+    PTP-backhaul T-BC share a NIC base_port. On SX-047 the fronthaul ptp4l
+    runs on eno8503 and the backhaul (ptp01bh, is_managed_by_dpll_mgr) on
+    eno8403, both base_port eno8703. They are DIFFERENT timing roles with
+    DIFFERENT sources (fronthaul GNSS vs backhaul upstream PTP), not one
+    shared clock, so the fronthaul must not be derived-locked off the
+    backhaul -- otherwise it forwards the backhaul's clockClass (248) while
+    itself GNSS-locked (cc6).
+
+    The guard is arbitrated by dpll-mgr config: _dpll_mgr_backhaul_instance
+    names the backhaul ptp4l instance. _lock_derived_instance refuses to
+    derive a sibling off that backhaul. This is inert on non-dpll-mgr nodes,
+    so the ordinary PTS/FTS and detached-downstream-GM cases (see
+    TestDetachedDownstreamGmStillDerived) are unaffected.
+    """
+
+    def setUp(self):
+        # Fronthaul: independent GNSS T-GM (NOT the dpll-mgr backhaul).
+        self.fh = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
+        self.fh.interface = 'eno8503'
+        self.fh.is_managed_by_dpll_mgr = False
+        self.fh.timing_instance = MagicMock()
+        self.fh.timing_instance.interfaces = {'eno8503'}
+        # Backhaul: the dpll-mgr ptp_bh instance, slaved to upstream PTP.
+        self.bh = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
+        self.bh.interface = 'eno8403'
+        self.bh.is_managed_by_dpll_mgr = True
+        self.bh.timing_instance = MagicMock()
+        self.bh.timing_instance.interfaces = {'eno8403'}
+
+        ptp.ptpinstances = {
+            'ptp4l-ptp01fh': self.fh,
+            'ptp4l-ptp01bh': self.bh,
+        }
+        ptp.base_port_to_ptp4l_instances = {
+            'eno8703': ['ptp4l-ptp01fh', 'ptp4l-ptp01bh'],
+        }
+        ptp.ptp4l_instance_map = {}
+        ptp.ts2phc_instance_map = {}
+
+        # dpll-mgr config identifies ptp01bh as the backhaul instance.
+        self._saved_bh = ptp._dpll_mgr_backhaul_instance
+        ptp._dpll_mgr_backhaul_instance = 'ptp4l-ptp01bh'
+        self.addCleanup(
+            setattr, ptp, '_dpll_mgr_backhaul_instance', self._saved_bh)
+
+    def tearDown(self):
+        ptp.ptpinstances = {}
+        ptp.base_port_to_ptp4l_instances = {}
+        ptp.ptp4l_instance_map = {}
+        ptp.ts2phc_instance_map = {}
+
+    @staticmethod
+    def _port_data(state):
+        return OrderedDict({
+            'port1': {'portState': state, **{f'k{i}': 'v' for i in range(10)}}
+        })
+
+    @patch('ptp.query_pmc_indexed')
+    def test_backhaul_slave_does_not_enslave_fronthaul(self, mock_query):
+        """Backhaul-first slave must not enslave the GNSS fronthaul.
+
+        The backhaul is resolved FIRST with a slave port: it may claim
+        reference, but it must NOT lock the GNSS fronthaul as derived (the
+        fronthaul would otherwise forward the backhaul's cc248 while
+        GNSS-locked).
+        """
+        def side_effect(instance, *args, **kwargs):
+            if instance == 'ptp4l-ptp01bh':
+                return self._port_data('SLAVE')
+            return self._port_data('MASTER')
+        mock_query.side_effect = side_effect
+
+        # This is the exact order that previously latched the fronthaul derived.
+        _try_lock_reference_derived('ptp4l-ptp01bh', self.bh, 'eno8703')
+
+        # The fronthaul must never be derived off the dpll-mgr backhaul.
+        self.assertNotEqual(self.fh.is_derived_instance, True)
+        self.assertIsNone(self.fh.reference_ptp4l_instance)
+
+    @patch('ptp.query_pmc_indexed')
+    def test_fronthaul_never_derived_either_order(self, mock_query):
+        """Fronthaul resolved first: not derived regardless of order.
+
+        Not derived regardless of a sibling backhaul slave port.
+        """
+        def side_effect(instance, *args, **kwargs):
+            if instance == 'ptp4l-ptp01bh':
+                return self._port_data('SLAVE')
+            return self._port_data('MASTER')
+        mock_query.side_effect = side_effect
+
+        result = _try_lock_reference_derived('ptp4l-ptp01fh', self.fh, 'eno8703')
+
+        self.assertFalse(result)
+        self.assertNotEqual(self.fh.is_derived_instance, True)
+        self.assertIsNone(self.fh.reference_ptp4l_instance)
+
+    def test_lock_derived_instance_refuses_backhaul_reference(self):
+        """The choke-point guard refuses a backhaul reference.
+
+        _lock_derived_instance must refuse to lock a non-backhaul sibling as
+        derived of the dpll-mgr backhaul, leaving its role unresolved so it
+        keeps running its own check_clock_class.
+        """
+        _lock_derived_instance('ptp4l-ptp01fh', self.fh, 'ptp4l-ptp01bh')
+        self.assertIsNone(self.fh.is_derived_instance)
+        self.assertIsNone(self.fh.reference_ptp4l_instance)
+
+
+class TestDetachedDownstreamGmStillDerived(unittest.TestCase):
+    """Regression guard for the ordinary (non-dpll-mgr) PTS/FTS local-GM case.
+
+    A detached downstream PTP instance sharing a NIC with its upstream PTP
+    instance (no ts2phc, no dpll-mgr) runs as a GM on its own domain, so it
+    is a local grandmaster -- yet it rides the SAME shared PHC and must still
+    be derived-locked to copy the upstream (reference) clock quality. The F4
+    fix must NOT block this: the dpll-mgr guard is inert when
+    _dpll_mgr_backhaul_instance is None.
+    """
+
+    def setUp(self):
+        # Upstream PTP (reference): follows an upstream GM via a slave port.
+        self.up = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
+        self.up.interface = 'ens1f0'
+        self.up.is_managed_by_dpll_mgr = False
+        # Downstream detached PTP (derived): a local GM on its own domain,
+        # same NIC/PHC, no ts2phc.
+        self.down = PTP_ctrl_object(PTP_INSTANCE_TYPE_PTP4L)
+        self.down.interface = 'ens1f0'
+        self.down.is_managed_by_dpll_mgr = False
+
+        ptp.ptpinstances = {
+            'ptp4l-upstream': self.up,
+            'ptp4l-downstream': self.down,
+        }
+        ptp.base_port_to_ptp4l_instances = {
+            'ens1f0': ['ptp4l-upstream', 'ptp4l-downstream'],
+        }
+        ptp.ptp4l_instance_map = {}
+        ptp.ts2phc_instance_map = {}
+        # No dpll-mgr on this node.
+        self._saved_bh = ptp._dpll_mgr_backhaul_instance
+        ptp._dpll_mgr_backhaul_instance = None
+        self.addCleanup(
+            setattr, ptp, '_dpll_mgr_backhaul_instance', self._saved_bh)
+
+    def tearDown(self):
+        ptp.ptpinstances = {}
+        ptp.base_port_to_ptp4l_instances = {}
+        ptp.ptp4l_instance_map = {}
+        ptp.ts2phc_instance_map = {}
+
+    def test_local_gm_downstream_still_locks_derived(self):
+        """Downstream local GM is still derived when no dpll-mgr backhaul.
+
+        _lock_derived_instance locks the downstream (a local GM) as derived
+        when there is no dpll-mgr backhaul -- PTS/FTS behaviour preserved.
+        """
+        _lock_derived_instance('ptp4l-downstream', self.down, 'ptp4l-upstream')
+        self.assertTrue(self.down.is_derived_instance)
+        self.assertEqual(self.down.reference_ptp4l_instance, 'ptp4l-upstream')
+
+    @patch('ptp.query_pmc_indexed')
+    def test_upstream_slave_derives_downstream_gm(self, mock_query):
+        """End-to-end via the resolver: detached local GM still derived.
+
+        Upstream has a slave port, downstream (local GM) is derived off it --
+        unchanged from pre-fix behaviour.
+        """
+        def side_effect(instance, *args, **kwargs):
+            if instance == 'ptp4l-upstream':
+                return OrderedDict({
+                    'p': {'portState': 'SLAVE',
+                          **{f'k{i}': 'v' for i in range(10)}}})
+            return OrderedDict({
+                'p': {'portState': 'MASTER',
+                      **{f'k{i}': 'v' for i in range(10)}}})
+        mock_query.side_effect = side_effect
+
+        _try_lock_reference_derived('ptp4l-upstream', self.up, 'ens1f0')
+
+        self.assertFalse(self.up.is_derived_instance)
+        self.assertTrue(self.down.is_derived_instance)
+        self.assertEqual(self.down.reference_ptp4l_instance, 'ptp4l-upstream')
 
 
 class TestTryLockThreeSiblings(unittest.TestCase):
