@@ -7,6 +7,7 @@
 import sys
 import unittest
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 # bypass 'import collectd' as it's C-based daemon, and cannot be directly imported.
 mock_collectd = sys.modules.setdefault("collectd", MagicMock())
@@ -673,3 +674,258 @@ class TestPtpMonitoring(unittest.TestCase):
         # Verify first instance was modified
         self.assertEqual(data1.satellite_count, 10)
         self.assertEqual(data1.signal_quality_db.avg, 55.0)
+
+
+class TestGpsdReadTimeout(unittest.TestCase):
+    """Verify get_gps_data_by_session cannot block indefinitely.
+
+    gps.gps() is an unbounded blocking iterator; when the receiver has no fix
+    it streams reports forever. get_gps_data_by_session() must bound the read
+    with a wall-clock deadline so it cannot stall the single collectd
+    python.ptp read thread (blowing the 30s read interval). These tests drive
+    the function with endless iterators and assert it returns.
+    """
+
+    def setUp(self):
+        mock_collectd.reset_mock()
+
+    @staticmethod
+    def _endless_no_fix_stream(device_path):
+        """Simulate a receiver with no fix.
+
+        A never-ending stream of reports that never satisfies a break
+        condition (SKY with no satellite data, for a device we are not
+        waiting on so no mode-1 TPV break fires).
+        """
+        while True:
+            yield {
+                "class": "SKY",
+                "device": device_path,
+                # No uSat / satellites keys: an empty constellation report,
+                # which never trips the "satellite_count > 0" break.
+            }
+
+    def test_endless_stream_times_out_and_returns_partial(self):
+        """An endless no-fix stream must return instead of hanging.
+
+        Once the deadline is crossed it must yield fail-safe data with
+        lock_state == 0.
+        """
+        device_path = "/dev/gnss0"
+        # Make the deadline deterministic: first monotonic() call (deadline
+        # computation) returns 0, the next (loop check) returns a value past
+        # the configured timeout so the very first iteration times out.
+        times = [0, ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1]
+
+        def fake_monotonic():
+            return times.pop(0) if times else ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1
+
+        with patch.object(ptp_monitoring.time, "monotonic", side_effect=fake_monotonic):
+            data = ptp_monitoring.get_gps_data_by_session(
+                self._endless_no_fix_stream(device_path), device_path
+            )
+
+        expected_data = ptp_monitoring.GpsData(
+            gpsd_running=1,
+            lock_state=0,
+            satellite_count=0,
+            signal_quality_db=ptp_monitoring.SignalQualityDb(min=0, max=0, avg=0),
+        )
+        self.assertEqual(
+            data,
+            expected_data,
+            msg=f"actual {data} not equal to expected {expected_data} ",
+        )
+        # The timeout path must log a warning naming the device.
+        self.assertTrue(mock_collectd.warning.called)
+        warn_arg = mock_collectd.warning.call_args.args[0]
+        self.assertIn(device_path, warn_arg)
+        self.assertIn("timed out", warn_arg)
+
+    def test_endless_stream_without_mocked_clock_still_returns(self):
+        """Belt-and-suspenders check under the real monotonic clock.
+
+        With the real clock, an endless stream must still return within a
+        small multiple of the timeout (proves the loop actually terminates,
+        not just under a mocked clock).
+        """
+        device_path = "/dev/gnss0"
+        import time as _time
+
+        start = _time.monotonic()
+        data = ptp_monitoring.get_gps_data_by_session(
+            self._endless_no_fix_stream(device_path), device_path
+        )
+        elapsed = _time.monotonic() - start
+
+        self.assertEqual(data.lock_state, 0)
+        # Must finish shortly after the deadline, never hang.
+        self.assertLess(
+            elapsed,
+            ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 5,
+            msg=f"read did not terminate promptly (elapsed {elapsed:.2f}s)",
+        )
+
+    def test_short_valid_stream_does_not_trip_timeout(self):
+        """A normal short stream must not trip the timeout.
+
+        A stream that reaches a valid fix must return the real data and must
+        NOT emit a timeout warning (no regression / no spurious warnings on
+        the healthy path).
+        """
+        device_path = "/dev/gnss0"
+        session = [
+            {"class": "TPV", "device": "/dev/gnss0", "mode": 3},
+            {
+                "class": "SKY",
+                "device": "/dev/gnss0",
+                "uSat": 1,
+                "satellites": [
+                    {
+                        "PRN": 5,
+                        "el": 31.0,
+                        "az": 86.0,
+                        "ss": 45.0,
+                        "used": True,
+                        "gnssid": 0,
+                        "svid": 5,
+                        "health": 1,
+                    },
+                ],
+            },
+        ]
+        data = ptp_monitoring.get_gps_data_by_session(session, device_path)
+        self.assertEqual(data.lock_state, 1)
+        self.assertEqual(data.satellite_count, 1)
+        self.assertFalse(
+            mock_collectd.warning.called,
+            msg="healthy short read should not log a timeout warning",
+        )
+
+
+class _FakeSession:
+    """Minimal stand-in for gps.gps() for _bounded_session tests.
+
+    waiting() returns the next value from a scripted list (then False
+    forever); read() returns the next status (then 0) and exposes the
+    next scripted report as .data, mimicking gps.gps().read().
+    """
+
+    def __init__(self, waiting_values=None, reports=None, read_statuses=None):
+        self._waiting = list(waiting_values or [])
+        self._reports = list(reports or [])
+        self._statuses = list(read_statuses or [])
+        self.data = None
+        self.waiting_calls = 0
+        self.read_calls = 0
+
+    def waiting(self, timeout=0):
+        self.waiting_calls += 1
+        return self._waiting.pop(0) if self._waiting else False
+
+    def read(self):
+        self.read_calls += 1
+        status = self._statuses.pop(0) if self._statuses else 0
+        self.data = self._reports.pop(0) if self._reports else None
+        return status
+
+
+class TestBoundedSession(unittest.TestCase):
+    """Tests for _bounded_session().
+
+    _bounded_session() must never block past the deadline, regardless of
+    whether gpsd is quiet, disconnects, or streams normally.
+    """
+
+    def setUp(self):
+        mock_collectd.reset_mock()
+
+    def test_quiet_socket_terminates_at_deadline(self):
+        """A quiet socket must terminate the generator at the deadline.
+
+        If waiting() never reports data (quiet gpsd / no fix), the generator
+        must stop at the deadline instead of blocking forever -- the exact
+        live-lab hang this fix targets.
+        """
+        session = _FakeSession(waiting_values=[])  # always False
+        times = iter([0.0, 0.1, 0.2] + [ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1] * 50)
+
+        def fake_monotonic():
+            try:
+                return next(times)
+            except StopIteration:
+                return ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1
+
+        with patch.object(ptp_monitoring.time, "monotonic", side_effect=fake_monotonic):
+            reports = list(
+                ptp_monitoring._bounded_session(
+                    session, timeout_seconds=5, poll_step_seconds=0.01
+                )
+            )
+        self.assertEqual(reports, [])
+        # read() must never have been called -- there was never data ready.
+        self.assertEqual(session.read_calls, 0)
+
+    def test_disconnect_stops_generator(self):
+        """A negative read() status (gpsd disconnect) stops iteration."""
+        session = _FakeSession(
+            waiting_values=[True, True],
+            reports=[{"class": "TPV"}, None],
+            read_statuses=[0, -1],
+        )
+        with patch.object(ptp_monitoring.time, "monotonic", side_effect=lambda: 0.1):
+            reports = list(
+                ptp_monitoring._bounded_session(
+                    session, timeout_seconds=5, poll_step_seconds=0.01
+                )
+            )
+        # First (status 0, has data) is yielded; second (status -1) stops it.
+        self.assertEqual(reports, [{"class": "TPV"}])
+
+    def test_normal_reports_are_yielded(self):
+        """Reports that arrive before the deadline are yielded in order."""
+        session = _FakeSession(
+            waiting_values=[True, True],
+            reports=[{"class": "TPV", "mode": 3}, {"class": "SKY", "uSat": 4}],
+            read_statuses=[0, 0],
+        )
+        # Advancing clock: 0 seeds the deadline, the next two reads land before
+        # it, then jump past the deadline so the loop exits once the two
+        # scripted reports are consumed (a constant mock would spin forever
+        # since waiting() returns False after its scripted values).
+        times = iter([0.0, 0.1, 0.2] + [ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1] * 50)
+
+        def fake_monotonic():
+            try:
+                return next(times)
+            except StopIteration:
+                return ptp_monitoring.GPSD_READ_TIMEOUT_SECONDS + 1
+
+        with patch.object(ptp_monitoring.time, "monotonic", side_effect=fake_monotonic):
+            reports = list(
+                ptp_monitoring._bounded_session(
+                    session, timeout_seconds=5, poll_step_seconds=0.01
+                )
+            )
+        self.assertEqual(
+            reports,
+            [{"class": "TPV", "mode": 3}, {"class": "SKY", "uSat": 4}],
+        )
+
+    def test_end_to_end_no_fix_does_not_hang(self):
+        """Real monotonic clock plus a quiet session must return promptly.
+
+        Proves the deadline actually fires, not just under a mock.
+        """
+        import time as _time
+
+        session = _FakeSession(waiting_values=[])  # always False
+        start = _time.monotonic()
+        reports = list(
+            ptp_monitoring._bounded_session(
+                session, timeout_seconds=1, poll_step_seconds=0.01
+            )
+        )
+        elapsed = _time.monotonic() - start
+        self.assertEqual(reports, [])
+        self.assertLess(elapsed, 5, msg=f"generator did not terminate promptly ({elapsed:.2f}s)")
