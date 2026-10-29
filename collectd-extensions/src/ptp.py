@@ -319,11 +319,45 @@ CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
 # Operator toggle (collectd monitoring-section param on the dpll-mgr instance),
 # default enabled.
 CLOCKCLASS_PASSTHROUGH_PARAM = 'clockclass_passthrough'
+# Operator toggle (monitoring-section param on the dpll-mgr instance) for the
+# extended-clockClass relay of G.8275.1 Table 2 NOTE 3. Default ENABLED: WRCP
+# GNR-D hybrid timing domains are WRCP-managed end to end, so relaying the
+# selected parent's degraded class is the spec-correct out-of-box behaviour.
+# The toggle is the opt-out for a mixed domain containing third-party clocks
+# that do not implement the extended-clockClass option.
+CLOCKCLASS_EXTENDED_RELAY_PARAM = 'clockclass_extended_relay'
 # clockClass values that represent a genuinely locked/traceable upstream GM
 # worth forwarding. Anything else (holdover/free-run/slave-only, i.e. >= 128
 # per G.8275.1) means the backhaul is not a usable time source to pass through.
 CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
     str(c) for c in range(6, 128))
+# Extended out-of-holdover-spec classes a T-BC MAY relay per G.8275.1 Table 2
+# NOTE 3 ("the clockClass range of a T-BC can be extended ... to 135, 140,
+# 150, 160, 165, 248"). We relay the T-GM out-of-spec classes (140/150/160)
+# and the T-BC out-of-spec class (165) from a still-SLAVE+gmPresent backhaul;
+# these are forwarded ONLY when the operator toggle is enabled. 248 (free-run)
+# and 255 (slave-only) are never relayed -- a lost parent falls back to the
+# local T-BC holdover ladder instead. 135 (T-BC in-holdover, WITHIN spec) is
+# deliberately NOT in this set: it is an in-spec class the local holdover
+# ladder owns, not an extended out-of-spec class the relay opts into.
+CLOCKCLASS_EXTENDED_FORWARDABLE = frozenset(('140', '150', '160', '165'))
+# G.8275.1 Table 2 traceability flags, keyed by the forwarded clockClass. Per
+# Table 2 NOTE 3 a T-BC reflects the selected parent's traceability flags
+# downstream; the flags are a deterministic function of the advertised class.
+# Locked/traceable classes (6..127) are time- and frequency-traceable. The
+# out-of-holdover-spec extended classes are time-NON-traceable (PRTC time
+# traceability is lost -- that is what makes them out-of-spec), and differ only
+# in frequencyTraceable: 140 keeps a Category-1 frequency reference (TRUE),
+# 150/160 do not (FALSE). For 165 (Table 2 Note 2, frequency-source dependent)
+# a backhaul-sourced T-BC has no independent PRC physical-layer frequency input
+# to assert, so frequencyTraceable is FALSE (the conservative, safe value). A
+# missing key defaults to the locked (6..127) TRUE/TRUE case.
+CLOCKCLASS_EXTENDED_TRACEABILITY = {
+    '140': {'timeTraceable': False, 'frequencyTraceable': True},
+    '150': {'timeTraceable': False, 'frequencyTraceable': False},
+    '160': {'timeTraceable': False, 'frequencyTraceable': False},
+    '165': {'timeTraceable': False, 'frequencyTraceable': False},
+}
 # dpll-mgr gearshift value that proves a ts2phc instance holds DRIVE custody.
 GEARSHIFT_DRIVE = 'DRIVE'
 
@@ -483,6 +517,11 @@ class PTP_ctrl_object:
         self.ptp4l_prc_state = None
         self.ptp4l_ptp_source_state = None
         self.ptp4l_time_source = None
+        # the backhaul GM dataset triple relayed THIS poll by
+        # check_clock_class() (cc6/extended passthrough), or None. Reset every
+        # poll at the top of the dispatch block; consumed by
+        # handle_ptp4l_g8275_fields() to compose the two GM-dataset writers.
+        self.ptp4l_relayed_triple = None
         self.ptp4l_utc_offset_nanoseconds = 37 * NANOSECONDS_IN_A_SECOND
         self.ptp4l_announce_settings = {}
 
@@ -2447,8 +2486,22 @@ def handle_ptp4l_g8275_fields(instance):
     if 'gm.ClockClass' in parent_data_set.keys():
         ctrl.ptp4l_clock_class = parent_data_set['gm.ClockClass']
 
-    if ctrl.ptp4l_prc_state in [CLOCK_STATE_LOCKED,
-                                CLOCK_STATE_LOCKED_HO_ACQ]:
+    # Two-writer composition: if check_clock_class() relayed a
+    # backhaul GM dataset this poll (cc6/extended passthrough), it already wrote
+    # the self-consistent {clockClass, clockAccuracy, offsetScaledLogVariance}
+    # triple. Do NOT overwrite accuracy/OSLV from the local prc_state bucket
+    # here -- that is what produced the malformed pair (relayed cc6/140 beside a
+    # local 0xfe/0xffff). Keep the relayed values; only timeSource tracks the
+    # relayed-GM semantics.
+    relayed_triple = ctrl.ptp4l_relayed_triple
+    if relayed_triple is not None:
+        ctrl.ptp4l_announce_settings['clockAccuracy'] = \
+            relayed_triple['clockAccuracy']
+        ctrl.ptp4l_announce_settings['offsetScaledLogVariance'] = \
+            relayed_triple['offsetScaledLogVariance']
+        ctrl.ptp4l_announce_settings['timeSource'] = ctrl.ptp4l_time_source
+    elif ctrl.ptp4l_prc_state in [CLOCK_STATE_LOCKED,
+                                  CLOCK_STATE_LOCKED_HO_ACQ]:
         # PRC is locked
         # Use the values configured by initialize_ptp4l_state_fields()
         ctrl.ptp4l_announce_settings['clockAccuracy'] = ctrl.ptp4l_clock_accuracy
@@ -3844,21 +3897,42 @@ def _cc6_passthrough_enabled():
     return str(value).strip().lower() not in ('disabled', '0', 'false', 'no')
 
 
-def _backhaul_forwardable_clock_class():
-    """Return the backhaul GM clockClass to forward, or None.
+def _clockclass_extended_relay_enabled():
+    """Return True if the extended-clockClass relay is enabled (default on).
 
-    The backhaul is "really locked" (worth forwarding) when the dpll-mgr
-    managed instance's port tracks a GM (UNCALIBRATED/SLAVE), a GM is present,
-    and the upstream clockClass is a locked/traceable value (not holdover/
-    free-run/slave-only). This mirrors the 1007484 backhaul-health signal and
-    the 1009526 "backhaul really locked" authority. Returns the clockClass
-    string on success, else None (fail-safe to local holdover).
+    Per G.8275.1 Table 2 NOTE 3 the extended range (140/150/160/165) relay is
+    an OPTION; this toggle is the operator opt-out. Monitoring-section param on
+    the dpll-mgr instance; absence of the key means default-on.
+    """
+    ctrl = ptpinstances.get(_dpll_mgr_instance_name) if _dpll_mgr_instance_name \
+        else None
+    if ctrl is None:
+        return True
+    value = ctrl.monitoring_parameters.get(
+        CLOCKCLASS_EXTENDED_RELAY_PARAM, 'enabled')
+    return str(value).strip().lower() not in ('disabled', '0', 'false', 'no')
+
+
+def _backhaul_forwardable_clock_class():
+    """Return the backhaul GM dataset triple to forward, or None.
+
+    Returns a dict {clockClass, clockAccuracy, offsetScaledLogVariance} read
+    from the SAME backhaul PARENT_DATA_SET so the advertised fronthaul dataset
+    is self-consistent (G.8275.1 Table V.2 -- a relayed
+    clockClass must never be paired with a local-bucket 0xfe/0xffff). Returns
+    None (fail-safe to the local holdover ladder) when the backhaul is not a
+    usable time source to pass through.
+
+    Forwarding decision (G.8275.1 Table 2 NOTE 3 -- a locked T-BC reflects its
+    current parent's dataset downstream):
+      - the backhaul leader's port is SLAVE/UNCALIBRATED (gmPresent), and
+      - the received clockClass is either locked/traceable (6..127) OR, when
+        the operator extended-relay toggle is enabled, an out-of-spec class the
+        T-BC may optionally relay (140/150/160/165). 248/255 are never relayed.
 
     Queries the backhaul PTP4L instance (_dpll_mgr_backhaul_instance, the one
-    flagged is_managed_by_dpll_mgr, e.g. 'ptp01bh') for PARENT_DATA_SET /
-    PORT_DATA_SET. NOT the dpll-mgr/clock instance, which has no ptp4l UDS and
-    would make every pmc query empty -> forwardable always None -> passthrough
-    never fires.
+    flagged is_managed_by_dpll_mgr, e.g. 'ptp01bh'), NOT the dpll-mgr/clock
+    instance which has no ptp4l UDS.
     """
     if not _dpll_mgr_backhaul_instance:
         return None
@@ -3869,7 +3943,13 @@ def _backhaul_forwardable_clock_class():
     if gm_clock_class is None:
         return None
     gm_clock_class = str(gm_clock_class)
-    if gm_clock_class not in CLOCKCLASS_LOCKED_FORWARDABLE:
+
+    forwardable = gm_clock_class in CLOCKCLASS_LOCKED_FORWARDABLE
+    if (not forwardable
+            and gm_clock_class in CLOCKCLASS_EXTENDED_FORWARDABLE
+            and _clockclass_extended_relay_enabled()):
+        forwardable = True
+    if not forwardable:
         return None
 
     port_data_set = query_pmc_indexed(
@@ -3881,7 +3961,19 @@ def _backhaul_forwardable_clock_class():
     if not port_healthy:
         return None
 
-    return gm_clock_class
+    # Forward the FULL dataset triple from the same PARENT_DATA_SET so the
+    # advertised fronthaul GM dataset is self-consistent. Fall back to the
+    # G.8275.1 PRTC defaults only when a field is absent (older ptp4l), never
+    # to the local freerun bucket.
+    fwd_accuracy = str(parent_data_set.get(
+        'gm.ClockAccuracy', G8275_CLOCK_ACCURACY_PRTC))
+    fwd_oslv = str(parent_data_set.get(
+        'gm.OffsetScaledLogVariance', G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC))
+    return {
+        'clockClass': gm_clock_class,
+        'clockAccuracy': fwd_accuracy,
+        'offsetScaledLogVariance': fwd_oslv,
+    }
 
 
 def _ts2phc_is_dpll_mgr_channel(base_port):
@@ -4000,18 +4092,26 @@ def _leader_custody_confirmed(base_port):
     return gear == GEARSHIFT_DRIVE
 
 
-def _cc6_passthrough_class(ctrl, base_port):
-    """Return the forwarded cc6 clockClass for this leader, or None.
+def _cc6_passthrough_class(ctrl, base_port, local_gnss_locked=False):
+    """Return the forwarded backhaul GM dataset triple for this leader, or None.
 
     Applies the full per-leader passthrough decision:
-    toggle enabled AND a dpll-mgr host AND backhaul really locked AND this
-    leader's custody confirmed DRIVE. Returns the backhaul GM clockClass string
-    to advertise, or None to fall back to local behaviour.
+    toggle enabled AND a dpll-mgr host AND this leader is NOT itself a locally
+    GNSS/ts2phc-locked T-GM AND backhaul really locked AND this leader's
+    custody confirmed DRIVE. Returns the backhaul GM dataset dict
+    {clockClass, clockAccuracy, offsetScaledLogVariance} to advertise, or None
+    to fall back to local behaviour.
+
+    The local-GNSS-lock gate is the precedence rule (recovery /
+    latch fix): a leader that has reacquired its own PRTC is a T-GM in its own
+    right and MUST advertise its local class (cc6), never a stale relayed
+    backhaul class. The relay applies only while the DUT is actually
+    backhaul-sourced.
 
     Each gate that fails logs at debug level which gate declined, so a field
     "why isn't passthrough firing?" question is answerable from /var/log
-    without re-instrumenting the plugin (the pain that earlier debugging
-    hit). Debug level keeps steady-state logs quiet.
+    without re-instrumenting the plugin. Debug level keeps steady-state logs
+    quiet.
     """
     instance = ctrl.instance_name if hasattr(ctrl, 'instance_name') else '?'
     if not _cc6_passthrough_enabled():
@@ -4020,6 +4120,11 @@ def _cc6_passthrough_class(ctrl, base_port):
         return None
     if not _dpll_mgr_instance_name:
         collectd.debug("%s %s cc6 passthrough declined: not a dpll-mgr host"
+                       % (PLUGIN, instance))
+        return None
+    if local_gnss_locked:
+        collectd.debug("%s %s cc6 passthrough declined: leader is locally "
+                       "GNSS/PRTC-locked (local class wins)"
                        % (PLUGIN, instance))
         return None
     forwardable = _backhaul_forwardable_clock_class()
@@ -4222,23 +4327,49 @@ def check_clock_class(instance):
     else:
         new_clock_class = CLOCK_CLASS_248
 
-    # cc6 passthrough: when the node is locked to the PTP backhaul
+    # cc6 / extended passthrough: when the node is locked to the PTP backhaul
     # and this leader's PHC is provably DRIVE-disciplined to it, advertise the
-    # upstream GM's clockClass instead of the local holdover ladder computed
-    # above. Gated per-leader (toggle + backhaul-really-locked + DRIVE custody);
-    # fail-safe returns None and leaves the local decision untouched.
-    forwarded_clock_class = _cc6_passthrough_class(ctrl, base_port)
-    if forwarded_clock_class is not None:
+    # upstream GM's dataset (clockClass + clockAccuracy + offsetScaledLogVariance)
+    # instead of the local holdover ladder computed above (G.8275.1 Table 2
+    # NOTE 3). Gated per-leader (toggle + not-locally-GNSS-locked + backhaul-
+    # really-locked + DRIVE custody); fail-safe returns None and leaves the
+    # local decision untouched.
+    local_gnss_locked = bool(
+        is_ts2phc_running
+        and state in [CLOCK_STATE_LOCKED, CLOCK_STATE_LOCKED_HO_ACQ])
+    forwarded = _cc6_passthrough_class(ctrl, base_port,
+                                       local_gnss_locked=local_gnss_locked)
+    # Record what (if anything) we are relaying THIS poll so the subsequent
+    # handle_ptp4l_g8275_fields() writer composes with this decision instead of
+    # clobbering the relayed accuracy/OSLV from its local prc_state bucket
+    # (two-writer / malformed-pair fix). Reset every poll.
+    ctrl.ptp4l_relayed_triple = forwarded
+    if forwarded is not None:
+        forwarded_clock_class = forwarded['clockClass']
         if forwarded_clock_class != new_clock_class:
             collectd.info(
-                "%s %s cc6 passthrough: advertising backhaul clockClass %s "
-                "(local would be %s)"
-                % (PLUGIN, instance, forwarded_clock_class, new_clock_class))
+                "%s %s cc6 passthrough: advertising backhaul GM dataset "
+                "clockClass=%s clockAccuracy=%s offsetScaledLogVariance=%s "
+                "(local clockClass would be %s)"
+                % (PLUGIN, instance, forwarded_clock_class,
+                   forwarded['clockAccuracy'],
+                   forwarded['offsetScaledLogVariance'], new_clock_class))
         new_clock_class = forwarded_clock_class
-        # A forwarded locked upstream GM is time- and frequency-traceable with
-        # a valid UTC offset, consistent with a cc6 upstream.
-        time_traceable = True
-        frequency_traceable = True
+        data['clockAccuracy'] = forwarded['clockAccuracy']
+        data['offsetScaledLogVariance'] = forwarded['offsetScaledLogVariance']
+        # Traceability flags follow G.8275.1 Table 2 for the forwarded class
+        # (Table 2 NOTE 3: a T-BC reflects the parent's traceability). A locked
+        # class (6..127) is time/frequency-traceable; the extended out-of-spec
+        # classes are time-NON-traceable (PRTC time traceability lost) with
+        # frequencyTraceable per Table 2 (140 TRUE, 150/160/165 FALSE). This
+        # matches the local holdover ladder, which already sets timeTraceable
+        # FALSE at cc140. currentUtcOffsetValid stays valid: the parent is
+        # still present (SLAVE+gmPresent), so the UTC offset remains known.
+        traceability = CLOCKCLASS_EXTENDED_TRACEABILITY.get(
+            forwarded_clock_class,
+            {'timeTraceable': True, 'frequencyTraceable': True})
+        time_traceable = traceability['timeTraceable']
+        frequency_traceable = traceability['frequencyTraceable']
         current_utc_offset_valid = True
 
     if current_clock_class != new_clock_class and (
@@ -5431,6 +5562,11 @@ def read_func():
         base_port = get_base_port(ctrl.interface)
         if get_ts2phc_source(base_port) and \
            ctrl.instance_type == PTP_INSTANCE_TYPE_PTP4L:
+            # Reset the per-poll relayed-triple record before routing so a
+            # leader that does NOT go through check_clock_class this poll (e.g.
+            # a T-BC relay via process_ptp_bc) cannot have handle_ptp4l_g8275_
+            # fields() read a stale relayed triple from a previous poll.
+            ctrl.ptp4l_relayed_triple = None
             # Removed redundant call to check_time_drift()
             # Handled in check_ptp_regular() above
             # Manage PTP clock class only for configured follower PHC clocks
