@@ -82,6 +82,16 @@ def _make_status(lock_status='locked', current_master='GNSS_REF4P',
         'ptp_port_state': kwargs.get('ptp_port_state', 'MASTER'),
         'connected_pin': kwargs.get('connected_pin', current_master),
         'ever_locked': ever_locked,
+        # Per-engine pin map: each pin carries independent EEC (DPLL0/frequency)
+        # and PPS (DPLL1/phase) state + priority. Default models a GNSS-primary
+        # DUT (GNSS connected on both engines, SDP0 the PPS-only standby, DNU on
+        # EEC). Override via kwargs['pins'].
+        'pins': kwargs.get('pins', {
+            'GNSS_REF4P': {'eec': {'state': 'connected', 'priority': 0},
+                           'pps': {'state': 'connected', 'priority': 0}},
+            'SDP0_REF0N': {'eec': {'state': 'disconnected', 'priority': 15},
+                           'pps': {'state': 'selectable', 'priority': 12}},
+        }),
     }
     return data
 
@@ -522,6 +532,42 @@ class TestCheckDpllMgrState(unittest.TestCase):
             ptp._check_dpll_mgr_state()
 
         mock_raise.assert_not_called()
+
+    @patch('ptp.is_service_running', return_value=True)
+    @patch('ptp.clear_alarm', return_value=True)
+    def test_logs_whole_status_dict(self, mock_clear, mock_running):
+        """The whole status dict is logged in one line (incl. per-engine pins).
+
+        Logging the dict as-is is self-maintaining: any field dpll-mgr adds, and
+        the per-engine (eec/pps) pins map, appear in the log without field-by-
+        field formatting. Assert the single status line carries the key fields
+        and the nested pins structure.
+        """
+        status = _make_status(lock_status='locked', pins={
+            'SDP0_REF0N': {'eec': {'state': 'disconnected', 'priority': 15},
+                           'pps': {'state': 'connected', 'priority': 0}},
+        })
+        ptp._dpll_mgr_status._cache = status
+        ptp._dpll_mgr_status._mtime = 1
+
+        with patch('ptp.DPLL_MGR_STATUS_FILE', '/tmp/fake'), \
+             patch('os.path.getmtime', return_value=1), \
+             patch('ptp.collectd') as mock_collectd:
+            ptp._check_dpll_mgr_state()
+
+        status_lines = [
+            call.args[0]
+            for call in mock_collectd.info.call_args_list
+            if call.args and 'status:' in call.args[0]
+        ]
+        self.assertEqual(len(status_lines), 1)
+        line = status_lines[0]
+        # Top-level fields and the nested per-engine pins are all present.
+        self.assertIn("'dpll_lock_status': 'locked'", line)
+        self.assertIn("'current_master': 'GNSS_REF4P'", line)
+        self.assertIn("'SDP0_REF0N'", line)
+        self.assertIn("'eec'", line)
+        self.assertIn("'pps'", line)
 
 
 if __name__ == '__main__':

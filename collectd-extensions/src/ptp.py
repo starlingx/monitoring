@@ -5161,39 +5161,8 @@ def _check_dpll_mgr_state():
     is_running = is_service_running(dpll_mgr_service)
     collectd.info("%s PTP service %s admin state:enabled running:%s"
                   % (PLUGIN, dpll_mgr_service, is_running))
-    collectd.info("%s dpll-mgr %s lock_status=%s current_master=%s "
-                  "previous_master=%s"
-                  % (PLUGIN, dpll_mgr_instance, lock,
-                     status.get('current_master', '?'),
-                     status.get('previous_master', '?')))
-    collectd.info("%s dpll-mgr %s in_holdover=%s holdover_level=%s "
-                  "holdover_duration_s=%s"
-                  % (PLUGIN, dpll_mgr_instance,
-                     status.get('in_holdover', '?'),
-                     status.get('holdover_level', '?'),
-                     status.get('holdover_duration_s', '?')))
-    collectd.info("%s dpll-mgr %s gearshift ptp_bh=%s ts2_0=%s ts2_1=%s"
-                  % (PLUGIN, dpll_mgr_instance,
-                     status.get('gearshift', {}).get('ptp_bh', '-'),
-                     status.get('gearshift', {}).get('ts2_0', '-'),
-                     status.get('gearshift', {}).get('ts2_1', '-')))
-    collectd.info("%s dpll-mgr %s phase_offset_ns=%s drift_rate_ns_per_s=%s"
-                  % (PLUGIN, dpll_mgr_instance,
-                     status.get('phase_offset_ns', '?'),
-                     status.get('drift_rate_ns_per_s', '?')))
-    collectd.info("%s dpll-mgr %s ptp_port_state=%s connected_pin=%s "
-                  "ever_locked=%s operation_mode=%s"
-                  % (PLUGIN, dpll_mgr_instance,
-                     status.get('ptp_port_state', '?'),
-                     status.get('connected_pin', '?'),
-                     ever_locked,
-                     status.get('operation_mode', '?')))
-    pins = status.get('pins', {})
-    for pin_name, pin_info in pins.items():
-        collectd.info("%s dpll-mgr %s pin %s state=%s priority=%s"
-                      % (PLUGIN, dpll_mgr_instance, pin_name,
-                         pin_info.get('state', '?'),
-                         pin_info.get('priority', '?')))
+    collectd.info("%s dpll-mgr %s status: %s"
+                  % (PLUGIN, dpll_mgr_instance, status))
 
     if lock == 'holdover':
         ho_obj = ctrl.holdover_alarm_object
