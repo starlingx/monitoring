@@ -31,6 +31,7 @@
 ############################################################################
 import os
 import json
+import datetime
 from collections import OrderedDict
 import socket
 import collectd
@@ -310,7 +311,9 @@ CLOCK_CLASS_6 = '6'      # T-GM connected to PRTC in locked mode
 CLOCK_CLASS_7 = '7'      # T-GM in holdover, within holdover specification
 CLOCK_CLASS_135 = '135'  # T-BC in holdover, within holdover specification
 CLOCK_CLASS_165 = '165'  # T-BC in holdover, out of holdover specification
-CLOCK_CLASS_140 = '140'  # T-GM in holdover, out of holdover specification
+CLOCK_CLASS_140 = '140'  # T-GM in holdover, out of spec, Category 1 frequency
+CLOCK_CLASS_150 = '150'  # T-GM in holdover, out of spec, Category 2 frequency
+CLOCK_CLASS_160 = '160'  # T-GM in holdover, out of spec, Category 3 frequency
 CLOCK_CLASS_248 = '248'  # T-GM in free-run mode
 
 # cc6 passthrough (GNR-D State-2): when the node is a locked
@@ -4035,6 +4038,117 @@ def _cc6_passthrough_class(ctrl, base_port):
     return forwardable
 
 
+def _backhaul_holdover_clock_class(ctrl, base_port, ho_timer_interface):
+    """Return the local T-BC holdover clockClass on genuine backhaul loss, or None.
+
+    This is the fail-over companion to _cc6_passthrough_class(). The passthrough
+    relays the upstream backhaul GM's clockClass while the backhaul is really
+    locked (SLAVE + gmPresent). When the backhaul is genuinely LOST, the
+    passthrough declines (returns None); without this helper the leader falls
+    through to free-run clockClass 248 even though the DPLL is actively holding
+    over on its oscillator -- a G.8275.1 non-conformance (a T-BC that was locked
+    to a usable parent must advertise the holdover ladder 135 -> 165, not 248).
+
+    This returns the T-BC holdover class ONLY when all of the following hold,
+    which together uniquely identify a backhaul-sourced leader whose backhaul
+    parent is lost while the node is genuinely holding over:
+
+      * this is a dpll-mgr host, and
+      * this leader's PHC is DRIVE-disciplined from the backhaul
+        (_leader_custody_confirmed -- true in State-2 via gearshift ptp_bh=DRIVE,
+        and it stays DRIVE through a DPLL holdover), and
+      * the backhaul is no longer really locked
+        (_backhaul_forwardable_clock_class() is None), and
+      * dpll-mgr reports in_holdover AND ever_locked -- i.e. the DPLL is
+        actively holding over having previously been locked (not a cold-start
+        free-run, and not a genuinely-unlocked node).
+
+    A GNSS-sourced T-GM leader never satisfies the custody gate, so this path is
+    disjoint from the GNSS/ts2phc free-run -> 248 behaviour.
+
+    dpll-mgr's in_holdover/ever_locked are used ONLY as the gate (DPLL state).
+    The within-spec 135 -> out-of-spec 165 transition is timed by collectd's own
+    holdover_timestamp against holdover_seconds -- the same control-plane
+    mechanism as the existing local ladders. dpll-mgr's holdover_duration_s is
+    the gearshift-tier timer and is deliberately NOT used for the clockClass
+    budget.
+
+    Per G.8275.1 Appendix VII the landing value is gated on the pre-loss parent
+    class: a parent that was within-spec (6/7/135) permits 135 first; a parent
+    already out-of-spec (140/150/160/165) goes straight to 165.
+    ctrl.ptp4l_clock_class holds the last class this leader advertised (the
+    relayed parent class while the passthrough was active).
+
+    Returns a (clock_class, time_traceable, frequency_traceable) tuple, or None
+    to leave the caller's local decision untouched (fail-safe).
+    """
+    if not _dpll_mgr_instance_name:
+        return None
+    if not _leader_custody_confirmed(base_port):
+        return None
+    if _backhaul_forwardable_clock_class() is not None:
+        # Backhaul still really locked -- not a loss; passthrough handles it.
+        return None
+
+    status = _dpll_mgr_status.read()
+    if not status:
+        return None
+    if not status.get('in_holdover') or not status.get('ever_locked'):
+        # Not holding over (genuine free-run), or never locked (cold start):
+        # fall through to the caller's existing free-run decision (248).
+        return None
+
+    instance = ctrl.instance_name if hasattr(ctrl, 'instance_name') else '?'
+
+    # Pre-loss parent class (last advertised while relaying). If it was already
+    # out-of-spec, G.8275.1 App. VII requires going straight to 165.
+    pre_loss_class = str(getattr(ctrl, 'ptp4l_clock_class', CLOCK_CLASS_248))
+    parent_was_out_of_spec = pre_loss_class in (
+        CLOCK_CLASS_140, CLOCK_CLASS_150, CLOCK_CLASS_160, CLOCK_CLASS_165)
+
+    # collectd owns the within-spec clock: seed our own holdover timestamp,
+    # then age it against holdover_seconds. Anchor t0 to the ACTUAL DPLL
+    # holdover entry rather than the first collectd poll that observes it:
+    # dpll-mgr publishes holdover_duration_s (seconds elapsed in holdover), so
+    # back-date the seed by that amount. This removes the detection lag
+    # (collectd poll cadence + relay-cache latency) that otherwise pushed the
+    # 135->165 boundary later than the configured holdover_seconds window.
+    # Fall back to "now" if the field is missing/unusable (older dpll-mgr).
+    if (ho_timer_interface not in ctrl.holdover_timestamp
+            or not ctrl.holdover_timestamp[ho_timer_interface]):
+        seed = timeutils.utcnow()
+        try:
+            elapsed = float(status.get('holdover_duration_s', 0))
+            if elapsed > 0:
+                seed = seed - datetime.timedelta(seconds=elapsed)
+        except (TypeError, ValueError):
+            elapsed = 0
+        ctrl.holdover_timestamp[ho_timer_interface] = seed
+        collectd.info(
+            "%s %s backhaul-loss T-BC holdover: seeding holdover timestamp "
+            "%s (PHC %s, back-dated %ss from dpll-mgr holdover entry)"
+            % (PLUGIN, instance, ctrl.holdover_timestamp[ho_timer_interface],
+               ho_timer_interface, elapsed))
+
+    delta = timeutils.delta_seconds(
+        ctrl.holdover_timestamp[ho_timer_interface], timeutils.utcnow())
+    within_spec = (
+        not parent_was_out_of_spec
+        and delta <= ctrl.monitoring_parameters['holdover_seconds'])
+
+    if within_spec:
+        # T-BC in holdover, within holdover specification (G.8275.1 Table 2).
+        # frequencyTraceable per Table 2 NOTE 2: a SyncE-disciplined holdover
+        # stays traceable to a Category-1 physical-layer source; a plain
+        # oscillator holdover does not.
+        freq_traceable = _is_synce_only_frequency_holdover(base_port)
+        return (CLOCK_CLASS_135, True, freq_traceable)
+
+    # T-BC in holdover, out of holdover specification (G.8275.1 Table 2):
+    # clockClass 165, timeTraceable FALSE.
+    return (CLOCK_CLASS_165, False, False)
+
+
 def check_clock_class(instance):
     collectd.debug(f"{PLUGIN} check_clock_class {instance}")
     ctrl = ptpinstances[instance]
@@ -4240,6 +4354,30 @@ def check_clock_class(instance):
         time_traceable = True
         frequency_traceable = True
         current_utc_offset_valid = True
+        # Backhaul is really locked again: clear any T-BC holdover timestamp
+        # seeded by a prior backhaul loss, so the next loss restarts the
+        # 135 -> 165 ladder from within-spec instead of a stale elapsed time.
+        ctrl.holdover_timestamp[ho_timer_interface] = None
+    else:
+        # Passthrough declined. If it declined because the backhaul parent was
+        # genuinely LOST while this backhaul-sourced leader's DPLL is holding
+        # over, advertise the T-BC holdover ladder (135 -> 165) rather than the
+        # free-run 248 the local ladder above would otherwise leave. Returns
+        # None for every other decline reason (toggle off, not a dpll-mgr host,
+        # no custody, genuine free-run), leaving new_clock_class untouched.
+        backhaul_holdover = _backhaul_holdover_clock_class(
+            ctrl, base_port, ho_timer_interface)
+        if backhaul_holdover is not None:
+            bh_class, bh_time_traceable, bh_freq_traceable = backhaul_holdover
+            if bh_class != new_clock_class:
+                collectd.info(
+                    "%s %s backhaul lost, DPLL holdover: advertising T-BC "
+                    "holdover clockClass %s (local would be %s)"
+                    % (PLUGIN, instance, bh_class, new_clock_class))
+            new_clock_class = bh_class
+            time_traceable = bh_time_traceable
+            frequency_traceable = bh_freq_traceable
+            current_utc_offset_valid = False
 
     if current_clock_class != new_clock_class and (
         not is_ts2phc_running or state != CLOCK_STATE_INVALID
