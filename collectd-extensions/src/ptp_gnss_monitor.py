@@ -14,12 +14,35 @@ import configparser
 from dataclasses import dataclass
 from dataclasses import field
 import gps
+import time
 import traceback
 
 # name of the plugin - all logs produced by this plugin are prefixed with this
 PLUGIN = "ptp plugin"
 
 GPSD_TCP_PORT = "2947"
+
+# Upper bound, in seconds, on how long a single gpsd read is allowed to run.
+# gps.gps() is an unbounded blocking iterator: when the receiver has no fix it
+# keeps streaming TPV/SKY reports indefinitely, and -- worse -- its __next__()
+# blocks inside a socket read with no deadline of its own, so if gpsd goes
+# quiet mid-read the iterator never returns. Because this read runs inside the
+# single collectd python.ptp read thread, an unbounded read stalls the whole
+# plugin for minutes, blowing the 30s read interval and starving every other
+# PTP instance's state/clockClass refresh. get_gps_data() wraps the live
+# session in _bounded_session(), which uses gps.waiting()/read() so the socket
+# is only ever waited on in GPSD_READ_POLL_STEP_SECONDS slices and the deadline
+# is honoured even when no report arrives. get_gps_data_by_session() keeps an
+# independent deadline guard at the top of its loop as a defence in depth (and
+# so the bound is exercised by the unit tests, which drive it with plain
+# iterables). A read that times out returns what it has gathered so far
+# (fail-safe: lock_state stays 0), to be retried on the next poll.
+GPSD_READ_TIMEOUT_SECONDS = 5
+
+# Granularity of the socket wait inside _bounded_session(). Small enough that
+# the effective overshoot past GPSD_READ_TIMEOUT_SECONDS is sub-second, large
+# enough to avoid a busy spin.
+GPSD_READ_POLL_STEP_SECONDS = 0.5
 
 
 @dataclass
@@ -122,7 +145,19 @@ def get_gps_data_by_session(session, device_path):
         # - SKY report won't follow TPV, when GPS receiver is not functional.
         tpv_report_scanned = False
         sky_report_scanned = False
+        # Bound the read so a receiver with no fix (which streams reports
+        # endlessly) or a device for which no matching report ever arrives
+        # cannot block this loop indefinitely. gps.gps() has no deadline of its
+        # own, so we enforce one here with a monotonic clock.
+        deadline = time.monotonic() + GPSD_READ_TIMEOUT_SECONDS
         for report in session:
+            if time.monotonic() >= deadline:
+                message = (
+                    f"{PLUGIN} {device_path} gpsd read timed out after "
+                    f"{GPSD_READ_TIMEOUT_SECONDS}s; returning partial data: {data}"
+                )
+                collectd.warning(message)
+                break
             if report["class"] in ["VERSION", "WATCH", "DEVICE"]:
                 continue
             elif report["class"] == "DEVICES" and device_path not in get_device_paths(
@@ -199,6 +234,38 @@ def get_gps_data_by_session(session, device_path):
     return data
 
 
+def _bounded_session(session, timeout_seconds=GPSD_READ_TIMEOUT_SECONDS,
+                     poll_step_seconds=GPSD_READ_POLL_STEP_SECONDS):
+    """Yield gpsd reports from a live gps.gps() session under a hard deadline.
+
+    The stock gps.gps() iterator calls read(), which blocks inside a socket
+    read with no timeout; if gpsd stops sending (e.g. a receiver with no fix),
+    __next__() never returns and the caller hangs. This generator instead polls
+    the socket with waiting(), which is a select() with a timeout, so control
+    returns at least every poll_step_seconds and the monotonic deadline is
+    always enforced. It stops once the deadline passes, on disconnect
+    (read() < 0), or on a read error, letting the consumer return whatever it
+    has gathered so far.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        # waiting() is select()-based; returns False if no data arrived within
+        # the slice, in which case we loop and re-check the deadline.
+        if not session.waiting(poll_step_seconds):
+            continue
+        try:
+            status = session.read()
+        except Exception as exc:
+            collectd.error(f"{PLUGIN} gpsd read() failed: {type(exc)}:{exc}")
+            return
+        if status is not None and status < 0:
+            # Negative status == error/disconnect from gpsd.
+            return
+        report = getattr(session, "data", None)
+        if report:
+            yield report
+
+
 def get_gps_data(device_path):
     # Whenever there is client connection, only then gpsd polls
     # on serial devices, otherwise it won't keep looking for sensor
@@ -229,7 +296,10 @@ def get_gps_data(device_path):
         devpath=device_path,
     )
 
-    data = get_gps_data_by_session(session, device_path)
+    # Iterate the session through _bounded_session() rather than directly, so a
+    # quiet or endlessly-streaming gpsd (no-fix receiver) cannot block this read
+    # -- and therefore the whole python.ptp plugin -- past the deadline.
+    data = get_gps_data_by_session(_bounded_session(session), device_path)
 
     session.close()
     return data
