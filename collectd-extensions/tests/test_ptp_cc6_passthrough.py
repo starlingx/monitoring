@@ -77,8 +77,11 @@ class TestCc6PassthroughDecision(unittest.TestCase):
             '/var/run/ts2phc1': 'ts2_1',
         }
         ptp.CLOCKCLASS_PASSTHROUGH_PARAM = 'clockclass_passthrough'
+        ptp.CLOCKCLASS_EXTENDED_RELAY_PARAM = 'clockclass_extended_relay'
         ptp.CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
             str(c) for c in range(6, 128))
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = frozenset(
+            ('140', '150', '160', '165'))
         ptp.GEARSHIFT_DRIVE = 'DRIVE'
 
         # dpll-mgr instance ctrl with default (enabled) toggle
@@ -130,10 +133,15 @@ class TestCc6PassthroughDecision(unittest.TestCase):
     # ---- backhaul forwardable class ------------------------------------
 
     def test_backhaul_forwardable_cc6_locked(self):
-        with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}), \
+        pds = {'gm.ClockClass': '6', 'gm.ClockAccuracy': '0x20',
+               'gm.OffsetScaledLogVariance': '0x4e5d'}
+        with patch('ptp.query_pmc', return_value=pds), \
              patch('ptp.query_pmc_indexed',
                    return_value={'0': {'portState': 'SLAVE'}}):
-            self.assertEqual(ptp._backhaul_forwardable_clock_class(), '6')
+            self.assertEqual(
+                ptp._backhaul_forwardable_clock_class(),
+                {'clockClass': '6', 'clockAccuracy': '0x20',
+                 'offsetScaledLogVariance': '0x4e5d'})
 
     def test_backhaul_forwardable_none_when_backhaul_instance_unset(self):
         # regression: if the backhaul ptp4l instance was never identified
@@ -156,9 +164,10 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}) as qp, \
              patch('ptp.query_pmc_indexed',
                    return_value={'0': {'portState': 'SLAVE'}}):
-            self.assertEqual(ptp._backhaul_forwardable_clock_class(), '6')
+            result = ptp._backhaul_forwardable_clock_class()
+            self.assertEqual(result['clockClass'], '6')
             # first positional arg of query_pmc must be the backhaul instance
-            assert qp.call_args[0][0] == 'ptp01bh', qp.call_args
+            self.assertEqual(qp.call_args[0][0], 'ptp01bh')
 
     def test_backhaul_not_forwardable_holdover_class(self):
         # clockClass 135 (holdover) is not forwardable
@@ -174,8 +183,47 @@ class TestCc6PassthroughDecision(unittest.TestCase):
                    return_value={'0': {'portState': 'LISTENING'}}):
             self.assertIsNone(ptp._backhaul_forwardable_clock_class())
 
-    def test_backhaul_no_parent_data(self):
-        with patch('ptp.query_pmc', return_value={}), \
+    def test_backhaul_no_parent_clock_class_first_gate(self):
+        # No gm.ClockClass in PARENT_DATA_SET -> returns None at the FIRST gate,
+        # before the port-health check is ever reached. query_pmc_indexed is
+        # deliberately NOT patched here: if the function regressed to reach the
+        # port query with no parent class, the unpatched real query_pmc_indexed
+        # would surface it rather than a mock masking the gate order.
+        with patch('ptp.query_pmc', return_value={}):
+            self.assertIsNone(ptp._backhaul_forwardable_clock_class())
+
+    def test_backhaul_forwardable_uncalibrated_accepted(self):
+        # port UNCALIBRATED (gmPresent, syncing) is a healthy engaged port and
+        # must be accepted exactly like SLAVE (regression guard: dropping
+        # UNCALIBRATED from the accepted set would fail here).
+        pds = {'gm.ClockClass': '6', 'gm.ClockAccuracy': '0x20',
+               'gm.OffsetScaledLogVariance': '0x4e5d'}
+        with patch('ptp.query_pmc', return_value=pds), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'UNCALIBRATED'}}):
+            self.assertEqual(
+                ptp._backhaul_forwardable_clock_class(),
+                {'clockClass': '6', 'clockAccuracy': '0x20',
+                 'offsetScaledLogVariance': '0x4e5d'})
+
+    def test_backhaul_forwardable_any_port_slave_multi_port(self):
+        # Multi-port backhaul: one port LISTENING, another SLAVE. port_healthy is
+        # an any() over all indexed ports, so this must forward (regression
+        # guard: any()->all() would fail here).
+        pds = {'gm.ClockClass': '6', 'gm.ClockAccuracy': '0x20',
+               'gm.OffsetScaledLogVariance': '0x4e5d'}
+        with patch('ptp.query_pmc', return_value=pds), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'LISTENING'},
+                                 '1': {'portState': 'SLAVE'}}):
+            self.assertEqual(
+                ptp._backhaul_forwardable_clock_class()['clockClass'], '6')
+
+    def test_backhaul_not_forwardable_port_data_empty(self):
+        # cc6 is forwardable, but PORT_DATA_SET is empty (no ports reported) ->
+        # port_healthy any() over {} is False -> None. This is the TRUE
+        # port-empty path (distinct from the first-gate no-parent-class case).
+        with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}), \
              patch('ptp.query_pmc_indexed', return_value={}):
             self.assertIsNone(ptp._backhaul_forwardable_clock_class())
 
@@ -279,15 +327,20 @@ class TestCc6PassthroughDecision(unittest.TestCase):
         p1, p2, p3 = self._patch_full(
             '6', 'SLAVE', {'gearshift': {'ts2_0': 'DRIVE', 'ts2_1': 'DRIVE'}})
         with p1, p2, p3:
-            self.assertEqual(
-                ptp._cc6_passthrough_class(Mock(), 'ens1f0'), '6')
+            result = ptp._cc6_passthrough_class(Mock(), 'ens1f0')
+            # full triple: cc6 with the composed PRTC defaults (never 0xfe/0xffff)
+            self.assertEqual(result, {
+                'clockClass': '6',
+                'clockAccuracy': ptp.G8275_CLOCK_ACCURACY_PRTC,
+                'offsetScaledLogVariance':
+                    ptp.G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC})
 
     def test_tc2_e830_backhaul_cc6_ts2_1_drive_forwards(self):
         p1, p2, p3 = self._patch_full(
             '6', 'SLAVE', {'gearshift': {'ts2_0': 'DRIVE', 'ts2_1': 'DRIVE'}})
         with p1, p2, p3:
-            self.assertEqual(
-                ptp._cc6_passthrough_class(Mock(), 'ens2f0'), '6')
+            result = ptp._cc6_passthrough_class(Mock(), 'ens2f0')
+            self.assertEqual(result['clockClass'], '6')
 
     def test_tc3_e830_ts2_1_absent_no_forward(self):
         p1, p2, p3 = self._patch_full(
@@ -542,6 +595,565 @@ class TestIsPrtcTraceableLeader(unittest.TestCase):
         self.assertFalse(ptp.is_prtc_traceable_leader('enp108s0f0'))
         # NMEA stays True regardless -- legacy behaviour preserved.
         self.assertTrue(ptp.is_prtc_traceable_leader('eno8703'))
+
+
+class TestExtendedClockClassRelay(unittest.TestCase):
+    """Full GM-dataset triple relay + extended out-of-spec classes.
+
+    Covers Issue 3 (forward clockAccuracy/OSLV together with clockClass so the
+    advertised dataset is never malformed) and Issue 5 (relay the extended
+    out-of-spec classes 140/150/160/165 while SLAVE+gmPresent, behind the
+    default-on clockclass_extended_relay toggle; never relay 248/255; a locally
+    GNSS-locked leader yields to its local class).
+    """
+
+    def setUp(self):
+        self._saved = {
+            'name': ptp._dpll_mgr_instance_name,
+            'bh_inst': getattr(ptp, '_dpll_mgr_backhaul_instance', None),
+            'instances': dict(getattr(ptp, 'ptpinstances', {})),
+            'locked': ptp.CLOCKCLASS_LOCKED_FORWARDABLE,
+            'ext': getattr(ptp, 'CLOCKCLASS_EXTENDED_FORWARDABLE', None),
+        }
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
+            str(c) for c in range(6, 128))
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = frozenset(
+            ('140', '150', '160', '165'))
+        self.dpll_ctrl = Mock()
+        self.dpll_ctrl.monitoring_parameters = {}
+        ptp.ptpinstances = {'ptp01bh': self.dpll_ctrl}
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved['name']
+        ptp._dpll_mgr_backhaul_instance = self._saved['bh_inst']
+        ptp.ptpinstances = self._saved['instances']
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = self._saved['locked']
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = self._saved['ext']
+
+    def _parent(self, cc, acc='0x20', oslv='0x4e5d'):
+        return {'gm.ClockClass': cc, 'gm.ClockAccuracy': acc,
+                'gm.OffsetScaledLogVariance': oslv}
+
+    # ---- Issue 3: full triple forwarded, never malformed ----------------
+
+    def test_issue3_triple_forwarded_from_parent(self):
+        """cc6 forwards the backhaul's OWN accuracy/OSLV, not local defaults."""
+        with patch('ptp.query_pmc',
+                   return_value=self._parent('6', '0x21', '0x4b32')), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            result = ptp._backhaul_forwardable_clock_class()
+        self.assertEqual(result, {'clockClass': '6', 'clockAccuracy': '0x21',
+                                  'offsetScaledLogVariance': '0x4b32'})
+
+    def test_issue3_triple_never_malformed_defaults_when_absent(self):
+        """Parent-omitted accuracy/OSLV falls back to PRTC defaults, never 0xfe/0xffff."""
+        with patch('ptp.query_pmc', return_value={'gm.ClockClass': '6'}), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            result = ptp._backhaul_forwardable_clock_class()
+        self.assertEqual(result['clockAccuracy'],
+                         ptp.G8275_CLOCK_ACCURACY_PRTC)
+        self.assertEqual(result['offsetScaledLogVariance'],
+                         ptp.G8275_OFFSET_SCALED_LOG_VARIANCE_PRTC)
+        self.assertNotEqual(result['clockAccuracy'], '0xfe')
+
+    # ---- Issue 5: extended relay (toggle default-on) --------------------
+
+    def test_issue5_relay_140_when_enabled(self):
+        for cc in ('140', '150', '160', '165'):
+            with patch('ptp.query_pmc',
+                       return_value=self._parent(cc, '0x29')), \
+                 patch('ptp.query_pmc_indexed',
+                       return_value={'0': {'portState': 'SLAVE'}}):
+                result = ptp._backhaul_forwardable_clock_class()
+            self.assertIsNotNone(result, "cc%s should relay when enabled" % cc)
+            self.assertEqual(result['clockClass'], cc)
+
+    def test_issue5_extended_default_on(self):
+        """Absence of the toggle key means extended relay is ON by default."""
+        self.assertTrue(ptp._clockclass_extended_relay_enabled())
+
+    def test_issue5_extended_toggle_off_opts_out(self):
+        """clockclass_extended_relay=disabled blocks 140 but still relays cc6."""
+        self.dpll_ctrl.monitoring_parameters = {
+            'clockclass_extended_relay': 'disabled'}
+        self.assertFalse(ptp._clockclass_extended_relay_enabled())
+        with patch('ptp.query_pmc', return_value=self._parent('140', '0x29')), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            self.assertIsNone(ptp._backhaul_forwardable_clock_class())
+        with patch('ptp.query_pmc', return_value=self._parent('6')), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}):
+            self.assertEqual(
+                ptp._backhaul_forwardable_clock_class()['clockClass'], '6')
+
+    def test_issue5_freerun_248_never_relayed(self):
+        for cc in ('248', '255'):
+            with patch('ptp.query_pmc', return_value=self._parent(cc, '0xfe')), \
+                 patch('ptp.query_pmc_indexed',
+                       return_value={'0': {'portState': 'SLAVE'}}):
+                self.assertIsNone(
+                    ptp._backhaul_forwardable_clock_class(),
+                    "cc%s must never be relayed" % cc)
+
+    def test_issue5_extended_not_relayed_if_port_lost(self):
+        """Even with extended-on, cc140 is not relayed if the backhaul port is lost."""
+        with patch('ptp.query_pmc', return_value=self._parent('140', '0x29')), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'LISTENING'}}):
+            self.assertIsNone(ptp._backhaul_forwardable_clock_class())
+
+    # ---- yield-to-local-GNSS precedence (latch fix) ---------------------
+
+    def test_yield_to_local_gnss_declines_forward(self):
+        """A locally GNSS/PRTC-locked leader must not relay (latch fix)."""
+        with patch('ptp._backhaul_forwardable_clock_class',
+                   return_value={'clockClass': '140', 'clockAccuracy': '0x29',
+                                 'offsetScaledLogVariance': '0x4e5d'}), \
+             patch('ptp._leader_custody_confirmed', return_value=True):
+            # locked locally -> decline
+            self.assertIsNone(
+                ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                           local_gnss_locked=True))
+            # not locked locally -> relay
+            result = ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                                local_gnss_locked=False)
+            self.assertEqual(result['clockClass'], '140')
+
+
+class TestGnssPrimaryBackhaulDegradeNoLeak(unittest.TestCase):
+    """A degrading backhaul secondary must not leak into the fronthaul dataset.
+
+    When this leader has its own PRTC lock as the active source (GNSS primary),
+    the PARKed/standby backhaul's received class -- whatever it has walked to
+    (6, 7, or an extended 140) -- must NOT propagate into the fronthaul GM
+    dataset. The fronthaul advertises the leader's own local class. This is the
+    inverse of the backhaul-sourced relay: relay fires ONLY while the DUT is
+    actually backhaul-sourced. (dpll-mgr Oct-21 known-issue, Vz-2.)
+    """
+
+    def setUp(self):
+        self._saved_name = ptp._dpll_mgr_instance_name
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved_name
+
+    def test_local_prtc_lock_declines_relay_whatever_backhaul_carries(self):
+        # Across the whole walk a degraded backhaul can show, a locally-locked
+        # leader must decline the relay every time (no leak of 6/7/140).
+        for backhaul_cc in ('6', '7', '140'):
+            forwardable = {'clockClass': backhaul_cc, 'clockAccuracy': '0x29',
+                           'offsetScaledLogVariance': '0x4e5d'}
+            with patch('ptp._backhaul_forwardable_clock_class',
+                       return_value=forwardable), \
+                 patch('ptp._leader_custody_confirmed', return_value=True):
+                self.assertIsNone(
+                    ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                               local_gnss_locked=True),
+                    "locally-locked leader leaked backhaul cc%s" % backhaul_cc)
+
+    def test_no_leak_is_independent_of_custody_and_toggle(self):
+        # The local-lock gate precedes custody and backhaul evaluation, so even
+        # with custody confirmed and a forwardable backhaul the answer is None.
+        with patch('ptp._backhaul_forwardable_clock_class') as fwd, \
+             patch('ptp._leader_custody_confirmed', return_value=True):
+            fwd.return_value = {'clockClass': '140', 'clockAccuracy': '0x29',
+                                'offsetScaledLogVariance': '0x4e5d'}
+            self.assertIsNone(
+                ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                           local_gnss_locked=True))
+
+    def test_both_fronthaul_leaders_decline_identically_under_local_lock(self):
+        # Vz-2 has two fronthaul leaders; under a local PRTC lock BOTH must
+        # decline, so neither can leak and they cannot disagree.
+        forwardable = {'clockClass': '7', 'clockAccuracy': '0x29',
+                       'offsetScaledLogVariance': '0x4e5d'}
+        with patch('ptp._backhaul_forwardable_clock_class',
+                   return_value=forwardable), \
+             patch('ptp._leader_custody_confirmed', return_value=True):
+            r1 = ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                            local_gnss_locked=True)
+            r2 = ptp._cc6_passthrough_class(Mock(), 'ens2f0',
+                                            local_gnss_locked=True)
+        self.assertIsNone(r1)
+        self.assertIsNone(r2)
+        self.assertEqual(r1, r2)
+
+
+class TestFronthaulInstancesDeriveConsistently(unittest.TestCase):
+    """Both fronthaul leaders derive from the SAME backhaul source.
+
+    The observed divergence defect was two fronthaul ptp4ls advertising
+    different classes from one backhaul source (E825->140, E830->248). Both
+    leaders route through the same _backhaul_forwardable_clock_class() result,
+    so for identical gating inputs they cannot diverge, and when the backhaul
+    is not forwardable they BOTH fall back identically (None -> local ladder).
+    The advertised dataset is never a malformed locked-class + 0xfe/0xffff pair.
+    (dpll-mgr Oct-21 known-issue, backhaul-only upstream loss.)
+    """
+
+    def setUp(self):
+        self._saved = {
+            'name': ptp._dpll_mgr_instance_name,
+            'bh_inst': getattr(ptp, '_dpll_mgr_backhaul_instance', None),
+            'instances': dict(getattr(ptp, 'ptpinstances', {})),
+            'locked': ptp.CLOCKCLASS_LOCKED_FORWARDABLE,
+            'ext': getattr(ptp, 'CLOCKCLASS_EXTENDED_FORWARDABLE', None),
+        }
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
+            str(c) for c in range(6, 128))
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = frozenset(
+            ('140', '150', '160', '165'))
+        dpll_ctrl = Mock()
+        dpll_ctrl.monitoring_parameters = {}
+        ptp.ptpinstances = {'ptp01bh': dpll_ctrl}
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved['name']
+        ptp._dpll_mgr_backhaul_instance = self._saved['bh_inst']
+        ptp.ptpinstances = self._saved['instances']
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = self._saved['locked']
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = self._saved['ext']
+
+    def test_identical_source_yields_identical_result_both_leaders(self):
+        forwardable = {'clockClass': '140', 'clockAccuracy': '0x29',
+                       'offsetScaledLogVariance': '0x4e5d'}
+        with patch('ptp._backhaul_forwardable_clock_class',
+                   return_value=forwardable), \
+             patch('ptp._leader_custody_confirmed', return_value=True):
+            r1 = ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                            local_gnss_locked=False)
+            r2 = ptp._cc6_passthrough_class(Mock(), 'ens2f0',
+                                            local_gnss_locked=False)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r1['clockClass'], '140')
+
+    def test_backhaul_not_forwardable_both_leaders_fall_back_identically(self):
+        # Upstream gone -> forwardable None -> both leaders decline the relay
+        # identically (no E825->140 / E830->248 split; both -> local ladder).
+        with patch('ptp._backhaul_forwardable_clock_class',
+                   return_value=None), \
+             patch('ptp._leader_custody_confirmed', return_value=True):
+            r1 = ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                            local_gnss_locked=False)
+            r2 = ptp._cc6_passthrough_class(Mock(), 'ens2f0',
+                                            local_gnss_locked=False)
+        self.assertIsNone(r1)
+        self.assertIsNone(r2)
+        self.assertEqual(r1, r2)
+
+    def test_relayed_triple_is_never_malformed_pair(self):
+        # Whatever class is relayed, it carries the backhaul's real accuracy/OSLV
+        # (not the 0xfe/0xffff local-bucket defaults) -- the malformed-pair
+        # signature must never appear on a forwarded locked/extended class.
+        for cc in ('6', '7', '140', '165'):
+            with patch('ptp.query_pmc',
+                       return_value={'gm.ClockClass': cc,
+                                     'gm.ClockAccuracy': '0x29',
+                                     'gm.OffsetScaledLogVariance': '0x4e5d'}), \
+                 patch('ptp.query_pmc_indexed',
+                       return_value={'0': {'portState': 'SLAVE'}}):
+                result = ptp._backhaul_forwardable_clock_class()
+            self.assertIsNotNone(result)
+            self.assertNotEqual(result['clockAccuracy'], '0xfe')
+            self.assertNotEqual(result['offsetScaledLogVariance'], '0xffff')
+
+
+class TestG8275ApplySiteHonoursRelayedTriple(unittest.TestCase):
+    """handle_ptp4l_g8275_fields composes with the relayed GM triple.
+
+    When check_clock_class() relayed a backhaul GM dataset this poll it set
+    ctrl.ptp4l_relayed_triple. The subsequent g8275 writer must emit that
+    triple's clockAccuracy/offsetScaledLogVariance and must NOT fall through to
+    the local prc_state bucket (0xfe/0xffff) -- the two-writer composition that
+    the malformed-pair defect violated. Oracle is the dict actually handed to
+    write_ptp4l_gm_fields (the real emit), not an intermediate.
+    (apply-site; the branch where the shipped bug lived.)
+    """
+
+    def setUp(self):
+        self._saved_instances = dict(getattr(ptp, 'ptpinstances', {}))
+
+    def tearDown(self):
+        ptp.ptpinstances = self._saved_instances
+
+    def _mk_g8275_ctrl(self, relayed_triple, prc_state,
+                       local_accuracy='0x20', local_oslv='0x4e5d'):
+        """A ctrl that reaches the relayed-triple branch then exits cleanly.
+
+        disciplined_by_ts2phc=True skips the T-BC override block; prtc_present
+        =False skips the leap-second block; so execution runs the accuracy/OSLV
+        composition and falls through to the final emit.
+        """
+        ctrl = Mock()
+        ctrl.ptp4l_relayed_triple = relayed_triple
+        ctrl.ptp4l_prc_state = prc_state
+        ctrl.ptp4l_prtc_type = 'prtc_a'
+        ctrl.ptp4l_announce_settings = {}
+        ctrl.ptp4l_clock_accuracy = local_accuracy
+        ctrl.ptp4l_offset_scaled_log_variance = local_oslv
+        ctrl.ptp4l_time_source = '0x20'
+        ctrl.ptp4l_clock_identity = 'aaaa.bbbb.cccc'
+        ctrl.ptp4l_grandmaster_identity = 'aaaa.bbbb.cccc'  # == clk id: no GM-change log
+        ctrl.ptp4l_clock_class = '6'
+        ctrl.disciplined_by_ts2phc = True   # skip the T-BC override block
+        ctrl.prtc_present = False            # skip the leap-second block
+        config = MagicMock()
+        config.has_section.return_value = True
+        config.__getitem__.return_value = {'dataset_comparison': 'G.8275.x'}
+        config.__contains__.return_value = True
+        ctrl.timing_instance = Mock()
+        ctrl.timing_instance.config = config
+        return ctrl
+
+    def _pmc_side_effect(self, parent_class='6'):
+        """Return a query_pmc side_effect keyed by dataset name."""
+        def _se(instance, dataset, query_action='GET'):
+            if dataset == 'GRANDMASTER_SETTINGS_NP':
+                return {'clockClass': '6', 'clockAccuracy': '0x20',
+                        'offsetScaledLogVariance': '0x4e5d'}
+            if dataset == 'TIME_PROPERTIES_DATA_SET':
+                return {'timeTraceable': 1, 'frequencyTraceable': 1}
+            if dataset == 'PARENT_DATA_SET':
+                return {'grandmasterIdentity': 'aaaa.bbbb.cccc',
+                        'gm.ClockClass': parent_class}
+            if dataset == 'DEFAULT_DATA_SET':
+                return {'numberPorts': '1', 'clockIdentity': 'aaaa.bbbb.cccc'}
+            return {}
+        return _se
+
+    def _run_and_capture_emit(self, ctrl, parent_class='6'):
+        """Run the writer; return the dict handed to write_ptp4l_gm_fields."""
+        ptp.ptpinstances = {'ptp01fh': ctrl}
+        captured = {}
+
+        def _capture(instance, gm_fields_dict):
+            captured.update(gm_fields_dict)
+        with patch('ptp.query_pmc',
+                   side_effect=self._pmc_side_effect(parent_class)), \
+             patch('ptp.write_ptp4l_gm_fields', side_effect=_capture):
+            ptp.handle_ptp4l_g8275_fields('ptp01fh')
+        return captured
+
+    def test_relayed_triple_sets_accuracy_oslv(self):
+        triple = {'clockClass': '140', 'clockAccuracy': '0x29',
+                  'offsetScaledLogVariance': '0x4b32'}
+        ctrl = self._mk_g8275_ctrl(triple, ptp.CLOCK_STATE_LOCKED)
+        emit = self._run_and_capture_emit(ctrl, parent_class='140')
+        self.assertEqual(emit['clockAccuracy'], '0x29')
+        self.assertEqual(emit['offsetScaledLogVariance'], '0x4b32')
+
+    def test_relayed_triple_overrides_locked_bucket(self):
+        # prc_state LOCKED AND triple set: the relayed values win the if/elif,
+        # NOT the local ctrl.ptp4l_clock_accuracy bucket.
+        triple = {'clockClass': '140', 'clockAccuracy': '0x29',
+                  'offsetScaledLogVariance': '0x4b32'}
+        ctrl = self._mk_g8275_ctrl(triple, ptp.CLOCK_STATE_LOCKED,
+                                   local_accuracy='0x20', local_oslv='0x4e5d')
+        emit = self._run_and_capture_emit(ctrl, parent_class='140')
+        self.assertNotEqual(emit['clockAccuracy'], '0x20')  # not the local bucket
+        self.assertEqual(emit['clockAccuracy'], '0x29')
+
+    def test_no_relayed_triple_uses_local_bucket(self):
+        # No triple + prc LOCKED: falls through to the local bucket (no regression
+        # to the legacy non-passthrough path).
+        ctrl = self._mk_g8275_ctrl(None, ptp.CLOCK_STATE_LOCKED,
+                                   local_accuracy='0x20', local_oslv='0x4e5d')
+        emit = self._run_and_capture_emit(ctrl, parent_class='6')
+        self.assertEqual(emit['clockAccuracy'], '0x20')
+        self.assertEqual(emit['offsetScaledLogVariance'], '0x4e5d')
+
+    def test_relayed_triple_never_emits_malformed_pair(self):
+        # A relayed locked/extended class must never be emitted beside the
+        # 0xfe/0xffff local-freerun bucket (the malformed-pair signature).
+        triple = {'clockClass': '140', 'clockAccuracy': '0x29',
+                  'offsetScaledLogVariance': '0x4b32'}
+        ctrl = self._mk_g8275_ctrl(triple, ptp.CLOCK_STATE_LOCKED)
+        emit = self._run_and_capture_emit(ctrl, parent_class='140')
+        self.assertNotEqual(emit['clockAccuracy'], '0xfe')
+        self.assertNotEqual(emit['offsetScaledLogVariance'], '0xffff')
+
+
+class TestPassthroughComposesEndToEnd(unittest.TestCase):
+    """_cc6_passthrough_class composed with its REAL collaborators.
+
+    Every other decision test mocks _backhaul_forwardable_clock_class and
+    _leader_custody_confirmed, so none proves the real wiring: a field-name
+    drift between what the forwardable helper returns and what the decision
+    passes through would pass those tests but break in the field. Here ONLY the
+    I/O boundary (query_pmc / query_pmc_indexed / _dpll_mgr_status.read) is
+    mocked; the three helpers run for real. (integration guard.)
+    """
+
+    def setUp(self):
+        self._saved = {
+            'name': ptp._dpll_mgr_instance_name,
+            'chan': dict(ptp._dpll_mgr_ts2phc_channel_by_uds),
+            'instances': dict(getattr(ptp, 'ptpinstances', {})),
+            'ts2map': dict(getattr(ptp, 'ts2phc_instance_map', {})),
+            'bh_base': getattr(ptp, '_dpll_mgr_backhaul_base_port', None),
+            'bh_inst': getattr(ptp, '_dpll_mgr_backhaul_instance', None),
+            'locked': ptp.CLOCKCLASS_LOCKED_FORWARDABLE,
+            'ext': getattr(ptp, 'CLOCKCLASS_EXTENDED_FORWARDABLE', None),
+        }
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_base_port = None
+        ptp._dpll_mgr_ts2phc_channel_by_uds = {
+            '/var/run/ts2phc0': 'ts2_0',
+            '/var/run/ts2phc1': 'ts2_1',
+        }
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = frozenset(
+            str(c) for c in range(6, 128))
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = frozenset(
+            ('140', '150', '160', '165'))
+        dpll_ctrl = Mock()
+        dpll_ctrl.monitoring_parameters = {}
+        ptp.ptpinstances = {
+            'ptp01bh': dpll_ctrl,
+            'ts2phc-0': _mk_ts2phc_ctrl('/var/run/ts2phc0'),
+            'ts2phc-1': _mk_ts2phc_ctrl('/var/run/ts2phc1'),
+        }
+        ptp.ts2phc_instance_map = {'ens1f0': 'ts2phc-0', 'ens2f0': 'ts2phc-1'}
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved['name']
+        ptp._dpll_mgr_ts2phc_channel_by_uds = self._saved['chan']
+        ptp.ptpinstances = self._saved['instances']
+        ptp.ts2phc_instance_map = self._saved['ts2map']
+        ptp._dpll_mgr_backhaul_base_port = self._saved['bh_base']
+        ptp._dpll_mgr_backhaul_instance = self._saved['bh_inst']
+        ptp.CLOCKCLASS_LOCKED_FORWARDABLE = self._saved['locked']
+        ptp.CLOCKCLASS_EXTENDED_FORWARDABLE = self._saved['ext']
+
+    def test_backhaul_sourced_leader_passes_full_triple_through(self):
+        # Real stack: forwardable reads parentDS triple, custody confirms DRIVE,
+        # decision passes the SAME triple through. Asserts the FULL dict, so a
+        # key-name drift in the forwardable return would fail here (the isolated
+        # tests, which mock the helper, would not).
+        parent = {'gm.ClockClass': '140', 'gm.ClockAccuracy': '0x29',
+                  'gm.OffsetScaledLogVariance': '0x4b32'}
+        status = {'gearshift': {'ts2_0': 'DRIVE', 'ts2_1': 'DRIVE'}}
+        with patch('ptp.query_pmc', return_value=parent), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}), \
+             patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            result = ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                                local_gnss_locked=False)
+        self.assertEqual(result, {'clockClass': '140', 'clockAccuracy': '0x29',
+                                  'offsetScaledLogVariance': '0x4b32'})
+
+    def test_local_gnss_lock_declines_through_real_stack(self):
+        # Same real stack, but the leader is locally PRTC-locked -> decline,
+        # even though forwardable+custody would both succeed.
+        parent = {'gm.ClockClass': '140', 'gm.ClockAccuracy': '0x29',
+                  'gm.OffsetScaledLogVariance': '0x4b32'}
+        status = {'gearshift': {'ts2_0': 'DRIVE', 'ts2_1': 'DRIVE'}}
+        with patch('ptp.query_pmc', return_value=parent), \
+             patch('ptp.query_pmc_indexed',
+                   return_value={'0': {'portState': 'SLAVE'}}), \
+             patch.object(ptp._dpll_mgr_status, 'read', return_value=status):
+            self.assertIsNone(
+                ptp._cc6_passthrough_class(Mock(), 'ens1f0',
+                                           local_gnss_locked=True))
+
+
+class TestForwardableSetBoundaries(unittest.TestCase):
+    """Boundaries of the PRODUCTION forwardable sets (off-by-one guards).
+
+    Deliberately does NOT override CLOCKCLASS_LOCKED_FORWARDABLE /
+    CLOCKCLASS_EXTENDED_FORWARDABLE in setUp -- it exercises whatever ptp.py
+    defines, so an off-by-one in range(6, 128) or a widening of the extended
+    set is detectable here. (A fixture that re-pins the sets would mask exactly
+    the production bug these tests exist to catch.)
+    """
+
+    def setUp(self):
+        self._saved = {
+            'name': ptp._dpll_mgr_instance_name,
+            'bh_inst': getattr(ptp, '_dpll_mgr_backhaul_instance', None),
+            'instances': dict(getattr(ptp, 'ptpinstances', {})),
+        }
+        ptp._dpll_mgr_instance_name = 'ptp01bh'
+        ptp._dpll_mgr_backhaul_instance = 'ptp01bh'
+        dpll_ctrl = Mock()
+        dpll_ctrl.monitoring_parameters = {}   # extended relay default-on
+        ptp.ptpinstances = {'ptp01bh': dpll_ctrl}
+        # NOTE: CLOCKCLASS_*_FORWARDABLE intentionally left at production values.
+
+    def tearDown(self):
+        ptp._dpll_mgr_instance_name = self._saved['name']
+        ptp._dpll_mgr_backhaul_instance = self._saved['bh_inst']
+        ptp.ptpinstances = self._saved['instances']
+
+    def _check(self, cases):
+        for cc, expected in cases.items():
+            pds = {'gm.ClockClass': cc, 'gm.ClockAccuracy': '0x20',
+                   'gm.OffsetScaledLogVariance': '0x4e5d'}
+            with patch('ptp.query_pmc', return_value=pds), \
+                 patch('ptp.query_pmc_indexed',
+                       return_value={'0': {'portState': 'SLAVE'}}):
+                result = ptp._backhaul_forwardable_clock_class()
+            if expected is None:
+                self.assertIsNone(result, "cc%s must not forward" % cc)
+            else:
+                self.assertEqual(result['clockClass'], expected,
+                                 "cc%s should forward" % cc)
+
+    def test_locked_range_boundaries(self):
+        # 6..127 inclusive; 5 and 128 are outside (and 128 is not extended).
+        self._check({'5': None, '6': '6', '127': '127', '128': None})
+
+    def test_extended_set_exact_membership(self):
+        # Extended relay is EXACTLY {140,150,160,165}, not a range.
+        self._check({'139': None, '140': '140', '165': '165', '166': None})
+
+
+class TestForwardedTraceabilityFlags(unittest.TestCase):
+    """Forwarded clockClass carries G.8275.1 Table 2 traceability flags.
+
+    Table 2 fixes the (timeTraceable, frequencyTraceable) pair per clockClass.
+    A forwarded extended class must advertise timeTraceable=FALSE (PRTC time
+    traceability is lost -- what makes it out-of-spec), with frequencyTraceable
+    140=TRUE, 150/160/165=FALSE. Guards against regressing to a blanket
+    TRUE/TRUE, which would advertise a self-contradictory cc140+timeTraceable.
+    """
+
+    def test_table2_extended_class_flags_exact(self):
+        # (clockClass, timeTraceable, frequencyTraceable) straight from Table 2.
+        expected = {
+            '140': (False, True),
+            '150': (False, False),
+            '160': (False, False),
+            '165': (False, False),
+        }
+        for cc, (tt, ft) in expected.items():
+            entry = ptp.CLOCKCLASS_EXTENDED_TRACEABILITY[cc]
+            self.assertEqual(entry['timeTraceable'], tt,
+                             "cc%s timeTraceable" % cc)
+            self.assertEqual(entry['frequencyTraceable'], ft,
+                             "cc%s frequencyTraceable" % cc)
+
+    def test_extended_classes_are_never_time_traceable(self):
+        # The defining property of the out-of-spec extended range.
+        for cc in ('140', '150', '160', '165'):
+            self.assertFalse(
+                ptp.CLOCKCLASS_EXTENDED_TRACEABILITY[cc]['timeTraceable'],
+                "cc%s must advertise timeTraceable=FALSE" % cc)
+
+    def test_mapping_keys_match_forwardable_extended_set(self):
+        # Every relayable extended class has a Table 2 flag entry (no class can
+        # be forwarded without defined traceability flags).
+        self.assertEqual(
+            set(ptp.CLOCKCLASS_EXTENDED_TRACEABILITY),
+            set(ptp.CLOCKCLASS_EXTENDED_FORWARDABLE))
 
 
 if __name__ == '__main__':
